@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::app::App;
-use crate::config::{BrigadeConfig, WorkerAgentSetting};
+use crate::config::{BrigadeConfig, CodexBrigadeConfig, GoinkyoAgentSetting, WorkerAgentSetting};
 use crate::model::{Activity, AgentKind, BrigadeRole, PtyExitReason, SessionRow};
 use crate::screen::Screen;
 
@@ -708,6 +708,8 @@ fn a_fresh_goinkyo_is_created_with_its_model_and_effort_and_a_resumed_one_with_n
         brigade_id: 1,
         cwd: PathBuf::from("/work"),
         roster: Vec::new(),
+        agent: None,
+        director_agent: None,
     };
     let mut state = EmporiumState::new(PrefixKey::default());
     let cmds = update_goinkyo_awaiting_spawn(
@@ -1734,6 +1736,8 @@ fn the_goinkyo_follows_the_same_rule() {
                 brigade_id: 1,
                 cwd: PathBuf::from("/work"),
                 roster: Vec::new(),
+                agent: None,
+                director_agent: None,
             }),
             now(),
         );
@@ -2565,4 +2569,353 @@ fn the_round_counter_wraps_past_the_end_without_landing_on_no_round() {
     state.pending_opens.clear();
     // The next one is 1, never 0, which names no round.
     assert_eq!(ask(&mut state, 2), vec![Cmd::ReadCodexCatalog { round: 1 }]);
+}
+
+// --- a Codex Goinkyo's own model and effort ------------------------------------
+
+/// A brigade whose Goinkyo is Codex, with `[brigade.codex]`'s two Goinkyo keys as
+/// given and every Claude setting at a value that must not reach it.
+fn codex_goinkyo(model: Option<&str>, effort: Option<&str>) -> BrigadeConfig {
+    BrigadeConfig {
+        goinkyo_agent: GoinkyoAgentSetting::Codex,
+        codex: CodexBrigadeConfig {
+            goinkyo_model: model.map(str::to_string),
+            goinkyo_effort: effort.map(str::to_string),
+            ..CodexBrigadeConfig::default()
+        },
+        ..configured()
+    }
+}
+
+/// What the shell reports of brigade 1's Goinkyo when its row has no session yet.
+fn consultation() -> GoinkyoObservation {
+    GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate {
+        brigade_id: 1,
+        cwd: PathBuf::from("/work"),
+        roster: Vec::new(),
+        agent: None,
+        director_agent: None,
+    })
+}
+
+/// What it reports once the row is gone: the consultation was dismissed.
+fn dismissed() -> GoinkyoObservation {
+    GoinkyoObservation::NoGoinkyo { brigade_id: 1 }
+}
+
+fn goinkyo_key() -> SessionKey {
+    SessionKey::new_worker(1, "goinkyo")
+}
+
+fn catalog_answer(round: u64) -> Event {
+    Event::CodexCatalogRead {
+        round,
+        result: catalog(),
+    }
+}
+
+fn asks_for_the_catalog(cmds: &[Cmd]) -> Vec<u64> {
+    cmds.iter()
+        .filter_map(|cmd| match cmd {
+            Cmd::ReadCodexCatalog { round } => Some(*round),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_codex_goinkyo_with_a_family_word_waits_for_the_catalog_and_opens_on_the_resolved_slug() {
+    let brigade = codex_goinkyo(Some("terra"), Some("xhigh"));
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(vec![]);
+    let key = goinkyo_key();
+
+    let cmds = update_goinkyo_awaiting_spawn(&mut state, &brigade, consultation(), now());
+    assert_eq!(cmds, vec![Cmd::ReadCodexCatalog { round: 1 }]);
+    // Held, with everything that keeps a second open out already written.
+    assert_eq!(state.goinkyo_pane.get(&1), Some(&key));
+    assert!(state.pending_opens.contains_key(&key));
+    let again = update_goinkyo_awaiting_spawn(&mut state, &brigade, consultation(), now());
+    assert!(again.is_empty(), "a tick while it waits: {again:?}");
+
+    let released = update(&mut state, &mut app, &brigade, catalog_answer(1), now());
+    let got = launches(&released);
+    assert_eq!(got.len(), 1, "{released:?}");
+    assert_eq!(got[0].agent, AgentKind::Codex);
+    assert_eq!(got[0].role, Some(BrigadeRole::Goinkyo));
+    assert_eq!(got[0].model, s("gpt-6.1-terra"));
+    assert_eq!(got[0].effort, s("xhigh"));
+    assert_eq!(
+        (&got[0].permission_mode, &got[0].disallowed_tools),
+        (&None, &None)
+    );
+    // Started by the Codex kickoff, as one that was not held.
+    assert!(matches!(
+        state.pending_opens.get(&key),
+        Some(PendingOpen::BrigadeMember {
+            brigade_id: 1,
+            needs_codex_kickoff: true,
+        })
+    ));
+    assert!(state.pending_goinkyo_kickoffs.is_empty());
+    assert!(state.codex_opens_awaiting_catalog.is_empty());
+    let status = state.status.as_deref().unwrap();
+    assert!(status.contains("terra → gpt-6.1-terra"), "{status}");
+}
+
+#[test]
+fn a_codex_goinkyo_with_no_model_opens_at_once_and_never_reads_the_catalog() {
+    // The built-in is nothing: the operator's own Codex default. An effort alone
+    // has no word to resolve, so it does not wait either.
+    for (model, effort, want_effort) in [
+        (None, None, None),
+        (None, Some("xhigh"), s("xhigh")),
+        (Some(""), Some(""), None),
+        (Some("  "), Some(" low "), s("low")),
+    ] {
+        let brigade = codex_goinkyo(model, effort);
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let cmds = update_goinkyo_awaiting_spawn(&mut state, &brigade, consultation(), now());
+        let got = launches(&cmds);
+        assert_eq!(got.len(), 1, "{model:?}/{effort:?}: {cmds:?}");
+        assert!(
+            asks_for_the_catalog(&cmds).is_empty(),
+            "{model:?}/{effort:?}"
+        );
+        assert_eq!(got[0].model, None, "{model:?}/{effort:?}");
+        assert_eq!(got[0].effort, want_effort, "{model:?}/{effort:?}");
+    }
+}
+
+#[test]
+fn a_slug_is_held_and_passed_as_written_when_the_catalog_does_not_know_it() {
+    // Not validated: a word the catalog cannot resolve and that has a digit goes
+    // through untouched (`codex_model::resolve`), the operator's own business.
+    let brigade = codex_goinkyo(Some("gpt-9-mystery"), None);
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(vec![]);
+    let cmds = update_goinkyo_awaiting_spawn(&mut state, &brigade, consultation(), now());
+    assert_eq!(asks_for_the_catalog(&cmds), [1]);
+    let released = update(&mut state, &mut app, &brigade, catalog_answer(1), now());
+    assert_eq!(launches(&released)[0].model, s("gpt-9-mystery"));
+}
+
+#[test]
+fn each_goinkyo_reads_only_its_own_products_model_and_effort() {
+    let spawn = |brigade: &BrigadeConfig| {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let cmds = update_goinkyo_awaiting_spawn(&mut state, brigade, consultation(), now());
+        (launches(&cmds), asks_for_the_catalog(&cmds))
+    };
+    // A Claude Goinkyo keeps its own, whatever `[brigade.codex]` says, and does
+    // not go near the catalog.
+    let claude = BrigadeConfig {
+        goinkyo_agent: GoinkyoAgentSetting::Claude,
+        codex: CodexBrigadeConfig {
+            goinkyo_model: s("terra"),
+            goinkyo_effort: s("xhigh"),
+            ..CodexBrigadeConfig::default()
+        },
+        ..configured()
+    };
+    let (got, asks) = spawn(&claude);
+    assert_eq!(
+        (got[0].model.clone(), got[0].effort.clone()),
+        (s("haiku"), s("medium"))
+    );
+    assert!(asks.is_empty());
+    // A Codex Goinkyo does not take Claude's.
+    let codex = BrigadeConfig {
+        goinkyo_agent: GoinkyoAgentSetting::Codex,
+        claude: crate::config::ClaudeBrigadeConfig {
+            goinkyo_model: s("fable"),
+            goinkyo_effort: s("max"),
+            ..Default::default()
+        },
+        ..configured()
+    };
+    let (got, asks) = spawn(&codex);
+    assert_eq!((got[0].model.clone(), got[0].effort.clone()), (None, None));
+    assert!(asks.is_empty());
+}
+
+#[test]
+fn a_resumed_codex_goinkyo_gets_neither_model_nor_effort_and_asks_for_no_catalog() {
+    let brigade = codex_goinkyo(Some("terra"), Some("xhigh"));
+    let mut state = EmporiumState::new(PrefixKey::default());
+    state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
+    let mut app = App::new(vec![
+        row("dir", AgentKind::ClaudeCode),
+        row("g1", AgentKind::Codex),
+    ]);
+    let cmds = update(
+        &mut state,
+        &mut app,
+        &brigade,
+        Event::MembershipResolved {
+            session_id: "dir".to_string(),
+            membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+            members: Some(vec![
+                ("director".to_string(), BrigadeRole::Director, s("dir")),
+                ("goinkyo".to_string(), BrigadeRole::Goinkyo, s("g1")),
+            ]),
+            layout: None,
+            names: Vec::new(),
+        },
+        now(),
+    );
+    let goinkyo = launches(&cmds)
+        .into_iter()
+        .find(|launch| launch.role == Some(BrigadeRole::Goinkyo))
+        .expect("the Goinkyo is resumed");
+    assert_eq!(goinkyo.agent, AgentKind::Codex);
+    assert_eq!(goinkyo.id, "g1");
+    assert_eq!((goinkyo.model, goinkyo.effort), (None, None));
+    assert!(asks_for_the_catalog(&cmds).is_empty());
+}
+
+// --- two creations of one Goinkyo ---------------------------------------------
+
+#[test]
+fn a_consultation_dismissed_and_asked_again_while_the_read_is_out_opens_the_goinkyo_once() {
+    // Both consultations' creations are under one placeholder key (the Goinkyo's
+    // token is reused), and a held creation's own-key exception in
+    // `creation_still_wanted` cannot tell them apart. The first is dropped when
+    // its consultation is seen to end, so that only the current one is ever
+    // released, and the pane it opens is the one a later dismissal can close.
+    let brigade = codex_goinkyo(Some("terra"), None);
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(vec![]);
+    let key = goinkyo_key();
+    let mut seen: Vec<Cmd> = Vec::new();
+
+    let first = update_goinkyo_awaiting_spawn(&mut state, &brigade, consultation(), now());
+    assert_eq!(asks_for_the_catalog(&first), [1]);
+    seen.extend(first);
+    // Dismissed, then asked again, with the first read still out.
+    let end = update_goinkyo_awaiting_spawn(&mut state, &brigade, dismissed(), now());
+    assert!(launches(&end).is_empty(), "{end:?}");
+    assert!(state.codex_opens_awaiting_catalog.is_empty());
+    assert_eq!(state.goinkyo_pane.get(&1), None);
+    assert!(!state.pending_opens.contains_key(&key));
+    seen.extend(end);
+    let second = update_goinkyo_awaiting_spawn(&mut state, &brigade, consultation(), now());
+    assert_eq!(
+        asks_for_the_catalog(&second),
+        [2],
+        "the new consultation asks for its own read: {second:?}"
+    );
+    seen.extend(second);
+
+    // The first read's answer is late: it is for nobody.
+    let late = update(&mut state, &mut app, &brigade, catalog_answer(1), now());
+    assert!(late.is_empty(), "{late:?}");
+    seen.extend(late);
+    let released = update(&mut state, &mut app, &brigade, catalog_answer(2), now());
+    seen.extend(released);
+
+    assert_eq!(launches(&seen).len(), 1, "opened exactly once: {seen:?}");
+    assert_eq!(launches(&seen)[0].model, s("gpt-6.1-terra"));
+    // And tracked, so that the next dismissal ends that pane.
+    assert_eq!(state.goinkyo_pane.get(&1), Some(&key));
+    assert!(state.pending_opens.contains_key(&key));
+    assert!(state.codex_opens_awaiting_catalog.is_empty());
+    let end = update_goinkyo_awaiting_spawn(&mut state, &brigade, dismissed(), now());
+    assert!(
+        end.contains(&Cmd::HangUpPty { key: key.clone() }),
+        "{end:?}"
+    );
+}
+
+#[test]
+fn an_answer_between_the_dismissal_and_the_next_consultation_opens_nothing() {
+    let brigade = codex_goinkyo(Some("terra"), None);
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(vec![]);
+    update_goinkyo_awaiting_spawn(&mut state, &brigade, consultation(), now());
+    update_goinkyo_awaiting_spawn(&mut state, &brigade, dismissed(), now());
+    let answer = update(&mut state, &mut app, &brigade, catalog_answer(1), now());
+    assert!(answer.is_empty(), "{answer:?}");
+    assert_nothing_registered(&state, 1, "goinkyo");
+    assert!(state.goinkyo_pane.is_empty());
+    // A later consultation starts clean.
+    let next = update_goinkyo_awaiting_spawn(&mut state, &brigade, consultation(), now());
+    assert_eq!(asks_for_the_catalog(&next), [2]);
+}
+
+#[test]
+fn a_dismissal_seen_only_as_a_new_row_keeps_the_one_creation_already_held() {
+    // `dismiss_goinkyo` followed at once by `consult_goinkyo`, inside one tick,
+    // is never seen as an ended consultation: the new row simply has no session
+    // yet, as the old one did. The creation held for the first is the Goinkyo's.
+    let brigade = codex_goinkyo(Some("terra"), None);
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(vec![]);
+    update_goinkyo_awaiting_spawn(&mut state, &brigade, consultation(), now());
+    let again = update_goinkyo_awaiting_spawn(&mut state, &brigade, consultation(), now());
+    assert!(again.is_empty(), "{again:?}");
+    let released = update(&mut state, &mut app, &brigade, catalog_answer(1), now());
+    assert_eq!(launches(&released).len(), 1, "{released:?}");
+    assert_eq!(state.goinkyo_pane.get(&1), Some(&goinkyo_key()));
+}
+
+#[test]
+fn two_held_creations_of_one_goinkyo_open_it_once_and_the_later_one_wins() {
+    // The invariant on its own, whatever put two there: `creation_still_wanted`
+    // does not count a creation's own placeholder key, so without the one-per-
+    // member rule both would pass it and a second Codex would start on the same
+    // consultation.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(vec![]);
+    state.member_order.insert(1, vec!["goinkyo".to_string()]);
+    let open = |cwd: &str| Cmd::OpenEmbedded {
+        key: goinkyo_key(),
+        target: SessionToOpen {
+            id: String::new(),
+            agent: AgentKind::Codex,
+            title: "goinkyo".to_string(),
+            cwd: PathBuf::from(cwd),
+        },
+        brigade: Some((1, "goinkyo".to_string(), BrigadeRole::Goinkyo)),
+        model: s("terra"),
+        effort: None,
+        permission_mode: None,
+        disallowed_tools: None,
+        autocompact: None,
+    };
+    assert_eq!(
+        hold_for_catalog(&mut state, open("/old")),
+        vec![Cmd::ReadCodexCatalog { round: 1 }]
+    );
+    assert!(hold_for_catalog(&mut state, open("/new")).is_empty());
+    let released = update(
+        &mut state,
+        &mut app,
+        &BrigadeConfig::default(),
+        catalog_answer(1),
+        now(),
+    );
+    let opened: Vec<&PathBuf> = released
+        .iter()
+        .filter_map(|cmd| match cmd {
+            Cmd::OpenEmbedded { target, .. } => Some(&target.cwd),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opened, [&PathBuf::from("/new")], "{released:?}");
+}
+
+#[test]
+fn a_goinkyo_held_when_its_brigade_is_disbanded_is_never_opened_and_leaves_no_guard() {
+    let brigade = codex_goinkyo(Some("terra"), None);
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(vec![]);
+    update_goinkyo_awaiting_spawn(&mut state, &brigade, consultation(), now());
+    update(&mut state, &mut app, &brigade, disbanded(1), now());
+    let answer = update(&mut state, &mut app, &brigade, catalog_answer(1), now());
+    assert!(launches(&answer).is_empty(), "{answer:?}");
+    assert_nothing_registered(&state, 1, "goinkyo");
+    // A guard left naming the placeholder would read as "in flight or failed", and
+    // no later consultation of the brigade could open a Goinkyo.
+    assert_eq!(state.goinkyo_pane.get(&1), None);
 }

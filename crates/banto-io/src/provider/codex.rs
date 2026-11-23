@@ -355,9 +355,10 @@ fn session_meta_from_row(
         // the title above is already a pick among `threads.title`, the
         // `session_index.jsonl` rename and the canonical `name`, and from the
         // chosen string nothing says whether a person or Codex's own naming
-        // wrote it. A consultation's title is only ever recorded for a Claude
-        // session (`goinkyo_*` settings are Claude only), so no Codex row is
-        // ever one the flag would have to protect.
+        // wrote it. So a Codex Goinkyo's session, which can now be one that has
+        // a consultation title (`goinkyo_agent = "codex"`), is listed under
+        // banto's title even if the operator renamed it in Codex: the flag that
+        // protects a Claude `/rename` has nothing to read here.
         title_is_custom: false,
         cwd: cwd.as_deref().map(normalize_windows_extended_prefix),
         source_path: rollout_path,

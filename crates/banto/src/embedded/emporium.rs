@@ -361,11 +361,14 @@ pub struct EmporiumSettings<'a> {
     /// The banto executable, resolved once at start (`crate::exe`): what every
     /// brigade member's banto children are started from.
     pub exe: &'a crate::exe::BantoExe,
-    /// What startup has to say about the database: that it is not in the data
-    /// directory (`crate::startup::split_database_notice`), or that the check for
-    /// another banto on it could not be made (`crate::single_instance`). Shown
-    /// with the other startup notices.
-    pub database_notices: Vec<String>,
+    /// What startup has to say, decided before the first frame: that the
+    /// database is not in the data directory
+    /// (`crate::startup::split_database_notice`), that the check for another
+    /// banto on it could not be made (`crate::single_instance`), or that the
+    /// config still uses a legacy `[brigade]` key
+    /// (`BrigadeConfig::legacy_key_notice`). Shown with the other startup
+    /// notices.
+    pub boot_notices: Vec<String>,
 }
 
 /// Run the emporium until the user quits (`q`/Esc from the sidebar; a
@@ -427,7 +430,7 @@ pub fn run(
                 .list_brigades()
                 .unwrap_or_default()
                 .is_empty();
-            let hook_launchable = hook_launchable(settings.exe);
+            let hook_launchable = settings.exe.hook_launchable();
             session::codex_trust_notice(
                 banto_io::codex_trust::hook_trust_state(home),
                 true,
@@ -435,12 +438,12 @@ pub fn run(
                 hook_launchable,
             )
         });
-    // The executable's is told with the database's: both are about what banto
+    // The executable's is told with the others: all are about what banto
     // stands on, decided before the first frame.
     let startup_notices = session::startup_notices(
         trust_notice,
         settings
-            .database_notices
+            .boot_notices
             .iter()
             .cloned()
             .chain(settings.exe.watch_notice())
@@ -1386,15 +1389,6 @@ fn sweep_data_dir_with(dir: &DataDir, store: &RefCell<Store>, now: std::time::Sy
     });
 }
 
-/// Whether the hook command could carry the executable's path (no space in it),
-/// by the path resolved at start. An unknowable path counts as launchable:
-/// blaming a space nothing has established is there would be worse than leaving
-/// the trust question to speak for itself.
-fn hook_launchable(exe: &crate::exe::BantoExe) -> bool {
-    exe.path()
-        .is_none_or(|exe| launch::hook_command_is_launchable(&launch::forward_slash_path(exe)))
-}
-
 /// Read whether banto's `SessionStart` hook looks trusted right now —
 /// freshly, not cached, since the operator may have approved it in a pane
 /// since this run started — and whether it could even fire from this
@@ -1407,7 +1401,7 @@ fn execute_check_codex_trust(deps: &Deps) -> Vec<Event> {
         banto_io::codex_trust::hook_trust_state(home)
             == banto_io::codex_trust::HookTrustState::Primed
     });
-    let hook_launchable = hook_launchable(deps.exe);
+    let hook_launchable = deps.exe.hook_launchable();
     vec![Event::CodexTrustChecked {
         primed,
         hook_launchable,
@@ -2839,6 +2833,8 @@ fn gather_goinkyo_looks(
                 guard,
                 cwd: PathBuf::new(),
                 roster: Vec::new(),
+                agent: None,
+                director_agent: None,
             });
             continue;
         };
@@ -2846,10 +2842,8 @@ fn gather_goinkyo_looks(
         // directory the rest of the brigade runs in: both from its roster row,
         // as `stage_brigade` reads them, so that nothing depends on which
         // brigade is on stage.
-        let director_session = members
-            .iter()
-            .find(|m| m.role == BrigadeRole::Director)
-            .and_then(|m| m.session_id.as_ref());
+        let director_member = members.iter().find(|m| m.role == BrigadeRole::Director);
+        let director_session = director_member.and_then(|m| m.session_id.as_ref());
         let director_hosted = director_session
             .is_some_and(|session| state.screens.contains_key(&SessionKey::from_id(&session.0)));
         let row = match members.iter().find(|m| m.role == BrigadeRole::Goinkyo) {
@@ -2862,7 +2856,7 @@ fn gather_goinkyo_looks(
         // Only the awaiting case reads the cwd and the roster; the decision
         // uses them there and nowhere else, so the rest skip the work.
         let awaiting = matches!(row, GoinkyoRow::NoSession) && director_hosted;
-        let (cwd, roster) = if awaiting {
+        let (cwd, roster, agent, director_agent) = if awaiting {
             // Same cwd resolution as `stage_brigade` and `add_worker`: the
             // Director's own row, since a Goinkyo has no cwd of its own, and
             // "." when that row is not resolved.
@@ -2872,9 +2866,25 @@ fn gather_goinkyo_looks(
                 .unwrap_or_else(|| PathBuf::from("."));
             // Already in join order: what the core needs to place the
             // consultation among the Workers (see the field's doc).
-            (cwd, members.iter().map(|m| m.token.clone()).collect())
+            // The Director's product for a row that records none: its own row
+            // first, since `consult_goinkyo` resolves against that, then the
+            // session it is hosting.
+            let director_agent = director_member.and_then(|m| m.agent).or_else(|| {
+                director_session
+                    .and_then(|session| app.row_for_id(&session.0))
+                    .map(|row| row.agent)
+            });
+            (
+                cwd,
+                members.iter().map(|m| m.token.clone()).collect(),
+                members
+                    .iter()
+                    .find(|m| m.role == BrigadeRole::Goinkyo)
+                    .and_then(|m| m.agent),
+                director_agent,
+            )
         } else {
-            (PathBuf::new(), Vec::new())
+            (PathBuf::new(), Vec::new(), None, None)
         };
         looks.push(GoinkyoLook {
             brigade_id,
@@ -2884,6 +2894,8 @@ fn gather_goinkyo_looks(
             guard,
             cwd,
             roster,
+            agent,
+            director_agent,
         });
     }
     looks
@@ -14491,11 +14503,10 @@ mod tests {
 
     #[test]
     fn build_open_launch_drops_permission_mode_for_a_codex_target_even_when_some() {
-        // Unlike the Goinkyo (always Claude), a Worker can resolve to either
-        // product — `worker_permission_mode` reaches this function as `Some`
-        // for a Codex Worker too (`engine::RoleLaunch::of` doesn't gate it by
-        // agent), so this is no longer only ever structurally `None` here by
-        // construction. `AgentLaunch::Codex` still has no field for it.
+        // A Codex Worker does arrive with `permission_mode` set
+        // (`engine::RoleLaunch::of` doesn't gate it by agent), so this is not
+        // structurally `None` here. `AgentLaunch::Codex` still has no field for
+        // it.
         let probe = MockProbe {
             alive: HashSet::new(),
         };
@@ -14925,6 +14936,43 @@ mod tests {
             panic!("a Goinkyo row with no session is awaiting a spawn");
         };
         assert_eq!(candidate.roster, ["director", "goinkyo", "assistant"]);
+    }
+
+    #[test]
+    fn the_spawn_candidate_carries_the_rows_product_and_the_directors() {
+        let (store, state, app) = staged_goinkyo(None);
+        let candidate = || {
+            let GoinkyoObservation::AwaitingSpawn(candidate) =
+                only_observation(&state, &store, &app)
+            else {
+                panic!("a Goinkyo row with no session is awaiting a spawn");
+            };
+            candidate
+        };
+
+        // Neither row records a product: the row says nothing, and the Director's
+        // is read off the session it hosts.
+        let bare = candidate();
+        assert_eq!(
+            (bare.agent, bare.director_agent),
+            (None, Some(AgentKind::ClaudeCode))
+        );
+
+        // The Director's own row outranks its session's, which is what
+        // `consult_goinkyo` resolved against; the Goinkyo's row is passed on as is.
+        let mut writer = store.borrow_mut();
+        writer
+            .set_member_agent(1, "director", AgentKind::Codex)
+            .unwrap();
+        writer
+            .set_member_agent(1, "goinkyo", AgentKind::Codex)
+            .unwrap();
+        drop(writer);
+        let recorded = candidate();
+        assert_eq!(
+            (recorded.agent, recorded.director_agent),
+            (Some(AgentKind::Codex), Some(AgentKind::Codex))
+        );
     }
 
     #[test]
@@ -15509,6 +15557,8 @@ mod tests {
                     brigade_id: 1,
                     cwd: PathBuf::from("/work/alpha"),
                     roster: Vec::new(),
+                    agent: None,
+                    director_agent: None,
                 }),
             },
             now,
@@ -17048,12 +17098,10 @@ mod tests {
         let spaced = dir.path().join("a folder").join("banto");
         std::fs::create_dir_all(spaced.parent().unwrap()).unwrap();
         std::fs::write(&spaced, b"v1").unwrap();
-        assert!(!hook_launchable(&crate::exe::BantoExe::at(spaced.clone())));
+        assert!(!crate::exe::BantoExe::at(spaced.clone()).hook_launchable());
         replace_on_disk(&spaced);
-        assert!(!hook_launchable(&crate::exe::BantoExe::at(spaced)));
-        assert!(hook_launchable(&crate::exe::BantoExe::Unknown(
-            "x".to_string()
-        )));
+        assert!(!crate::exe::BantoExe::at(spaced).hook_launchable());
+        assert!(crate::exe::BantoExe::Unknown("x".to_string()).hook_launchable());
     }
 
     /// A pane that is not a brigade member starts no banto child, so an upgrade

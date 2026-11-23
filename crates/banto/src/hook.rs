@@ -44,11 +44,13 @@
 //! A config that breaks after the UI started therefore costs a hook run every
 //! setting in the file, its `[brigade]` templates included, not only the bad key.
 //!
-//! Where the config file and the database are comes from the banto that
-//! launched the agent, through the environment (`BANTO_PARENT_CONFIG`,
-//! `BANTO_PARENT_NO_CONFIG`, `BANTO_PARENT_DB`) for the same reason identity
-//! does: the command line can carry nothing. Without them (an older banto
-//! launched this agent) the hook resolves both for itself, as it always did.
+//! Where the config file, the database and the data directory are comes from the
+//! banto that launched the agent, through the environment
+//! (`BANTO_PARENT_CONFIG`, `BANTO_PARENT_NO_CONFIG`, `BANTO_PARENT_DB`,
+//! `BANTO_PARENT_DATA_DIR`) for the same reason identity does: the command line
+//! can carry nothing. Without them (an older banto launched this agent) the hook
+//! resolves them for itself, as it always did. The data directory is read for one
+//! thing: a Goinkyo's briefing names the consultation request file in it.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -59,6 +61,7 @@ use serde_json::{Value, json};
 use banto_core::config::Config;
 use banto_core::model::{AgentKind, BrigadeId, BrigadeRole, SessionId};
 use banto_io::codex_briefing::{self, Verdict};
+use banto_io::data_dir::DataDir;
 use banto_io::store::Store;
 
 /// Member identity as read from the environment. Every field is optional
@@ -83,6 +86,19 @@ fn read_identity(get: impl Fn(&str) -> Option<String>) -> HookIdentity {
     }
 }
 
+/// The consultation request path a Goinkyo's briefing names as `{request}`, or
+/// `None` for another role or a data directory that is not known. Built from the
+/// same [`DataDir`] path `crate::mcp::tool_consult_goinkyo` wrote the file to, so
+/// the briefing and the file cannot disagree about where it is.
+fn request_path(identity: &HookIdentity, data_dir: Option<&DataDir>) -> Option<String> {
+    if identity.role? != BrigadeRole::Goinkyo {
+        return None;
+    }
+    data_dir?
+        .goinkyo_request_path(identity.brigade_id?)
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 /// Pulls `session_id` out of the hook's stdin JSON. Leniently: a missing
 /// field, wrong type, or entirely unparsable stdin all just yield `None`.
 fn session_id_from_stdin(stdin: &Value) -> Option<SessionId> {
@@ -105,14 +121,13 @@ fn build_briefing(
     identity: &HookIdentity,
     config: &Config,
     store: Option<&Store>,
+    request: Option<&str>,
 ) -> Option<String> {
     let brigade_id = identity.brigade_id?;
     let token = identity.token.as_deref()?;
     let role = identity.role?;
     let store = store?;
     let peers = crate::briefing::peers_of(store, brigade_id, role);
-    // No request path: a Goinkyo is Claude-only, so this hook — Codex's own
-    // SessionStart briefing path — never renders one.
     crate::briefing::compose(
         &config.brigade,
         AgentKind::Codex,
@@ -120,7 +135,7 @@ fn build_briefing(
         brigade_id,
         token,
         &peers,
-        None,
+        request,
     )
 }
 
@@ -129,7 +144,7 @@ fn build_briefing(
 /// the other commands (it stops on a config file that does not parse). `None`
 /// for the store on any failure (unresolvable path, unopenable file): never an
 /// error the hook has to propagate.
-fn load_leniently() -> (Config, Option<Store>) {
+fn load_leniently() -> (Config, Option<Store>, Option<DataDir>) {
     let mut inputs = crate::startup::Inputs {
         env: crate::startup::Env::from_process(),
         cwd: std::env::current_dir().ok(),
@@ -143,9 +158,9 @@ fn load_leniently() -> (Config, Option<Store>) {
     let Ok((config, resolved)) =
         crate::startup::resolve(&inputs, crate::startup::Strictness::Lenient)
     else {
-        return (Config::default(), None);
+        return (Config::default(), None, None);
     };
-    (config, open_store_leniently(&resolved))
+    (config, open_store_leniently(&resolved), resolved.data_dir())
 }
 
 /// The store, or `None` when there is none to open — no database location, an
@@ -167,13 +182,15 @@ pub fn run() {
     let stdin_json: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
 
     let identity = read_identity(|key| std::env::var(key).ok());
-    let (config, store) = load_leniently();
+    let (config, store, data_dir) = load_leniently();
+    let request = request_path(&identity, data_dir.as_ref());
 
     let output = fire(
         &stdin_json,
         &identity,
         &config,
         store.as_ref(),
+        request.as_deref(),
         SystemTime::now(),
     );
     let _ = writeln!(std::io::stdout(), "{output}");
@@ -188,9 +205,10 @@ fn fire(
     identity: &HookIdentity,
     config: &Config,
     store: Option<&Store>,
+    request: Option<&str>,
     now: SystemTime,
 ) -> Value {
-    let briefing = build_briefing(identity, config, store);
+    let briefing = build_briefing(identity, config, store, request);
 
     // Recorded independent of whether `briefing` is `Some`, and of whether it is
     // then printed: a role briefed with an intentionally-empty template, or a
@@ -391,12 +409,12 @@ mod tests {
     fn a_withheld_firing_still_records_that_the_hook_fired() {
         let (store, identity) = worker_in_a_cell();
         let config = brigade_config("I am {token}");
-        let briefing = build_briefing(&identity, &config, Some(&store)).unwrap();
+        let briefing = build_briefing(&identity, &config, Some(&store), None).unwrap();
         let (_dir, path) = rollout_file(&[rollout_copy(&briefing)]);
         let stdin = json!({"session_id": "s-1", "source": "resume", "transcript_path": path});
         let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(5_000);
 
-        let output = fire(&stdin, &identity, &config, Some(&store), at);
+        let output = fire(&stdin, &identity, &config, Some(&store), None, at);
 
         assert_eq!(output, json!({}), "the history holds it: nothing printed");
         let member = store
@@ -417,7 +435,7 @@ mod tests {
         let stdin = json!({"session_id": "s-1", "source": "startup"});
         let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(5_000);
 
-        let output = fire(&stdin, &identity, &config, Some(&store), at);
+        let output = fire(&stdin, &identity, &config, Some(&store), None, at);
 
         assert!(delivered(&output).is_some());
         let member = store
@@ -434,7 +452,14 @@ mod tests {
         let config = brigade_config("I am {token}");
         let stdin = json!({"source": "startup"});
 
-        let output = fire(&stdin, &identity, &config, Some(&store), SystemTime::now());
+        let output = fire(
+            &stdin,
+            &identity,
+            &config,
+            Some(&store),
+            None,
+            SystemTime::now(),
+        );
 
         assert!(delivered(&output).is_some());
         let member = store
@@ -473,7 +498,7 @@ mod tests {
         };
         let config = brigade_config("I am {token} in {brigade}, peers: {peers}");
 
-        let briefing = build_briefing(&identity, &config, Some(&store));
+        let briefing = build_briefing(&identity, &config, Some(&store), None);
         assert_eq!(
             briefing,
             Some(crate::briefing::with_codex_addendum(
@@ -498,7 +523,7 @@ mod tests {
         let mut config = brigade_config("I lead {brigade}");
         config.brigade.goinkyo_consult = "disputes".to_string();
 
-        let briefing = build_briefing(&identity, &config, Some(&store)).unwrap();
+        let briefing = build_briefing(&identity, &config, Some(&store), None).unwrap();
         let paragraph =
             crate::briefing::consult_paragraph(banto_core::config::GoinkyoConsult::Disputes);
         assert!(
@@ -527,7 +552,7 @@ mod tests {
             role: Some(BrigadeRole::Worker),
         };
         assert!(
-            !build_briefing(&worker, &config, Some(&store))
+            !build_briefing(&worker, &config, Some(&store), None)
                 .unwrap()
                 .contains("When to consult the Goinkyo")
         );
@@ -551,11 +576,92 @@ mod tests {
         let config = brigade_config("");
 
         assert_eq!(
-            build_briefing(&identity, &config, Some(&store)),
+            build_briefing(&identity, &config, Some(&store), None),
             Some(crate::briefing::with_codex_addendum(
                 "",
                 BrigadeRole::Worker
             ))
+        );
+    }
+
+    fn goinkyo_identity(brigade_id: BrigadeId) -> HookIdentity {
+        HookIdentity {
+            brigade_id: Some(brigade_id),
+            token: Some("goinkyo".to_string()),
+            role: Some(BrigadeRole::Goinkyo),
+        }
+    }
+
+    #[test]
+    fn a_goinkyos_request_path_is_the_one_the_data_directory_derives() {
+        let dir = DataDir::new(std::env::temp_dir().join("banto data"));
+        let identity = goinkyo_identity(7);
+        assert_eq!(
+            request_path(&identity, Some(&dir)),
+            dir.goinkyo_request_path(7)
+                .map(|path| path.to_string_lossy().into_owned())
+        );
+        assert!(request_path(&identity, Some(&dir)).is_some());
+    }
+
+    #[test]
+    fn only_a_goinkyo_with_a_known_data_directory_has_a_request_path() {
+        let dir = DataDir::new(std::env::temp_dir().join("banto data"));
+        assert_eq!(request_path(&goinkyo_identity(7), None), None);
+        for role in [BrigadeRole::Director, BrigadeRole::Worker] {
+            let identity = HookIdentity {
+                role: Some(role),
+                ..goinkyo_identity(7)
+            };
+            assert_eq!(request_path(&identity, Some(&dir)), None, "{role:?}");
+        }
+        let no_brigade = HookIdentity {
+            brigade_id: None,
+            ..goinkyo_identity(7)
+        };
+        assert_eq!(request_path(&no_brigade, Some(&dir)), None);
+        let no_role = HookIdentity {
+            role: None,
+            ..goinkyo_identity(7)
+        };
+        assert_eq!(request_path(&no_role, Some(&dir)), None);
+    }
+
+    #[test]
+    fn a_codex_goinkyos_briefing_names_the_real_request_file_not_the_placeholder() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "director", BrigadeRole::Director, None)
+            .unwrap();
+        store
+            .add_brigade_member(brigade_id, "goinkyo", BrigadeRole::Goinkyo, None)
+            .unwrap();
+        let identity = goinkyo_identity(brigade_id);
+        let dir = DataDir::new(std::env::temp_dir().join("banto data"));
+        let request = request_path(&identity, Some(&dir)).unwrap();
+        let config = Config::default();
+
+        let briefing = build_briefing(&identity, &config, Some(&store), Some(&request)).unwrap();
+        assert!(briefing.contains(&request), "{briefing}");
+        assert!(!briefing.contains("{request}"), "{briefing}");
+        assert!(briefing.ends_with(codex_briefing::BRIEFING_LAST_SENTENCE));
+
+        // The same text the Claude launch path renders for the same request,
+        // plus the Codex-only addendum.
+        let claude = crate::briefing::compose(
+            &config.brigade,
+            AgentKind::ClaudeCode,
+            BrigadeRole::Goinkyo,
+            brigade_id,
+            "goinkyo",
+            &crate::briefing::peers_of(&store, brigade_id, BrigadeRole::Goinkyo),
+            Some(&request),
+        )
+        .unwrap();
+        assert_eq!(
+            briefing,
+            crate::briefing::with_codex_addendum(&claude, BrigadeRole::Goinkyo)
         );
     }
 
@@ -568,7 +674,7 @@ mod tests {
         };
         let config = brigade_config("hello {token}");
 
-        assert_eq!(build_briefing(&identity, &config, None), None);
+        assert_eq!(build_briefing(&identity, &config, None, None), None);
     }
 
     #[test]
@@ -582,7 +688,7 @@ mod tests {
             role: Some(BrigadeRole::Worker),
         };
         assert_eq!(
-            build_briefing(&missing_brigade, &config, Some(&store)),
+            build_briefing(&missing_brigade, &config, Some(&store), None),
             None
         );
 
@@ -591,7 +697,10 @@ mod tests {
             token: Some("worker-1".to_string()),
             role: None,
         };
-        assert_eq!(build_briefing(&missing_role, &config, Some(&store)), None);
+        assert_eq!(
+            build_briefing(&missing_role, &config, Some(&store), None),
+            None
+        );
     }
 
     fn resolved_with_db(db_path: Option<std::path::PathBuf>) -> crate::startup::Resolved {
@@ -635,7 +744,10 @@ mod tests {
             token: Some("worker-1".to_string()),
             role: Some(BrigadeRole::Worker),
         };
-        assert_eq!(build_briefing(&identity, &Config::default(), None), None);
+        assert_eq!(
+            build_briefing(&identity, &Config::default(), None, None),
+            None
+        );
     }
 
     #[test]

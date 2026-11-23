@@ -458,7 +458,7 @@ pub enum BrigadeRole {
     /// The retired elder called back in to arbitrate a Director/Worker
     /// disagreement or an impasse — advises, never takes the work over.
     /// Auto-spawned by banto itself once a Director's `consult_goinkyo`
-    /// files a request (Claude only — see `BrigadeConfig::goinkyo_model` —
+    /// files a request (as Claude, or as Codex when `goinkyo_agent` says so —
     /// never opened by the operator directly), addressable only by name,
     /// never a broadcast recipient.
     Goinkyo,

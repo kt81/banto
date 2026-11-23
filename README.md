@@ -88,6 +88,15 @@ Director also gets:
 - `name_member`: gives a Worker a display name for its standing role (the token
   stays the address)
 
+The Goinkyo is the advisor session a Director consults with `consult_goinkyo`. It runs
+as its Director's own product, so a Codex Director's Goinkyo is Codex by default
+(`goinkyo_agent`); `goinkyo_agent = "claude"` keeps it on Claude. A Codex Goinkyo runs
+read-only with no approval prompts, so it cannot build or run tests. The first
+consultation in a directory Codex has not trusted waits at Codex's own trust question
+until you answer it in the Goinkyo's pane. `consult_goinkyo` refuses up front when the
+Goinkyo's product cannot run: not enabled in `agents`, no home found, or banto's hook
+not trusted or not launchable.
+
 Each member also gets a role briefing naming its brigade, token and peers (appended
 to the system prompt for Claude Code, delivered by banto's own `SessionStart` hook
 for Codex). A relayed message is labeled as coming from another AI, never as
@@ -360,20 +369,10 @@ week_days = 7
 [brigade]           # Director/Worker brigades
 workers = 1         # Workers auto-spawned per brigade (1..=8)
 worker_agent = "inherit"   # "inherit" (the Director's product) | "claude" | "codex" | "select" (a picker: agent, model, effort)
-# Model and effort of a NEW Worker, passed only at creation. "" passes no flag.
-worker_model = "sonnet"          # Claude: --model
-worker_effort = "high"           # Claude: --effort (low | medium | high | xhigh | max)
-worker_model_codex = "terra"     # Codex: a slug, or a family word resolved to its newest slug
-worker_effort_codex = "high"     # Codex: -c model_reasoning_effort
 # A Worker's auto-compact window, passed on every launch, a resume included:
 # "auto", an integer 100000..=1000000, or "" (no flag). Directors and Goinkyo never get it.
 # Codex takes only a token count; "auto" gives it nothing.
 worker_autocompact = 250000
-# Model and effort of a NEW Goinkyo, passed only at creation. "" passes no flag.
-# Fable and max are opt-ins, not the built-ins: Fable bills usage credits on some
-# plans, and Claude cannot save max, so a restart drops it.
-goinkyo_model = "opus"           # Claude: --model
-goinkyo_effort = "xhigh"         # Claude: --effort (low | medium | high | xhigh | max)
 relay = "auto"      # "auto" | "manual" — the wake-up nudge engine
 # Append every brigade message, in full, to <data dir>/logs/brigade-<id>.log. The
 # file holds real conversation content and is never rotated or deleted: don't commit it.
@@ -389,8 +388,35 @@ worker_prompt = "..."
 # A Claude Director needs a banto restart after an edit; a Codex Director's hook re-reads
 # it at its next session start. A running Director never sees a change: tell it in its pane.
 goinkyo_consult = "design"
+# Which product a Goinkyo runs as: "inherit" (its Director's own) | "claude" | "codex".
+# A Codex Goinkyo runs read-only (-s read-only -a never), so it cannot build or run tests.
+# Its model and effort are goinkyo_model and goinkyo_effort under [brigade.codex].
+goinkyo_agent = "inherit"
 # A Director's request_decision also marks its row and rings. false: the tag only.
 request_attention = true
+
+# What only one product reads lives in a table of its own. These must stay below every
+# plain [brigade] key above: a plain key written under one of them belongs to that table,
+# and banto refuses to start on one of its own keys written there. Model, effort and permission mode go to a NEW Worker or Goinkyo, only
+# at creation. "" passes no flag. The old flat spellings under [brigade] (worker_model,
+# worker_effort, worker_model_codex, worker_effort_codex, worker_permission_mode,
+# goinkyo_model, goinkyo_effort, goinkyo_permission_mode, goinkyo_disallowed_tools)
+# still work, and banto names each one it finds at startup. The table wins when both are set.
+[brigade.claude]
+worker_model = "sonnet"          # --model
+worker_effort = "high"           # --effort (low | medium | high | xhigh | max)
+worker_permission_mode = "auto"  # --permission-mode
+# Fable and max are opt-ins, not the built-ins: Fable bills usage credits on some
+# plans, and Claude cannot save max, so a restart drops it.
+goinkyo_model = "opus"
+goinkyo_effort = "xhigh"
+goinkyo_permission_mode = "auto"
+
+[brigade.codex]
+worker_model = "terra"           # a slug, or a family word resolved to its newest slug
+worker_effort = "high"           # -c model_reasoning_effort
+goinkyo_model = ""               # a Codex Goinkyo's model; "" = Codex's own default
+goinkyo_effort = ""              # a Codex Goinkyo's -c model_reasoning_effort; "" = none
 
 [keys]
 prefix = "C-b"      # pane prefix chord

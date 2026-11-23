@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::{
     App, ClickOutcome, GroupId, GroupJoinTarget, Modal, Mode, WorkerDefaults, WorkerPickerFor,
 };
-use crate::config::{BrigadeConfig, RelayMode, WorkerAgentSetting};
+use crate::config::{BrigadeConfig, RelayMode, WorkerAgentSetting, resolve_goinkyo_agent};
 use crate::display_text::{display_name, shorten_to_columns};
 use crate::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -753,6 +753,19 @@ pub struct GoinkyoSpawnCandidate {
     /// recorded first. Empty in a capture recorded before this field existed.
     #[serde(default)]
     pub roster: Vec<MemberToken>,
+    /// The product on the Goinkyo's member row. `consult_goinkyo` writes it, after
+    /// resolving `goinkyo_agent` against its Director and refusing a product that
+    /// cannot work, so the row is the one place that decides what the spawn runs.
+    /// `None` for a row that never had one, and in a capture recorded before this
+    /// field existed: both fall back to [`Self::director_agent`] and the
+    /// setting.
+    #[serde(default)]
+    pub agent: Option<AgentKind>,
+    /// The Director's product as the shell knows it, for the fallback above only:
+    /// its roster row's, else its discovered session's. `None` when neither says,
+    /// which resolves like Claude.
+    #[serde(default)]
+    pub director_agent: Option<AgentKind>,
 }
 
 /// What the shell observed about one brigade's Goinkyo this tick —
@@ -827,6 +840,11 @@ pub struct GoinkyoLook {
     /// hosted; empty otherwise.
     pub cwd: PathBuf,
     pub roster: Vec<MemberToken>,
+    /// See [`GoinkyoSpawnCandidate::agent`]; like `cwd`, read only when the row is
+    /// awaiting a session.
+    pub agent: Option<AgentKind>,
+    /// See [`GoinkyoSpawnCandidate::director_agent`].
+    pub director_agent: Option<AgentKind>,
 }
 
 /// The observation this tick's [`GoinkyoLook`] calls for, or `None` when
@@ -848,6 +866,8 @@ pub fn decide_goinkyo(look: &GoinkyoLook) -> Option<GoinkyoObservation> {
                 brigade_id: look.brigade_id,
                 cwd: look.cwd.clone(),
                 roster: look.roster.clone(),
+                agent: look.agent,
+                director_agent: look.director_agent,
             })
         }),
         GoinkyoRow::Session(_) => None,
@@ -1079,7 +1099,8 @@ enum PendingOpen {
     BrigadeMember {
         brigade_id: BrigadeId,
         /// `true` only for a Worker [`open_worker`] just spawned fresh (no
-        /// id yet) as a Codex agent — the one case that needs a
+        /// id yet) as a Codex agent, or a Codex Goinkyo
+        /// ([`update_goinkyo_awaiting_spawn`]) — the cases that need a
         /// [`PendingKickoff`] queued once it's actually spawned. Always
         /// `false` for a *resumed* member ([`stage_brigade`]'s own
         /// `Some(row)` branch inserts this same variant, for a session
@@ -7810,7 +7831,20 @@ fn stage_brigade(
             // Goinkyo's discovery already ran once and assigned it a real
             // id, but `app.row_for_id` still can't find a row for it because
             // Claude Code writes no `projects/*.jsonl` transcript until the
-            // Goinkyo's first turn. Left as a plain `missing`, this member
+            // Goinkyo's first turn. That is a fact about Claude. Codex writes a
+            // session's `threads` row and rollout at the first persist, which is
+            // the kickoff's turn, and banto discovers the session about a second
+            // after the rollout is born (1.03-1.17 s in 8 measured runs). A Codex
+            // Goinkyo therefore resolves to a row from its discovery and takes
+            // the resume arm above, where `needs_codex_kickoff` is false; it never
+            // reaches this arm. What is left is a window of up to ~40 ms: in 3 of
+            // the 8 runs discovery came 25-39 ms before Codex had written the
+            // briefing and kickoff records of that same turn. A restart or a pane
+            // death inside it ends the turn before the kickoff record exists, and
+            // the re-stage resumes the thread without a kickoff. Nothing handles
+            // that, and
+            // `a_codex_goinkyo_restaged_before_its_first_turn_is_recorded_is_resumed_without_a_kickoff`
+            // pins it. Left as a plain `missing`, this member
             // is permanently stuck: `session_id` never gets a chance to
             // clear on its own, so `gather_goinkyo_observations`'s
             // `AwaitingSpawn` check (which only fires on `session_id: None`)
@@ -7849,8 +7883,8 @@ fn stage_brigade(
                     panes.push(key);
                 } else {
                     // Truly stranded, not a timing window: no live pane is
-                    // claiming this id, and none ever will — a Goinkyo that
-                    // never ran a turn writes no transcript, ever, not just
+                    // claiming this id, and none ever will — a Claude Goinkyo
+                    // that never ran a turn writes no transcript, ever, not just
                     // on this tick. Reset `session_id` so the next tick's
                     // `AwaitingSpawn` restarts the very same consultation
                     // (its request file outlives this — kept until
@@ -9031,10 +9065,10 @@ struct WorkerChoice<'a> {
 /// already-resolved choice (see [`resolve_worker_agent`]) — this function never
 /// re-derives it. Whenever that choice is `AgentKind::Codex`,
 /// [`PendingOpen::BrigadeMember::needs_codex_kickoff`] picks it up
-/// automatically: this function is the *only* place that ever sets it
-/// `true`, since every call here is a fresh, id-less spawn — a resumed
-/// member with a known id (`stage_brigade`'s own `Some(row)` branch) never
-/// calls this at all.
+/// automatically. Only a fresh, id-less spawn ever sets it `true`: this
+/// function's, and a Codex Goinkyo's ([`update_goinkyo_awaiting_spawn`]); a
+/// resumed member with a known id (`stage_brigade`'s own `Some(row)` branch)
+/// never does.
 ///
 /// A Codex model is the word the operator wrote, which may be a family: it has
 /// to meet the installed Codex's catalog before it can be passed
@@ -9099,31 +9133,39 @@ fn open_worker(
         autocompact: launch.autocompact,
     };
     if agent == AgentKind::Codex && !model.is_empty() {
-        // Joins the round already waiting, if there is one: its one read serves
-        // every creation requested meanwhile, and a round that has creations
-        // held is one that will be answered or given up. Otherwise a new round.
-        let waiting = state
-            .codex_opens_awaiting_catalog
-            .last()
-            .map(|held| held.round);
-        let round = waiting.unwrap_or(state.next_catalog_round);
-        if waiting.is_none() {
-            // Wraps past the end to 1, never to 0, which names no round.
-            state.next_catalog_round = state.next_catalog_round.checked_add(1).unwrap_or(1);
-            // The give-up clock starts at the next tick that sees it, not from
-            // whatever an earlier round left.
-            state.codex_catalog_waiting_since = None;
-        }
-        state
-            .codex_opens_awaiting_catalog
-            .push(HeldCreation { round, open });
-        return if waiting.is_none() {
-            vec![Cmd::ReadCodexCatalog { round }]
-        } else {
-            Vec::new()
-        };
+        return hold_for_catalog(state, open);
     }
     vec![open]
+}
+
+/// Hold back a Codex creation whose model may be a family word until the
+/// catalog read answers, and ask for that read unless one is already out. Shared
+/// by every launch that creates a Codex member with a model: a Worker's
+/// ([`open_worker`]) and a Goinkyo's ([`update_goinkyo_awaiting_spawn`]).
+fn hold_for_catalog(state: &mut EmporiumState, open: Cmd) -> Vec<Cmd> {
+    // Joins the round already waiting, if there is one: its one read serves
+    // every creation requested meanwhile, and a round that has creations
+    // held is one that will be answered or given up. Otherwise a new round.
+    let waiting = state
+        .codex_opens_awaiting_catalog
+        .last()
+        .map(|held| held.round);
+    let round = waiting.unwrap_or(state.next_catalog_round);
+    if waiting.is_none() {
+        // Wraps past the end to 1, never to 0, which names no round.
+        state.next_catalog_round = state.next_catalog_round.checked_add(1).unwrap_or(1);
+        // The give-up clock starts at the next tick that sees it, not from
+        // whatever an earlier round left.
+        state.codex_catalog_waiting_since = None;
+    }
+    state
+        .codex_opens_awaiting_catalog
+        .push(HeldCreation { round, open });
+    if waiting.is_none() {
+        vec![Cmd::ReadCodexCatalog { round }]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Whether a creation of `token` in `brigade_id`, decided earlier and carried
@@ -9172,6 +9214,14 @@ fn forget_unopened_worker(state: &mut EmporiumState, brigade_id: BrigadeId, toke
     state.member_tokens.remove(&key);
     state.member_brigades.remove(&key);
     state.pending_opens.remove(&key);
+    // A Goinkyo's spawn also left its one-shot guard on this very key
+    // (`update_goinkyo_awaiting_spawn`). Left behind for a creation that will
+    // never run, it would read as "in flight or failed: do not retry", and no
+    // later consultation of the brigade could ever open a Goinkyo. A guard naming
+    // a real pane is not this key and is not touched.
+    if token == GOINKYO_TOKEN && state.goinkyo_pane.get(&brigade_id) == Some(&key) {
+        state.goinkyo_pane.remove(&brigade_id);
+    }
 }
 
 /// The member a held `Cmd::OpenEmbedded` creates, if it is a brigade member's.
@@ -9215,6 +9265,30 @@ fn drop_leftovers_of_ended_panes(
         .retain(|(id, _), _| *id != brigade_id);
     state.unreadable_noticed.retain(|(id, _)| *id != brigade_id);
     drop_held_creations_of(state, brigade_id);
+}
+
+/// Drop the creation of one member, `token` of `brigade_id`, that is waiting
+/// for the catalog, with its bookkeeping, and say whether there was one. For a
+/// Goinkyo whose consultation ended while its open was held: the next
+/// consultation of the brigade reuses its token and its placeholder key, and the
+/// held open belongs to the consultation that is over.
+fn drop_held_creation_of_member(
+    state: &mut EmporiumState,
+    brigade_id: BrigadeId,
+    token: &str,
+) -> bool {
+    let held = std::mem::take(&mut state.codex_opens_awaiting_catalog);
+    let mut dropped = false;
+    for creation in held {
+        match held_creation_member(&creation) {
+            Some((id, held_token)) if id == brigade_id && held_token == token => dropped = true,
+            _ => state.codex_opens_awaiting_catalog.push(creation),
+        }
+    }
+    if dropped {
+        forget_unopened_worker(state, brigade_id, token);
+    }
+    dropped
 }
 
 /// Drop what a disband or a close leaves held: the brigade's creations waiting
@@ -9263,7 +9337,19 @@ fn update_codex_catalog_read(
     }
     let mut resolved: Vec<(String, crate::codex_model::Resolved)> = Vec::new();
     let mut opens = Vec::with_capacity(waiting.len());
-    for creation in waiting {
+    // One creation per member. [`creation_still_wanted`] does not count the
+    // creation's own placeholder key, so two held creations of one member (a
+    // Goinkyo's token and key are reused by each consultation) would both pass it
+    // and open the member twice. The later is the current one: the earlier was
+    // asked for by a consultation that has since been replaced.
+    let members: Vec<Option<(BrigadeId, String)>> = waiting
+        .iter()
+        .map(|held| held_creation_member(held).map(|(id, token)| (id, token.to_string())))
+        .collect();
+    for (at, creation) in waiting.into_iter().enumerate() {
+        if members[at].is_some() && members[at + 1..].contains(&members[at]) {
+            continue;
+        }
         let mut open = creation.open.clone();
         if let Some((brigade_id, token)) = held_creation_member(&creation) {
             let token = token.to_string();
@@ -11763,11 +11849,14 @@ fn say_unbriefed_codex_members(
 /// candidate for it at all, so nothing is left here to re-fire on
 /// regardless of the guard.
 ///
-/// Also queues a [`PendingGoinkyoKickoff`] on success — see that struct's
-/// own doc for why the Goinkyo needs one at all (unlike a Worker: an
-/// operator is always the one giving a fresh Worker its first turn, but
+/// Also queues a [`PendingGoinkyoKickoff`] on success for a Claude Goinkyo — see
+/// that struct's own doc for why the Goinkyo needs one at all (unlike a Worker:
+/// an operator is always the one giving a fresh Worker its first turn, but
 /// nobody sits at the Goinkyo's own keyboard) — riding on this same
-/// one-shot guard rather than a separate marker of its own.
+/// one-shot guard rather than a separate marker of its own. A Codex Goinkyo
+/// (the product is the row's, see [`GoinkyoSpawnCandidate::agent`]) gets the
+/// Codex kickoff a fresh Codex Worker gets instead
+/// ([`PendingOpen::BrigadeMember::needs_codex_kickoff`]).
 ///
 /// The `AwaitingSpawn` arm reads more than presence out of the guard: a
 /// *synthetic* key there means a spawn for the current consultation is in
@@ -11809,6 +11898,10 @@ fn update_goinkyo_awaiting_spawn(
                 joined.retain(|listed| listed != GOINKYO_TOKEN);
             }
             forget_goinkyo_facts(state, brigade_id);
+            // An open still held for the catalog is the ended consultation's:
+            // there is no process to end, and the next consultation asks for its
+            // own (a late answer for the round it was in finds nothing waiting).
+            drop_held_creation_of_member(state, brigade_id, GOINKYO_TOKEN);
             let Some(key) = state.goinkyo_pane.remove(&brigade_id) else {
                 return Vec::new();
             };
@@ -11950,30 +12043,54 @@ fn update_goinkyo_awaiting_spawn(
     state
         .member_brigades
         .insert(key.clone(), candidate.brigade_id);
+    // The product is what the row says: `consult_goinkyo` resolved it and
+    // refused the consultation if that product could not work, so a config edit
+    // since then must not send the spawn somewhere the refusal never looked. Only
+    // a row with no product resolves it here, from the setting and the Director.
+    // A Claude Goinkyo is started by the live-file kickoff below; a Codex one by
+    // the Codex kickoff every fresh Codex member gets, which reads the pane's own
+    // OSC 7501 report and input line. `PendingGoinkyoKickoff`'s gate reads
+    // Claude's live file and would wait on a file a Codex pane never writes, so a
+    // Codex Goinkyo is never given one.
+    let agent = candidate.agent.unwrap_or_else(|| {
+        resolve_goinkyo_agent(
+            brigade.goinkyo_agent,
+            candidate.director_agent.unwrap_or(AgentKind::ClaudeCode),
+        )
+    });
     state.pending_opens.insert(
         key.clone(),
         PendingOpen::BrigadeMember {
             brigade_id: candidate.brigade_id,
-            // A Codex kickoff is a Worker-only concern (`open_worker`'s own
-            // doc) — a Goinkyo is always Claude, never Codex (see
-            // `BrigadeConfig::goinkyo_model`'s doc), so this never applies.
-            needs_codex_kickoff: false,
+            needs_codex_kickoff: agent == AgentKind::Codex,
         },
     );
-    state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
-        key: key.clone(),
-        spawned_at: now,
-        notified_not_at_prompt: false,
-        turn_seen: false,
-        stuck: false,
-        sent_at: None,
-        attempts: 0,
-    });
-    vec![Cmd::OpenEmbedded {
+    if agent == AgentKind::ClaudeCode {
+        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
+            key: key.clone(),
+            spawned_at: now,
+            notified_not_at_prompt: false,
+            turn_seen: false,
+            stuck: false,
+            sent_at: None,
+            attempts: 0,
+        });
+    }
+    // `permission_mode` and `disallowed_tools` are Claude flags: a Codex launch
+    // has no field for either. The model and the effort are the product's own
+    // words, so each product reads its own key and never the other's.
+    let claude_only = |value: Option<&str>| {
+        value
+            .filter(|_| agent == AgentKind::ClaudeCode)
+            .map(str::to_string)
+    };
+    let model = brigade.goinkyo_model_for(agent).map(str::to_string);
+    let held = agent == AgentKind::Codex && model.is_some();
+    let open = Cmd::OpenEmbedded {
         key,
         target: SessionToOpen {
             id: String::new(),
-            agent: AgentKind::ClaudeCode,
+            agent,
             title: "goinkyo".to_string(),
             cwd: candidate.cwd,
         },
@@ -11982,12 +12099,20 @@ fn update_goinkyo_awaiting_spawn(
             GOINKYO_TOKEN.to_string(),
             BrigadeRole::Goinkyo,
         )),
-        model: brigade.goinkyo_model().map(str::to_string),
-        effort: brigade.goinkyo_effort().map(str::to_string),
-        permission_mode: brigade.goinkyo_permission_mode().map(str::to_string),
-        disallowed_tools: brigade.goinkyo_disallowed_tools().map(str::to_string),
+        model,
+        effort: brigade.goinkyo_effort_for(agent).map(str::to_string),
+        permission_mode: claude_only(brigade.goinkyo_permission_mode()),
+        disallowed_tools: claude_only(brigade.goinkyo_disallowed_tools()),
         autocompact: None,
-    }]
+    };
+    // A Codex model may be a family word, which has to meet the catalog before it
+    // can be passed (`open_worker`'s doc). Held like a Worker's: the same queue,
+    // the same round, the same answer. The one-shot guard and the placeholder
+    // key's maps were written above, so nothing opens a second one meanwhile.
+    if held {
+        return hold_for_catalog(state, open);
+    }
+    vec![open]
 }
 
 /// Whether a Codex Worker's pane is at its prompt, ready for its kickoff line:
@@ -12356,6 +12481,7 @@ mod untitled_session_tests;
 mod tests {
     use std::path::PathBuf;
 
+    use crate::config::GoinkyoAgentSetting;
     use crate::model::{Activity, StoredMemberLayout};
     use crate::screen::Screen;
 
@@ -13999,6 +14125,103 @@ mod tests {
             "resetting a stranded goinkyo must not read as \"not found\": {:?}",
             state.status
         );
+    }
+
+    #[test]
+    fn a_codex_goinkyo_restaged_before_its_first_turn_is_recorded_is_resumed_without_a_kickoff() {
+        // PINS A KNOWN GAP, NOT A DESIRED BEHAVIOUR. Codex writes a session's
+        // `threads` row and rollout at its first persist, the kickoff's turn, and
+        // banto discovers it about a second later, so a Codex Goinkyo's id
+        // resolves to a row from discovery on, where a Claude one's does not. In 3
+        // of 8 measured runs discovery came 25-39 ms before Codex had written the
+        // briefing and kickoff records of that turn (the row exists, and the
+        // test's `preview: None` stands for the first message not being in it
+        // yet). Staged then by a restart or a pane death, with no live pane to
+        // reuse, the Goinkyo takes the resume arm, whose `needs_codex_kickoff` is
+        // always false: the thread is resumed without the kickoff that would have
+        // started its first turn, and the cut turn never gets one. Nothing here
+        // handles it. If this test starts failing because banto learned to,
+        // update it to the new behaviour rather than weakening it.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        // A row with no preview is a session with no first user message.
+        let mut app = app_with(vec![row("dir"), codex_row("g1")]);
+        assert_eq!(app.row_for_id("g1").unwrap().preview, None);
+        let brigade = brigade_config();
+        state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
+
+        let roster = vec![
+            (
+                "director".to_string(),
+                BrigadeRole::Director,
+                Some("dir".to_string()),
+            ),
+            (
+                "goinkyo".to_string(),
+                BrigadeRole::Goinkyo,
+                Some("g1".to_string()),
+            ),
+        ];
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: Some(roster),
+                layout: None,
+                names: Vec::new(),
+            },
+            test_instant(),
+        );
+
+        // Resumed under its own id, as the Goinkyo of brigade 1 ...
+        let opens: Vec<_> = cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::OpenEmbedded {
+                    target, brigade, ..
+                } if target.id == "g1" => Some((target.agent, brigade.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            opens,
+            vec![(
+                AgentKind::Codex,
+                Some((1, "goinkyo".to_string(), BrigadeRole::Goinkyo))
+            )],
+            "{cmds:?}"
+        );
+        // ... not mistaken for a stranded one: its session id is kept.
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::Store(StoreIntent::ClearMemberSession { .. }))),
+            "{cmds:?}"
+        );
+        // The open is a resume that expects no kickoff ...
+        let key = SessionKey::from_id("g1");
+        assert!(matches!(
+            state.pending_opens.get(&key),
+            Some(PendingOpen::BrigadeMember {
+                brigade_id: 1,
+                needs_codex_kickoff: false
+            })
+        ));
+        // ... and once it is up, no kickoff of either kind is waiting for it.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key,
+                agent: Some(AgentKind::Codex),
+            },
+            test_instant(),
+        );
+        assert!(state.pending_kickoffs.is_empty());
+        assert!(state.pending_goinkyo_kickoffs.is_empty());
     }
 
     #[test]
@@ -27897,6 +28120,8 @@ mod tests {
             brigade_id,
             cwd: PathBuf::from("/work/alpha"),
             roster: Vec::new(),
+            agent: None,
+            director_agent: None,
         }
     }
 
@@ -27974,6 +28199,279 @@ mod tests {
         assert_eq!(permission_mode.as_deref(), Some("auto"));
         assert_eq!(disallowed_tools.as_deref(), Some("Edit,Write,NotebookEdit"));
         assert!(state.goinkyo_pane.contains_key(&7));
+    }
+
+    #[test]
+    fn a_claude_goinkyo_gets_the_live_file_kickoff_and_never_the_codex_one() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = BrigadeConfig::default();
+        // Pinned to Claude so that this stays about the Claude kickoff, not about
+        // what the built-in resolves to.
+        let brigade = BrigadeConfig {
+            goinkyo_agent: GoinkyoAgentSetting::Claude,
+            ..brigade
+        };
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(7),
+            test_instant(),
+        );
+        let [Cmd::OpenEmbedded { key, target, .. }] = cmds.as_slice() else {
+            panic!("expected exactly one OpenEmbedded, got {cmds:?}");
+        };
+        assert_eq!(target.agent, AgentKind::ClaudeCode);
+        assert!(matches!(
+            state.pending_opens.get(key),
+            Some(PendingOpen::BrigadeMember {
+                needs_codex_kickoff: false,
+                ..
+            })
+        ));
+        assert_eq!(state.pending_goinkyo_kickoffs.len(), 1);
+        assert_eq!(&state.pending_goinkyo_kickoffs[0].key, key);
+    }
+
+    #[test]
+    fn a_codex_goinkyo_opens_as_codex_with_the_codex_kickoff_and_none_of_the_claude_settings() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        // Every Claude setting at a value a Codex launch must not receive.
+        let brigade = BrigadeConfig {
+            goinkyo_agent: GoinkyoAgentSetting::Codex,
+            goinkyo_model: "opus".to_string(),
+            goinkyo_effort: "xhigh".to_string(),
+            ..BrigadeConfig::default()
+        };
+        assert!(brigade.goinkyo_permission_mode().is_some());
+        assert!(brigade.goinkyo_disallowed_tools().is_some());
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(7),
+            test_instant(),
+        );
+        let [
+            Cmd::OpenEmbedded {
+                key,
+                target,
+                brigade: member,
+                model,
+                effort,
+                permission_mode,
+                disallowed_tools,
+                autocompact,
+            },
+        ] = cmds.as_slice()
+        else {
+            panic!("expected exactly one OpenEmbedded, got {cmds:?}");
+        };
+        assert_eq!(target.agent, AgentKind::Codex);
+        assert!(target.id.is_empty(), "a consultation is always a creation");
+        assert_eq!(target.cwd, PathBuf::from("/work/alpha"));
+        assert_eq!(
+            member
+                .as_ref()
+                .map(|(id, token, role)| (*id, token.as_str(), *role)),
+            Some((7, "goinkyo", BrigadeRole::Goinkyo))
+        );
+        assert_eq!(
+            (
+                model,
+                effort,
+                permission_mode,
+                disallowed_tools,
+                autocompact
+            ),
+            (&None, &None, &None, &None, &None)
+        );
+        // Started by the Codex kickoff; the live-file kickoff would wait on a
+        // file a Codex pane never writes.
+        assert!(matches!(
+            state.pending_opens.get(key),
+            Some(PendingOpen::BrigadeMember {
+                brigade_id: 7,
+                needs_codex_kickoff: true,
+            })
+        ));
+        assert!(state.pending_goinkyo_kickoffs.is_empty());
+        // Everything else a Goinkyo spawn writes is the same for either product.
+        assert_eq!(state.goinkyo_pane.get(&7), Some(key));
+        assert_eq!(
+            state.member_tokens.get(key).map(String::as_str),
+            Some("goinkyo")
+        );
+        assert_eq!(state.member_brigades.get(key), Some(&7));
+    }
+
+    #[test]
+    fn a_codex_goinkyo_is_still_opened_only_once_per_consultation() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = BrigadeConfig {
+            goinkyo_agent: GoinkyoAgentSetting::Codex,
+            ..BrigadeConfig::default()
+        };
+        let opened = (0..3)
+            .map(|_| {
+                update(
+                    &mut state,
+                    &mut app,
+                    &brigade,
+                    awaiting_spawn(3),
+                    test_instant(),
+                )
+                .len()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(opened, [1, 0, 0]);
+    }
+
+    /// An awaiting-spawn event for a row that records `agent`, under a Director
+    /// whose own product is `director_agent`.
+    fn awaiting_spawn_as(
+        brigade_id: BrigadeId,
+        agent: Option<AgentKind>,
+        director_agent: Option<AgentKind>,
+    ) -> Event {
+        Event::GoinkyoAwaitingSpawn {
+            observation: GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate {
+                agent,
+                director_agent,
+                ..goinkyo_candidate(brigade_id)
+            }),
+        }
+    }
+
+    /// What `event` makes the engine open a Goinkyo as under `setting`, and
+    /// whether it queued the Claude live-file kickoff.
+    fn goinkyo_spawn_under(setting: GoinkyoAgentSetting, event: Event) -> (AgentKind, bool) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = BrigadeConfig {
+            goinkyo_agent: setting,
+            ..BrigadeConfig::default()
+        };
+        let cmds = update(&mut state, &mut app, &brigade, event, test_instant());
+        let [Cmd::OpenEmbedded { target, .. }] = cmds.as_slice() else {
+            panic!("expected exactly one OpenEmbedded, got {cmds:?}");
+        };
+        (target.agent, !state.pending_goinkyo_kickoffs.is_empty())
+    }
+
+    #[test]
+    fn the_rows_product_outranks_the_setting_in_both_directions() {
+        // The setting was edited after `consult_goinkyo` resolved and checked the
+        // product: the spawn still goes where the check looked.
+        assert_eq!(
+            goinkyo_spawn_under(
+                GoinkyoAgentSetting::Codex,
+                awaiting_spawn_as(7, Some(AgentKind::ClaudeCode), None)
+            ),
+            (AgentKind::ClaudeCode, true)
+        );
+        assert_eq!(
+            goinkyo_spawn_under(
+                GoinkyoAgentSetting::Claude,
+                awaiting_spawn_as(7, Some(AgentKind::Codex), None)
+            ),
+            (AgentKind::Codex, false)
+        );
+        // Not even a Director of the other product moves it.
+        assert_eq!(
+            goinkyo_spawn_under(
+                GoinkyoAgentSetting::Inherit,
+                awaiting_spawn_as(7, Some(AgentKind::ClaudeCode), Some(AgentKind::Codex))
+            ),
+            (AgentKind::ClaudeCode, true)
+        );
+    }
+
+    #[test]
+    fn a_row_with_no_product_is_resolved_from_the_setting_and_the_directors() {
+        use AgentKind::{ClaudeCode, Codex};
+        use GoinkyoAgentSetting::{Claude, Codex as CodexSetting, Inherit};
+        for (setting, director, expected) in [
+            (Inherit, Some(Codex), Codex),
+            (Inherit, Some(ClaudeCode), ClaudeCode),
+            // No Director product known: Claude, not a refusal.
+            (Inherit, None, ClaudeCode),
+            (Claude, Some(Codex), ClaudeCode),
+            (CodexSetting, None, Codex),
+            (CodexSetting, Some(ClaudeCode), Codex),
+        ] {
+            let (agent, kickoff) =
+                goinkyo_spawn_under(setting, awaiting_spawn_as(7, None, director));
+            assert_eq!(agent, expected, "{setting:?} under {director:?}");
+            assert_eq!(
+                kickoff,
+                expected == ClaudeCode,
+                "{setting:?} under {director:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherit_under_a_claude_director_opens_exactly_what_claude_always_did() {
+        // The baseline is the spawn as it was before `inherit` existed: the
+        // `claude` setting and a candidate that says nothing about a product.
+        let spawn = |setting, event| {
+            let mut state = EmporiumState::new(PrefixKey::default());
+            let mut app = app_with(vec![]);
+            let brigade = BrigadeConfig {
+                goinkyo_agent: setting,
+                ..BrigadeConfig::default()
+            };
+            let cmds = update(&mut state, &mut app, &brigade, event, test_instant());
+            (
+                format!("{cmds:?}"),
+                // Every field but `spawned_at`, which is the clock of the run.
+                state
+                    .pending_goinkyo_kickoffs
+                    .iter()
+                    .map(|k| {
+                        (
+                            k.key.clone(),
+                            k.notified_not_at_prompt,
+                            k.turn_seen,
+                            k.stuck,
+                            k.sent_at,
+                            k.attempts,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                state
+                    .pending_opens
+                    .values()
+                    .map(|open| {
+                        matches!(
+                            open,
+                            PendingOpen::BrigadeMember {
+                                brigade_id: 7,
+                                needs_codex_kickoff: false,
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let baseline = spawn(GoinkyoAgentSetting::Claude, awaiting_spawn(7));
+        assert!(baseline.0.contains("ClaudeCode") && !baseline.1.is_empty());
+        for row in [None, Some(AgentKind::ClaudeCode)] {
+            assert_eq!(
+                spawn(
+                    GoinkyoAgentSetting::Inherit,
+                    awaiting_spawn_as(7, row, Some(AgentKind::ClaudeCode))
+                ),
+                baseline,
+                "row product {row:?}"
+            );
+        }
     }
 
     #[test]

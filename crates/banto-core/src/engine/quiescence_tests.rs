@@ -5354,6 +5354,8 @@ fn a_goinkyo_spawned_off_stage_holds_the_ring_until_it_has_had_its_kickoff() {
             brigade_id: 1,
             cwd: PathBuf::from("/work"),
             roster: Vec::new(),
+            agent: None,
+            director_agent: None,
         }),
         at,
     );
@@ -5402,6 +5404,8 @@ fn a_goinkyo_spawned_off_stage_that_waits_is_shown_on_its_director() {
             brigade_id: 1,
             cwd: PathBuf::from("/work"),
             roster: Vec::new(),
+            agent: None,
+            director_agent: None,
         }),
         at,
     );
@@ -10338,6 +10342,8 @@ fn a_new_goinkyo_hosted_before_it_has_a_session_starts_with_no_facts_even_if_the
             brigade_id: 1,
             cwd: std::path::PathBuf::from("/work"),
             roster: Vec::new(),
+            agent: None,
+            director_agent: None,
         }),
         t0(),
     );

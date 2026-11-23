@@ -289,6 +289,8 @@ impl Scene {
                 brigade_id,
                 cwd: PathBuf::from("/work/alpha"),
                 roster,
+                agent: None,
+                director_agent: None,
             }),
         })
     }
@@ -848,6 +850,9 @@ fn a_spawn_candidate_recorded_without_a_roster_still_parses_and_joins_last() {
     let old: GoinkyoSpawnCandidate =
         serde_json::from_str(r#"{"brigade_id":1,"cwd":"/work/alpha"}"#).unwrap();
     assert!(old.roster.is_empty());
+    // The product fields arrived later still: a capture without them resolves
+    // from the setting, as it did when it was recorded.
+    assert_eq!((old.agent, old.director_agent), (None, None));
 
     let mut scene = Scene::two_brigades(true);
     scene.stage_one();

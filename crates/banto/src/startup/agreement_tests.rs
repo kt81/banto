@@ -238,30 +238,32 @@ fn assert_agrees(label: &str, parent: &Resolved, child: &Resolved, homes: bool) 
         format!("{:?}", parent.db_path),
         format!("{:?}", child.db_path),
     );
+    // The data directory is every process's, the hook's included: it is where a
+    // Goinkyo's consultation request is read from.
+    check(
+        "data directory",
+        format!("{:?}", parent.data_dir),
+        format!("{:?}", child.data_dir),
+    );
+    // Everything banto derives from it: the MCP configs (and where a member's
+    // goes), the consultation requests, the message logs.
+    let derived = |r: &Resolved| {
+        r.data_dir().map(|d| {
+            (
+                d.mcp_dir(),
+                d.member_config_path(7, "worker-1"),
+                d.goinkyo_dir(),
+                d.goinkyo_request_path(7),
+                d.logs_dir(),
+            )
+        })
+    };
+    check(
+        "paths derived from the data directory",
+        format!("{:?}", derived(parent)),
+        format!("{:?}", derived(child)),
+    );
     if homes {
-        check(
-            "data directory",
-            format!("{:?}", parent.data_dir),
-            format!("{:?}", child.data_dir),
-        );
-        // Everything banto derives from it: the MCP configs (and where a member's
-        // goes), the consultation requests, the message logs.
-        let derived = |r: &Resolved| {
-            r.data_dir().map(|d| {
-                (
-                    d.mcp_dir(),
-                    d.member_config_path(7, "worker-1"),
-                    d.goinkyo_dir(),
-                    d.goinkyo_request_path(7),
-                    d.logs_dir(),
-                )
-            })
-        };
-        check(
-            "paths derived from the data directory",
-            format!("{:?}", derived(parent)),
-            format!("{:?}", derived(child)),
-        );
         check(
             "Claude home",
             format!("{:?}", parent.claude_home),
@@ -354,8 +356,9 @@ fn children_of_a_parent_with_no_data_directory_have_none_either() {
         assert_eq!(child.data_dir, None, "{label}");
         assert_agrees(label, &parent, &child, true);
     }
-    // The hook is handed through the environment and reads no data directory:
-    // it has none either, and its database is still the parent's.
+    // The hook is handed through the environment, which names no data directory
+    // when the parent has none: it has none either, and its database is still the
+    // parent's.
     let hook = world.resolve_hook(&invocations.hook_env, None);
     assert_eq!(hook.data_dir, None);
     assert_agrees("_hook", &parent, &hook, false);
@@ -384,11 +387,12 @@ fn children_of_a_parent_whose_data_directory_was_chosen_by_variable_resolve_what
         assert_agrees(label, &parent, &child, true);
     }
     let hook = world.resolve_hook(&invocations.hook_env, None);
+    assert_eq!(hook.data_dir, parent.data_dir);
     assert_agrees("_hook", &parent, &hook, false);
 }
 
 #[test]
-fn a_hook_resolves_the_config_and_database_its_parent_did() {
+fn a_hook_resolves_the_config_database_and_data_directory_its_parent_did() {
     let world = World::new();
     let (_, parent) = world.parent();
     let child = world.resolve_hook(&invocations(&parent).hook_env, None);

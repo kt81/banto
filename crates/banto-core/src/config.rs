@@ -131,14 +131,137 @@ impl<'de> Deserialize<'de> for WorkerAgentSetting {
     }
 }
 
-/// Brigade formation settings.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Which product an auto-spawned Goinkyo runs as — `[brigade] goinkyo_agent` in
+/// config.toml. The built-in is [`Self::Inherit`], so a Codex Director's
+/// Goinkyo is Codex; `claude` keeps the product a Goinkyo had before the key
+/// existed, whatever the Director runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GoinkyoAgentSetting {
+    /// The Director's own product: a Codex Director consults a Codex Goinkyo.
+    /// The built-in.
+    #[default]
+    Inherit,
+    /// Claude Code, whatever the Director runs.
+    Claude,
+    /// Codex.
+    Codex,
+}
+
+impl GoinkyoAgentSetting {
+    /// Parses `[brigade] goinkyo_agent`'s raw string like
+    /// [`WorkerAgentSetting::parse`]: case-insensitive and whitespace-trimmed.
+    /// `None` for anything else, an empty string included: it is not one of the
+    /// three words, and the way to take the built-in is to omit the key.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "inherit" => Some(Self::Inherit),
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            _ => None,
+        }
+    }
+}
+
+/// The product a Goinkyo runs as, given the operator's setting and the product
+/// of the Director that summons it. The one place `inherit` is resolved:
+/// `consult_goinkyo` calls it to decide whether the consultation can start at
+/// all and records the answer on the Goinkyo's member row, and the engine
+/// calls it only for a row that has none (a row written before the product was
+/// recorded), so the two cannot disagree after the config is edited.
+pub fn resolve_goinkyo_agent(setting: GoinkyoAgentSetting, director: AgentKind) -> AgentKind {
+    match setting {
+        GoinkyoAgentSetting::Inherit => director,
+        GoinkyoAgentSetting::Claude => AgentKind::ClaudeCode,
+        GoinkyoAgentSetting::Codex => AgentKind::Codex,
+    }
+}
+
+/// Why a Goinkyo of a given product cannot be started, as
+/// [`goinkyo_refusal`] reports it. Each variant is a condition the operator can
+/// change; none is a judgement about the consultation itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoinkyoRefusal {
+    /// The `agents` setting leaves the product out, so banto neither lists nor
+    /// opens its sessions.
+    NotEnabled(AgentKind),
+    /// The product's home directory did not resolve, so there is nothing to
+    /// launch it against.
+    HomeUnresolved(AgentKind),
+    /// A Codex Goinkyo would start unbriefed: banto's own path has a space in it,
+    /// so the hook command cannot carry it and Codex is never given the hook.
+    CodexHookNotLaunchable,
+    /// A Codex Goinkyo would start unbriefed: Codex has not been asked to trust
+    /// banto's `SessionStart` hook, and an untrusted hook fails silently.
+    CodexHookNotPrimed,
+}
+
+/// The two facts about banto's `SessionStart` hook that decide whether a Codex
+/// member is briefed. Named fields rather than two bare bools, which a caller
+/// could swap without the compiler noticing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexHookFacts {
+    /// The hook command can carry banto's executable path (no space in it).
+    pub launchable: bool,
+    /// Codex has been asked to trust the hook (`Primed`).
+    pub primed: bool,
+}
+
+/// The first condition that stops a Goinkyo of `product` from working, in the
+/// order an operator would fix them: the product enabled, its home known, then
+/// (Codex only) the hook launchable and the hook trusted. A hook that cannot be
+/// launched outranks the trust question, as it does where a brigade is formed
+/// (`update_codex_trust_checked`): a trust record for a hook that never runs
+/// settles nothing. `None` when nothing does.
+///
+/// Directory trust is not among them: Codex writes no trust record for a
+/// directory outside a git repository, so an absent one does not mean it will
+/// ask (`banto_io::directory_trust`'s module doc).
+pub fn goinkyo_refusal(
+    product: AgentKind,
+    enabled: &BTreeSet<AgentKind>,
+    home_resolved: bool,
+    codex_hook: CodexHookFacts,
+) -> Option<GoinkyoRefusal> {
+    if !enabled.contains(&product) {
+        return Some(GoinkyoRefusal::NotEnabled(product));
+    }
+    if !home_resolved {
+        return Some(GoinkyoRefusal::HomeUnresolved(product));
+    }
+    if product != AgentKind::Codex {
+        return None;
+    }
+    if !codex_hook.launchable {
+        return Some(GoinkyoRefusal::CodexHookNotLaunchable);
+    }
+    (!codex_hook.primed).then_some(GoinkyoRefusal::CodexHookNotPrimed)
+}
+
+impl<'de> Deserialize<'de> for GoinkyoAgentSetting {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).ok_or_else(|| {
+            not_accepted(
+                "goinkyo_agent",
+                &raw,
+                "\"inherit\", \"claude\" or \"codex\"",
+            )
+        })
+    }
+}
+
+/// `[brigade.claude]`: the settings that only mean something to Claude Code.
+/// Every one is optional: an absent key defers to the legacy flat `[brigade]`
+/// key of the same name (see [`BrigadeConfig`]) and then to the built-in. Values
+/// that go to the agent are passed on as written and not validated: banto
+/// keeps no list of the harness's models, efforts or modes, and the agent says
+/// what it thinks of a value it does not know.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default)]
-pub struct BrigadeConfig {
-    /// How many fresh Workers to auto-spawn when a brigade is formed.
-    /// Clamped to 1..=8 wherever it's consumed — a raw, unclamped value here
-    /// lets a config round-trip losslessly even if it's out of range.
-    pub workers: u32,
+pub struct ClaudeBrigadeConfig {
     /// `--model` a Claude Worker launches with **when its session is first
     /// created** — never on a resume: a flag-less `claude --resume` restores
     /// the transcript's last model, including one the operator changed inside
@@ -151,20 +274,141 @@ pub struct BrigadeConfig {
     /// The built-in is the family word `sonnet`, never a version: Claude
     /// resolves the alias itself, so it cannot go stale in this file.
     ///
-    /// Named without a product suffix because it predates
-    /// [`Self::worker_model_codex`] and every config.toml that already sets
-    /// it means exactly this — a Claude Worker's model — so it keeps that
-    /// name and that meaning unconditionally rather than being renamed or
-    /// repurposed into a product-agnostic default. See
-    /// [`Self::worker_model_for`] for how the two fields combine once a
-    /// brigade can have either product as Worker.
-    pub worker_model: String,
+    /// [`BrigadeConfig::worker_model_for`] picks between this and
+    /// [`CodexBrigadeConfig::worker_model`] by the Worker's product.
+    pub worker_model: Option<String>,
     /// `--effort <level>` a Claude Worker launches with when its session is
     /// first created (`low`/`medium`/`high`/`xhigh`/`max`), built-in `high`;
     /// empty passes no flag. Not validated here: Claude warns about an
     /// invalid level and ignores it. Never passed on a resume — the effort
     /// then comes from the operator's own Claude settings, which Claude saves
     /// per model (read in its docs, not measured by running it).
+    pub worker_effort: Option<String>,
+    /// `--permission-mode <mode>` an auto-spawned Worker launches with,
+    /// default `"auto"` — same flag, same accepted values, and the same
+    /// unattended-operator rationale as [`Self::goinkyo_permission_mode`].
+    /// Same empty-string escape hatch as [`Self::worker_model`].
+    ///
+    /// Unlike the Goinkyo, a Worker carries no accompanying tool denylist
+    /// alongside this: editing the working tree is what a Worker is for, so
+    /// nothing here pairs with it the way [`Self::goinkyo_disallowed_tools`]
+    /// pairs with the Goinkyo's.
+    pub worker_permission_mode: Option<String>,
+    /// `--model` a Goinkyo is created with, built-in `"opus"` (a family
+    /// word, no version). Only when its session is first created, never on a
+    /// resume — [`Self::worker_model`]'s doc says why. Same empty-string escape
+    /// hatch. A Claude Goinkyo's alone: it is a Claude word. A Codex Goinkyo
+    /// (`goinkyo_agent = "codex"`) reads [`CodexBrigadeConfig::goinkyo_model`].
+    ///
+    /// `fable` is an opt-in, not the built-in: a Pro or standard Team seat pays
+    /// for Fable with usage credits and an interactive session asks consent
+    /// first, a prompt that waits with no expiry in a pane nobody is watching
+    /// (`docs/REQUIREMENTS.md`, "Decision (2026-11-23)").
+    pub goinkyo_model: Option<String>,
+    /// `--effort <level>` a Goinkyo is created with, built-in `"xhigh"`, on
+    /// creation only like the model above. `max` is an opt-in: it cannot be
+    /// saved to Claude's settings, so a resumed Goinkyo never has it again,
+    /// and a Goinkyo that ran on it was a quarter of this project's measured
+    /// usage (same decision entry). Claude's own reasoning-effort flag (`claude --help`,
+    /// accepts `low`/`medium`/`high`/`xhigh`/`max`): only a Claude Goinkyo is
+    /// given it, and a Codex one reads [`CodexBrigadeConfig::goinkyo_effort`],
+    /// which is a different flag with different words. Same empty-string escape
+    /// hatch as the model above.
+    pub goinkyo_effort: Option<String>,
+    /// `--permission-mode <mode>` an auto-spawned Goinkyo launches with,
+    /// default `"auto"` (`claude --help`, accepts `manual`/`acceptEdits`/
+    /// `plan`/`auto`/`dontAsk`/`bypassPermissions`). Same empty-string
+    /// escape hatch as the model/effort above.
+    ///
+    /// `auto` and not `manual` (Claude's own default) because nobody is at
+    /// the Goinkyo's keyboard to answer a permission prompt — `manual`
+    /// reliably stops there, and so does `plan`, whose own design still
+    /// exits through a human approval at the end. Not a guarantee of
+    /// unattended operation either, though: Claude Code falls back to its
+    /// ordinary confirmation flow after repeated denials even under `auto`,
+    /// and that flow stops the same way `manual` does. This only removes
+    /// one specific stop, observed live 2026-08-05 — a Goinkyo that had
+    /// just started on its own (the kickoff fix above landing) then sat
+    /// waiting for an operator who wasn't watching to approve a tool call.
+    pub goinkyo_permission_mode: Option<String>,
+    /// `--disallowedTools <tools>` an auto-spawned Goinkyo launches with,
+    /// default `"Edit,Write,NotebookEdit"` (`claude --help`: comma- or
+    /// space-separated tool names to deny). Same empty-string escape hatch
+    /// as the model/effort/permission-mode above, and — unlike `effort`,
+    /// like `permission_mode` — passed on a resume too: which tools a
+    /// Goinkyo may use is a property of the *role*, not of whether this
+    /// particular launch happens to be fresh or resumed.
+    ///
+    /// Not containment: Bash stays available (this is a tool-name denylist,
+    /// not a sandbox), so it is no barrier against anything actually
+    /// adversarial. It exists because `goinkyo_permission_mode`'s own
+    /// `"auto"` default changed what "unattended" means here — under
+    /// `"manual"` an edit stopped for approval nobody was there to give;
+    /// under `"auto"` it doesn't, so an unattended Goinkyo could now write
+    /// to the same working tree the Director is using without anyone
+    /// having agreed to that. This is a deterrent against that drift, not a
+    /// defense against a hostile session. The cost worth stating plainly:
+    /// it also blocks whatever a scratchpad or memory write would use
+    /// (`Edit`/`Write`/`NotebookEdit`) — consistent with a role meant to be
+    /// called holding nothing of its own, but a real cost, not a free one.
+    pub goinkyo_disallowed_tools: Option<String>,
+}
+
+/// `[brigade.codex]`: the settings that only mean something to Codex. Resolved
+/// like [`ClaudeBrigadeConfig`]'s, except that its two Goinkyo keys have no
+/// legacy flat spelling, so their built-in is the empty string.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default)]
+pub struct CodexBrigadeConfig {
+    /// The model a Codex Worker launches with when its session is first
+    /// created — the Codex sibling of [`ClaudeBrigadeConfig::worker_model`], same
+    /// empty-string escape hatch, independent default (the products share no
+    /// model namespace).
+    ///
+    /// Either a slug or a family word. Codex has no alias for `-m`: the string
+    /// must be a catalog slug, and an unknown one is sent to the API as it
+    /// stands. So a family word (the built-in `terra`) is resolved to the
+    /// newest slug of that family from the installed binary's own catalog at
+    /// the moment the session is created (`crate::codex_model`); a string
+    /// holding a digit that the catalog does not know is passed untouched.
+    pub worker_model: Option<String>,
+    /// `-c model_reasoning_effort="<level>"` a Codex Worker launches with when
+    /// its session is first created, built-in `high`; empty passes nothing.
+    /// Never on a resume: a `-c model_reasoning_effort` on a resume switches
+    /// Codex to "override" mode and drops the thread's own model (read in
+    /// Codex's source at tag `rust-v0.168.0`, not measured by running it).
+    pub worker_effort: Option<String>,
+    /// The model a Codex Goinkyo launches with when its session is first
+    /// created. Built-in empty: no `-m`, so it starts on the operator's own Codex
+    /// default, which is what a Goinkyo asked for in Codex has run on since
+    /// `goinkyo_agent` existed. A slug or a family word, like
+    /// [`Self::worker_model`], and held back for the catalog the same way
+    /// (`crate::codex_model`). Creation only, never on a resume, for the reason
+    /// [`Self::worker_effort`] gives. Not validated.
+    pub goinkyo_model: Option<String>,
+    /// `-c model_reasoning_effort="<level>"` a Codex Goinkyo launches with when
+    /// its session is first created. Built-in empty: nothing is passed. Creation
+    /// only, for the reason [`Self::worker_effort`] gives. Not validated.
+    pub goinkyo_effort: Option<String>,
+}
+
+/// Brigade formation settings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct BrigadeConfig {
+    /// How many fresh Workers to auto-spawn when a brigade is formed.
+    /// Clamped to 1..=8 wherever it's consumed — a raw, unclamped value here
+    /// lets a config round-trip losslessly even if it's out of range.
+    pub workers: u32,
+    /// Legacy spelling of `[brigade.claude] worker_model`, still read; the table's
+    /// value wins when both are set. Holds the built-in when the file sets
+    /// neither, which is why it is not an `Option`. What the value means is on
+    /// [`ClaudeBrigadeConfig::worker_model`].
+    pub worker_model: String,
+    /// Legacy spelling of `[brigade.claude] worker_effort`, still read; the table's
+    /// value wins when both are set. Holds the built-in when the file sets
+    /// neither, which is why it is not an `Option`. What the value means is on
+    /// [`ClaudeBrigadeConfig::worker_effort`].
     pub worker_effort: String,
     /// The window a Worker compacts at: `auto`, or a size in tokens from
     /// 100000 to 1000000. Built-in `250000`; an empty string passes nothing.
@@ -199,35 +443,22 @@ pub struct BrigadeConfig {
     /// the one reader.
     #[serde(deserialize_with = "autocompact_setting")]
     pub worker_autocompact: String,
-    /// The model a Codex Worker launches with when its session is first
-    /// created — the Codex sibling of [`Self::worker_model`], same
-    /// empty-string escape hatch, independent default (the products share no
-    /// model namespace).
-    ///
-    /// Either a slug or a family word. Codex has no alias for `-m`: the string
-    /// must be a catalog slug, and an unknown one is sent to the API as it
-    /// stands. So a family word (the built-in `terra`) is resolved to the
-    /// newest slug of that family from the installed binary's own catalog at
-    /// the moment the session is created (`crate::codex_model`); a string
-    /// holding a digit that the catalog does not know is passed untouched.
+    /// Legacy spelling of `[brigade.codex] worker_model`, still read; the table's
+    /// value wins when both are set. Holds the built-in when the file sets
+    /// neither, which is why it is not an `Option`. What the value means is on
+    /// [`CodexBrigadeConfig::worker_model`].
     pub worker_model_codex: String,
-    /// `-c model_reasoning_effort="<level>"` a Codex Worker launches with when
-    /// its session is first created, built-in `high`; empty passes nothing.
-    /// Never on a resume: a `-c model_reasoning_effort` on a resume switches
-    /// Codex to "override" mode and drops the thread's own model (read in
-    /// Codex's source at tag `rust-v0.168.0`, not measured by running it).
+    /// Legacy spelling of `[brigade.codex] worker_effort`, still read; the table's
+    /// value wins when both are set. Holds the built-in when the file sets
+    /// neither, which is why it is not an `Option`. What the value means is on
+    /// [`CodexBrigadeConfig::worker_effort`].
     pub worker_effort_codex: String,
     /// See [`WorkerAgentSetting`].
     pub worker_agent: WorkerAgentSetting,
-    /// `--permission-mode <mode>` an auto-spawned Worker launches with,
-    /// default `"auto"` — same flag, same accepted values, and the same
-    /// unattended-operator rationale as [`Self::goinkyo_permission_mode`].
-    /// Same empty-string escape hatch as [`Self::worker_model`].
-    ///
-    /// Unlike the Goinkyo, a Worker carries no accompanying tool denylist
-    /// alongside this: editing the working tree is what a Worker is for, so
-    /// nothing here pairs with it the way [`Self::goinkyo_disallowed_tools`]
-    /// pairs with the Goinkyo's.
+    /// Legacy spelling of `[brigade.claude] worker_permission_mode`, still read; the table's
+    /// value wins when both are set. Holds the built-in when the file sets
+    /// neither, which is why it is not an `Option`. What the value means is on
+    /// [`ClaudeBrigadeConfig::worker_permission_mode`].
     pub worker_permission_mode: String,
     /// See [`RelayMode`].
     pub relay: RelayMode,
@@ -259,69 +490,48 @@ pub struct BrigadeConfig {
     /// plus `{request}` (the consultation request file's path — see
     /// `crate::briefing::render`), and the same empty-string escape hatch.
     pub goinkyo_prompt: String,
-    /// `--model` a Goinkyo is created with, built-in `"opus"` (a family
-    /// word, no version). Only when its session is first created, never on a
-    /// resume — [`Self::worker_model`]'s doc says why. Same empty-string escape
-    /// hatch. Claude only — a Goinkyo is always Claude (see
-    /// [`Self::goinkyo_effort`]'s doc for why this build never gives it a Codex
-    /// counterpart).
-    ///
-    /// `fable` is an opt-in, not the built-in: a Pro or standard Team seat pays
-    /// for Fable with usage credits and an interactive session asks consent
-    /// first, a prompt that waits with no expiry in a pane nobody is watching
-    /// (`docs/REQUIREMENTS.md`, "Decision (2026-11-23)").
+    /// See [`GoinkyoAgentSetting`]. A Codex Goinkyo takes its model
+    /// and effort from `[brigade.codex]` ([`CodexBrigadeConfig::goinkyo_model`],
+    /// [`CodexBrigadeConfig::goinkyo_effort`]), never from the Claude ones, and
+    /// none of the Claude-only flags that keep a Goinkyo from editing
+    /// (`[brigade.claude]`'s `goinkyo_permission_mode` and
+    /// `goinkyo_disallowed_tools`); it is held read-only by Codex's own sandbox
+    /// flags instead.
+    pub goinkyo_agent: GoinkyoAgentSetting,
+    /// Legacy spelling of `[brigade.claude] goinkyo_model`, still read; the table's
+    /// value wins when both are set. Holds the built-in when the file sets
+    /// neither, which is why it is not an `Option`. What the value means is on
+    /// [`ClaudeBrigadeConfig::goinkyo_model`].
     pub goinkyo_model: String,
-    /// `--effort <level>` a Goinkyo is created with, built-in `"xhigh"`, on
-    /// creation only like the model above. `max` is an opt-in: it cannot be
-    /// saved to Claude's settings, so a resumed Goinkyo never has it again,
-    /// and a Goinkyo that ran on it was a quarter of this project's measured
-    /// usage (same decision entry). Claude's own reasoning-effort flag (`claude --help`,
-    /// accepts `low`/`medium`/`high`/`xhigh`/`max`), not a general
-    /// per-product setting: a Goinkyo is Claude-only in this build (see
-    /// `AgentLaunch::Claude`'s own `effort` field), so there is no
-    /// `goinkyo_effort_codex` counterpart the way [`Self::worker_model`]
-    /// has [`Self::worker_model_codex`] — Codex's nearest equivalent would
-    /// be `-c model_reasoning_effort`, a different mechanism entirely, left
-    /// for whenever a Codex Goinkyo is a real feature rather than a
-    /// hypothetical. Same empty-string escape hatch as the model above.
+    /// Legacy spelling of `[brigade.claude] goinkyo_effort`, still read; the table's
+    /// value wins when both are set. Holds the built-in when the file sets
+    /// neither, which is why it is not an `Option`. What the value means is on
+    /// [`ClaudeBrigadeConfig::goinkyo_effort`].
     pub goinkyo_effort: String,
-    /// `--permission-mode <mode>` an auto-spawned Goinkyo launches with,
-    /// default `"auto"` (`claude --help`, accepts `manual`/`acceptEdits`/
-    /// `plan`/`auto`/`dontAsk`/`bypassPermissions`). Same empty-string
-    /// escape hatch as the model/effort above.
-    ///
-    /// `auto` and not `manual` (Claude's own default) because nobody is at
-    /// the Goinkyo's keyboard to answer a permission prompt — `manual`
-    /// reliably stops there, and so does `plan`, whose own design still
-    /// exits through a human approval at the end. Not a guarantee of
-    /// unattended operation either, though: Claude Code falls back to its
-    /// ordinary confirmation flow after repeated denials even under `auto`,
-    /// and that flow stops the same way `manual` does. This only removes
-    /// one specific stop, observed live 2026-08-05 — a Goinkyo that had
-    /// just started on its own (the kickoff fix above landing) then sat
-    /// waiting for an operator who wasn't watching to approve a tool call.
+    /// Legacy spelling of `[brigade.claude] goinkyo_permission_mode`, still read; the table's
+    /// value wins when both are set. Holds the built-in when the file sets
+    /// neither, which is why it is not an `Option`. What the value means is on
+    /// [`ClaudeBrigadeConfig::goinkyo_permission_mode`].
     pub goinkyo_permission_mode: String,
-    /// `--disallowedTools <tools>` an auto-spawned Goinkyo launches with,
-    /// default `"Edit,Write,NotebookEdit"` (`claude --help`: comma- or
-    /// space-separated tool names to deny). Same empty-string escape hatch
-    /// as the model/effort/permission-mode above, and — unlike `effort`,
-    /// like `permission_mode` — passed on a resume too: which tools a
-    /// Goinkyo may use is a property of the *role*, not of whether this
-    /// particular launch happens to be fresh or resumed.
-    ///
-    /// Not containment: Bash stays available (this is a tool-name denylist,
-    /// not a sandbox), so it is no barrier against anything actually
-    /// adversarial. It exists because `goinkyo_permission_mode`'s own
-    /// `"auto"` default changed what "unattended" means here — under
-    /// `"manual"` an edit stopped for approval nobody was there to give;
-    /// under `"auto"` it doesn't, so an unattended Goinkyo could now write
-    /// to the same working tree the Director is using without anyone
-    /// having agreed to that. This is a deterrent against that drift, not a
-    /// defense against a hostile session. The cost worth stating plainly:
-    /// it also blocks whatever a scratchpad or memory write would use
-    /// (`Edit`/`Write`/`NotebookEdit`) — consistent with a role meant to be
-    /// called holding nothing of its own, but a real cost, not a free one.
+    /// Legacy spelling of `[brigade.claude] goinkyo_disallowed_tools`, still read; the table's
+    /// value wins when both are set. Holds the built-in when the file sets
+    /// neither, which is why it is not an `Option`. What the value means is on
+    /// [`ClaudeBrigadeConfig::goinkyo_disallowed_tools`].
     pub goinkyo_disallowed_tools: String,
+    /// `[brigade.claude]`: where the Claude-only settings live now.
+    #[serde(deserialize_with = "claude_table")]
+    pub claude: ClaudeBrigadeConfig,
+    /// `[brigade.codex]`: where the Codex-only settings live now.
+    #[serde(deserialize_with = "codex_table")]
+    pub codex: CodexBrigadeConfig,
+    /// The legacy keys the file wrote, in [`LEGACY_BRIGADE_KEYS`]' order. Not
+    /// read by serde: a value only says it was set when it differs from the
+    /// built-in, and this crate has no TOML parser to ask the file, so
+    /// `banto_io::config::load` fills it from the parsed table
+    /// ([`legacy_brigade_keys_in`]). Empty for a config built in code. Only
+    /// [`Self::legacy_key_notice`] reads it.
+    #[serde(skip)]
+    pub legacy_keys: Vec<&'static str>,
     /// How readily a Director consults the Goinkyo on its own initiative:
     /// `off`, `disputes`, `design` (built-in) or `decisions`, kept as the text
     /// the operator wrote ([`Self::goinkyo_consult`] is the one reader). Written
@@ -527,10 +737,14 @@ impl Default for BrigadeConfig {
             director_prompt: DEFAULT_DIRECTOR_PROMPT.to_string(),
             worker_prompt: DEFAULT_WORKER_PROMPT.to_string(),
             goinkyo_prompt: DEFAULT_GOINKYO_PROMPT.to_string(),
+            goinkyo_agent: GoinkyoAgentSetting::default(),
             goinkyo_model: "opus".to_string(),
             goinkyo_effort: "xhigh".to_string(),
             goinkyo_permission_mode: "auto".to_string(),
             goinkyo_disallowed_tools: "Edit,Write,NotebookEdit".to_string(),
+            claude: ClaudeBrigadeConfig::default(),
+            codex: CodexBrigadeConfig::default(),
+            legacy_keys: Vec::new(),
             goinkyo_consult: "design".to_string(),
             message_log: false,
             request_attention: true,
@@ -766,8 +980,12 @@ impl BrigadeConfig {
     /// picker as its pre-filled text; never when one is resumed.
     pub fn worker_model_for(&self, agent: AgentKind) -> Option<&str> {
         let raw = match agent {
-            AgentKind::ClaudeCode => &self.worker_model,
-            AgentKind::Codex => &self.worker_model_codex,
+            AgentKind::ClaudeCode => {
+                table_then_legacy(&self.claude.worker_model, &self.worker_model)
+            }
+            AgentKind::Codex => {
+                table_then_legacy(&self.codex.worker_model, &self.worker_model_codex)
+            }
         };
         flag_value(raw)
     }
@@ -777,8 +995,12 @@ impl BrigadeConfig {
     /// [`Self::worker_model_for`].
     pub fn worker_effort_for(&self, agent: AgentKind) -> Option<&str> {
         let raw = match agent {
-            AgentKind::ClaudeCode => &self.worker_effort,
-            AgentKind::Codex => &self.worker_effort_codex,
+            AgentKind::ClaudeCode => {
+                table_then_legacy(&self.claude.worker_effort, &self.worker_effort)
+            }
+            AgentKind::Codex => {
+                table_then_legacy(&self.codex.worker_effort, &self.worker_effort_codex)
+            }
         };
         flag_value(raw)
     }
@@ -825,33 +1047,374 @@ impl BrigadeConfig {
     /// Codex` carries no such field), so a Codex Worker simply never reaches
     /// anywhere this value would apply.
     pub fn worker_permission_mode(&self) -> Option<&str> {
-        (!self.worker_permission_mode.is_empty()).then_some(self.worker_permission_mode.as_str())
+        let raw = table_then_legacy(
+            &self.claude.worker_permission_mode,
+            &self.worker_permission_mode,
+        );
+        (!raw.is_empty()).then_some(raw)
     }
 
     /// [`Self::goinkyo_model`], or `None` for the empty-string escape hatch.
-    /// No `agent` parameter, unlike [`Self::worker_model_for`]: a Goinkyo is
-    /// always Claude.
+    /// The Claude Goinkyo's; [`Self::goinkyo_model_for`] picks by product.
     pub fn goinkyo_model(&self) -> Option<&str> {
-        flag_value(&self.goinkyo_model)
+        self.goinkyo_model_for(AgentKind::ClaudeCode)
     }
 
     /// [`Self::goinkyo_effort`], or `None` for the empty-string escape hatch.
+    /// The Claude Goinkyo's; [`Self::goinkyo_effort_for`] picks by product.
     pub fn goinkyo_effort(&self) -> Option<&str> {
-        flag_value(&self.goinkyo_effort)
+        self.goinkyo_effort_for(AgentKind::ClaudeCode)
+    }
+
+    /// The model a Goinkyo running `agent` is created with, or `None` for "pass
+    /// no model flag". Claude's is `[brigade.claude] goinkyo_model`, else its
+    /// legacy flat key, else `opus`; Codex's is `[brigade.codex] goinkyo_model`,
+    /// else nothing (a Codex Goinkyo has no legacy key and no built-in). Never
+    /// the other product's: a model word means nothing to the other binary.
+    pub fn goinkyo_model_for(&self, agent: AgentKind) -> Option<&str> {
+        let raw = match agent {
+            AgentKind::ClaudeCode => {
+                table_then_legacy(&self.claude.goinkyo_model, &self.goinkyo_model)
+            }
+            AgentKind::Codex => self.codex.goinkyo_model.as_deref().unwrap_or(""),
+        };
+        flag_value(raw)
+    }
+
+    /// The effort a Goinkyo running `agent` is created with, or `None`. Same
+    /// reading rule as [`Self::goinkyo_model_for`].
+    pub fn goinkyo_effort_for(&self, agent: AgentKind) -> Option<&str> {
+        let raw = match agent {
+            AgentKind::ClaudeCode => {
+                table_then_legacy(&self.claude.goinkyo_effort, &self.goinkyo_effort)
+            }
+            AgentKind::Codex => self.codex.goinkyo_effort.as_deref().unwrap_or(""),
+        };
+        flag_value(raw)
     }
 
     /// [`Self::goinkyo_permission_mode`], or `None` for the empty-string
     /// escape hatch.
     pub fn goinkyo_permission_mode(&self) -> Option<&str> {
-        (!self.goinkyo_permission_mode.is_empty()).then_some(self.goinkyo_permission_mode.as_str())
+        let raw = table_then_legacy(
+            &self.claude.goinkyo_permission_mode,
+            &self.goinkyo_permission_mode,
+        );
+        (!raw.is_empty()).then_some(raw)
     }
 
     /// [`Self::goinkyo_disallowed_tools`], or `None` for the empty-string
     /// escape hatch.
     pub fn goinkyo_disallowed_tools(&self) -> Option<&str> {
-        (!self.goinkyo_disallowed_tools.is_empty())
-            .then_some(self.goinkyo_disallowed_tools.as_str())
+        let raw = table_then_legacy(
+            &self.claude.goinkyo_disallowed_tools,
+            &self.goinkyo_disallowed_tools,
+        );
+        (!raw.is_empty()).then_some(raw)
     }
+
+    /// What startup says about legacy `[brigade]` keys, or `None` when the file
+    /// wrote none: the names, and how many of them the product table also sets and
+    /// so overrides. Short and without the new spelling of each key (the README
+    /// has that): the status line draws one unwrapped span and clips it at the
+    /// terminal's width, so a sentence per key lost most of nine keys' worth, and
+    /// a notice per key would hold the line for as many turns as the file has keys.
+    pub fn legacy_key_notice(&self) -> Option<String> {
+        const NAMED: usize = 3;
+        let found: Vec<&LegacyKey> = LEGACY_BRIGADE_KEYS
+            .iter()
+            .filter(|key| self.legacy_keys.contains(&key.legacy))
+            .collect();
+        if found.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = found.iter().take(NAMED).map(|key| key.legacy).collect();
+        let more = found.len().saturating_sub(NAMED);
+        let more = (more > 0).then(|| format!(" and {more} more"));
+        let ignored = found.iter().filter(|key| self.table_sets(key)).count();
+        let ignored = (ignored > 0).then(|| format!("; {ignored} ignored (the table wins)"));
+        Some(format!(
+            "config: legacy [brigade] keys ({}{}) moved to [brigade.claude]/[brigade.codex]; \
+             see README{}",
+            names.join(", "),
+            more.unwrap_or_default(),
+            ignored.unwrap_or_default()
+        ))
+    }
+
+    /// Whether the product table sets what `key` is the legacy spelling of.
+    fn table_sets(&self, key: &LegacyKey) -> bool {
+        match key.legacy {
+            "worker_model" => self.claude.worker_model.is_some(),
+            "worker_effort" => self.claude.worker_effort.is_some(),
+            "worker_permission_mode" => self.claude.worker_permission_mode.is_some(),
+            "goinkyo_model" => self.claude.goinkyo_model.is_some(),
+            "goinkyo_effort" => self.claude.goinkyo_effort.is_some(),
+            "goinkyo_permission_mode" => self.claude.goinkyo_permission_mode.is_some(),
+            "goinkyo_disallowed_tools" => self.claude.goinkyo_disallowed_tools.is_some(),
+            "worker_model_codex" => self.codex.worker_model.is_some(),
+            "worker_effort_codex" => self.codex.worker_effort.is_some(),
+            _ => false,
+        }
+    }
+}
+
+/// A flat `[brigade]` key and the product table that took over its meaning.
+struct LegacyKey {
+    legacy: &'static str,
+    /// The key's name inside the table: `worker_model_codex` became
+    /// `worker_model` under `[brigade.codex]`.
+    key: &'static str,
+    table: &'static str,
+}
+
+/// Every legacy key, in the order the notice names them.
+const LEGACY_BRIGADE_KEYS: [LegacyKey; 9] = [
+    LegacyKey {
+        legacy: "worker_model",
+        key: "worker_model",
+        table: "claude",
+    },
+    LegacyKey {
+        legacy: "worker_effort",
+        key: "worker_effort",
+        table: "claude",
+    },
+    LegacyKey {
+        legacy: "worker_permission_mode",
+        key: "worker_permission_mode",
+        table: "claude",
+    },
+    LegacyKey {
+        legacy: "goinkyo_model",
+        key: "goinkyo_model",
+        table: "claude",
+    },
+    LegacyKey {
+        legacy: "goinkyo_effort",
+        key: "goinkyo_effort",
+        table: "claude",
+    },
+    LegacyKey {
+        legacy: "goinkyo_permission_mode",
+        key: "goinkyo_permission_mode",
+        table: "claude",
+    },
+    LegacyKey {
+        legacy: "goinkyo_disallowed_tools",
+        key: "goinkyo_disallowed_tools",
+        table: "claude",
+    },
+    LegacyKey {
+        legacy: "worker_model_codex",
+        key: "worker_model",
+        table: "codex",
+    },
+    LegacyKey {
+        legacy: "worker_effort_codex",
+        key: "worker_effort",
+        table: "codex",
+    },
+];
+
+/// Of the keys a file wrote under `[brigade]`, the legacy ones, in
+/// [`LEGACY_BRIGADE_KEYS`]' order. Pure so that the edge that parses the file
+/// only has to hand over names.
+pub fn legacy_brigade_keys_in<'a>(keys: impl IntoIterator<Item = &'a str>) -> Vec<&'static str> {
+    let written: Vec<&str> = keys.into_iter().collect();
+    LEGACY_BRIGADE_KEYS
+        .iter()
+        .filter(|key| written.contains(&key.legacy))
+        .map(|key| key.legacy)
+        .collect()
+}
+
+/// The resolution every product-table setting follows: the table's value when
+/// it is set (an empty string counts: it is the escape hatch), else the legacy
+/// flat key, which holds the built-in when the file wrote neither.
+fn table_then_legacy<'a>(table: &'a Option<String>, legacy: &'a str) -> &'a str {
+    table.as_deref().unwrap_or(legacy)
+}
+
+/// The plain `[brigade]` keys: every key of [`BrigadeConfig`] that is neither a
+/// product table nor a legacy flat spelling. The test
+/// `the_key_lists_name_every_field_their_struct_has` fails to compile when a
+/// field is added to [`BrigadeConfig`] and passes only when this list, the two
+/// below and [`LEGACY_BRIGADE_KEYS`] still cover it.
+const PLAIN_BRIGADE_KEYS: [&str; 11] = [
+    "workers",
+    "worker_agent",
+    "worker_autocompact",
+    "relay",
+    "request_attention",
+    "director_prompt",
+    "goinkyo_consult",
+    "worker_prompt",
+    "goinkyo_prompt",
+    "goinkyo_agent",
+    "message_log",
+];
+
+/// The keys [`ClaudeBrigadeConfig`] has.
+const CLAUDE_TABLE_KEYS: [&str; 7] = [
+    "worker_model",
+    "worker_effort",
+    "worker_permission_mode",
+    "goinkyo_model",
+    "goinkyo_effort",
+    "goinkyo_permission_mode",
+    "goinkyo_disallowed_tools",
+];
+
+/// The keys [`CodexBrigadeConfig`] has.
+const CODEX_TABLE_KEYS: [&str; 4] = [
+    "worker_model",
+    "worker_effort",
+    "goinkyo_model",
+    "goinkyo_effort",
+];
+
+/// Why `key`, written under `[brigade.<table>]`, would be lost, or `None` when it
+/// is a key of that table or one nothing knows (which stays ignored, like every
+/// unknown key). TOML ends `[brigade]` at the first `[brigade.…]` header, so a
+/// plain `[brigade]` key written below one belongs to that table and no
+/// product table reads it: `relay = "typo"` there is not refused as a typo, it
+/// is not read at all.
+fn misplaced_key(table: &str, table_keys: &[&str], key: &str) -> Option<String> {
+    if PLAIN_BRIGADE_KEYS.contains(&key) {
+        return Some(format!(
+            "`{key}` is a [brigade] key, but it is written under [brigade.{table}]; \
+             move it above the first [brigade.*] table"
+        ));
+    }
+    if table_keys.contains(&key) {
+        return None;
+    }
+    let legacy = LEGACY_BRIGADE_KEYS
+        .iter()
+        .find(|legacy| legacy.legacy == key)?;
+    Some(if legacy.table == table {
+        format!(
+            "`{key}` is the old [brigade] spelling of `{}`, which is the name inside \
+             [brigade.{table}]",
+            legacy.key
+        )
+    } else {
+        format!(
+            "`{key}` is a legacy [brigade] key for `{}` under [brigade.{}], but it is \
+             written under [brigade.{table}], where nothing reads it; write it there \
+             instead",
+            legacy.key, legacy.table
+        )
+    })
+}
+
+fn claude_table<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ClaudeBrigadeConfig, D::Error> {
+    guarded_table("claude", &CLAUDE_TABLE_KEYS, deserializer)
+}
+
+fn codex_table<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<CodexBrigadeConfig, D::Error> {
+    guarded_table("codex", &CODEX_TABLE_KEYS, deserializer)
+}
+
+/// Reads a product table as `T` would, refusing a key [`misplaced_key`] names.
+/// The refusal is raised as the value's own error, inside the format's value
+/// deserialization, so that `toml` gives it the line and column of the offending
+/// value and prints that line, as it does for a value of the wrong type. A plain
+/// `Deserialize` cannot do this: it would have to be told every key to refuse
+/// and could not see the others.
+fn guarded_table<'de, T, D>(
+    table: &'static str,
+    table_keys: &'static [&'static str],
+    deserializer: D,
+) -> Result<T, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, DeserializeSeed, IntoDeserializer, MapAccess, Visitor};
+    use std::marker::PhantomData;
+
+    struct Guard<T> {
+        table: &'static str,
+        table_keys: &'static [&'static str],
+        kind: PhantomData<T>,
+    }
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for Guard<T> {
+        type Value = T;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a table")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+            T::deserialize(de::value::MapAccessDeserializer::new(Watch {
+                inner: map,
+                table: self.table,
+                table_keys: self.table_keys,
+                refuse: None,
+            }))
+        }
+    }
+
+    struct Watch<A> {
+        inner: A,
+        table: &'static str,
+        table_keys: &'static [&'static str],
+        /// What the key just read is refused for, said when its value is asked for.
+        refuse: Option<String>,
+    }
+    impl<'de, A: MapAccess<'de>> MapAccess<'de> for Watch<A> {
+        type Error = A::Error;
+
+        fn next_key_seed<K: DeserializeSeed<'de>>(
+            &mut self,
+            seed: K,
+        ) -> Result<Option<K::Value>, A::Error> {
+            let Some(key) = self.inner.next_key::<String>()? else {
+                return Ok(None);
+            };
+            self.refuse = misplaced_key(self.table, self.table_keys, &key);
+            seed.deserialize(key.into_deserializer()).map(Some)
+        }
+
+        fn next_value_seed<V: DeserializeSeed<'de>>(
+            &mut self,
+            seed: V,
+        ) -> Result<V::Value, A::Error> {
+            match self.refuse.take() {
+                Some(why) => self.inner.next_value_seed(Refuse {
+                    why,
+                    value: PhantomData,
+                }),
+                None => self.inner.next_value_seed(seed),
+            }
+        }
+    }
+
+    /// Takes the place of the value's own seed and fails inside the value's
+    /// deserialization.
+    struct Refuse<T> {
+        why: String,
+        value: PhantomData<T>,
+    }
+    impl<'de, T> DeserializeSeed<'de> for Refuse<T> {
+        type Value = T;
+
+        fn deserialize<D: serde::Deserializer<'de>>(self, _: D) -> Result<T, D::Error> {
+            Err(de::Error::custom(self.why))
+        }
+    }
+
+    deserializer.deserialize_map(Guard {
+        table,
+        table_keys,
+        kind: PhantomData::<T>,
+    })
 }
 
 /// Per-agent binary overrides. `None` for a given field means "look it up
@@ -1439,6 +2002,163 @@ worker_effort_codex = \"\"
                 Some(WorkerAgentSetting::Codex)
             );
         }
+    }
+
+    // -- GoinkyoAgentSetting ---------------------------------------------
+
+    #[test]
+    fn goinkyo_agent_defaults_to_inherit() {
+        assert_eq!(GoinkyoAgentSetting::default(), GoinkyoAgentSetting::Inherit);
+        assert_eq!(
+            BrigadeConfig::default().goinkyo_agent,
+            GoinkyoAgentSetting::Inherit
+        );
+        assert_eq!(
+            parse(
+                "[brigade]
+workers = 2
+"
+            )
+            .brigade
+            .goinkyo_agent,
+            GoinkyoAgentSetting::Inherit,
+            "a file written before the key existed takes the built-in"
+        );
+    }
+
+    #[test]
+    fn goinkyo_agent_every_known_value_parses() {
+        for (text, expected) in [
+            ("inherit", GoinkyoAgentSetting::Inherit),
+            ("claude", GoinkyoAgentSetting::Claude),
+            ("codex", GoinkyoAgentSetting::Codex),
+        ] {
+            assert_eq!(GoinkyoAgentSetting::parse(text), Some(expected));
+            let config = parse(&format!(
+                "[brigade]
+goinkyo_agent = \"{text}\"
+"
+            ));
+            assert_eq!(config.brigade.goinkyo_agent, expected);
+        }
+    }
+
+    #[test]
+    fn goinkyo_agent_is_case_insensitive_and_trims_whitespace() {
+        for text in ["Codex", "CODEX", "  codex  "] {
+            assert_eq!(
+                GoinkyoAgentSetting::parse(text),
+                Some(GoinkyoAgentSetting::Codex)
+            );
+        }
+        for text in ["Inherit", "INHERIT", "  inherit  "] {
+            assert_eq!(
+                GoinkyoAgentSetting::parse(text),
+                Some(GoinkyoAgentSetting::Inherit)
+            );
+        }
+    }
+
+    #[test]
+    fn goinkyo_agent_refuses_a_value_that_is_not_one_of_its_three() {
+        for bad in [
+            "\"made-up-product\"",
+            "\"\"",
+            "\"  \"",
+            "\"inherits\"",
+            "\"select\"",
+        ] {
+            assert_refused_naming(
+                &format!(
+                    "[brigade]
+goinkyo_agent = {bad}
+"
+                ),
+                "goinkyo_agent",
+                bad.trim_matches('"'),
+                &["inherit", "claude", "codex"],
+            );
+        }
+        assert_wrong_type(
+            "[brigade]
+goinkyo_agent = 5
+",
+            "a string",
+        );
+        assert_eq!(GoinkyoAgentSetting::parse(""), None, "empty is not a value");
+    }
+
+    #[test]
+    fn the_resolver_covers_every_setting_for_every_directors_product() {
+        use AgentKind::{ClaudeCode, Codex};
+        use GoinkyoAgentSetting::{Claude, Codex as CodexSetting, Inherit};
+        for (setting, director, expected) in [
+            (Inherit, ClaudeCode, ClaudeCode),
+            (Inherit, Codex, Codex),
+            (Claude, ClaudeCode, ClaudeCode),
+            (Claude, Codex, ClaudeCode),
+            (CodexSetting, ClaudeCode, Codex),
+            (CodexSetting, Codex, Codex),
+        ] {
+            assert_eq!(
+                resolve_goinkyo_agent(setting, director),
+                expected,
+                "{setting:?} under a {director:?} Director"
+            );
+        }
+    }
+
+    fn only(agent: AgentKind) -> BTreeSet<AgentKind> {
+        BTreeSet::from([agent])
+    }
+
+    #[test]
+    fn a_goinkyo_refusal_is_the_first_unmet_condition_in_the_order_it_is_fixed() {
+        use AgentKind::{ClaudeCode, Codex};
+        let both: BTreeSet<AgentKind> = AgentKind::ALL.into_iter().collect();
+        let hook = |launchable, primed| CodexHookFacts { launchable, primed };
+        // Nothing wrong: a Claude Goinkyo never asks about Codex's hook, and a
+        // Codex one needs it launchable and primed.
+        assert_eq!(
+            goinkyo_refusal(ClaudeCode, &both, true, hook(false, false)),
+            None
+        );
+        assert_eq!(goinkyo_refusal(Codex, &both, true, hook(true, true)), None);
+        assert_eq!(
+            goinkyo_refusal(Codex, &both, true, hook(true, false)),
+            Some(GoinkyoRefusal::CodexHookNotPrimed)
+        );
+        // A path the hook cannot carry outranks the trust record: trusted or
+        // not, the hook never runs.
+        for primed in [false, true] {
+            assert_eq!(
+                goinkyo_refusal(Codex, &both, true, hook(false, primed)),
+                Some(GoinkyoRefusal::CodexHookNotLaunchable)
+            );
+        }
+        // Left out of `agents`.
+        assert_eq!(
+            goinkyo_refusal(Codex, &only(ClaudeCode), true, hook(true, true)),
+            Some(GoinkyoRefusal::NotEnabled(Codex))
+        );
+        assert_eq!(
+            goinkyo_refusal(ClaudeCode, &only(Codex), true, hook(true, true)),
+            Some(GoinkyoRefusal::NotEnabled(ClaudeCode))
+        );
+        // A home that did not resolve outranks the hook, which lives in it.
+        assert_eq!(
+            goinkyo_refusal(Codex, &both, false, hook(false, false)),
+            Some(GoinkyoRefusal::HomeUnresolved(Codex))
+        );
+        assert_eq!(
+            goinkyo_refusal(ClaudeCode, &both, false, hook(false, false)),
+            Some(GoinkyoRefusal::HomeUnresolved(ClaudeCode))
+        );
+        // Not enabled outranks everything after it.
+        assert_eq!(
+            goinkyo_refusal(Codex, &only(ClaudeCode), false, hook(false, false)),
+            Some(GoinkyoRefusal::NotEnabled(Codex))
+        );
     }
 
     #[test]
@@ -2145,5 +2865,556 @@ data_dir = \"C:/synthetic/banto-data\"
         assert_eq!(config.brigade.worker_model, "whatever-model");
         assert_eq!(config.brigade.worker_effort, "extreme");
         assert_eq!(config.brigade.worker_model_codex, "");
+    }
+
+    // -- product tables: [brigade.claude] and [brigade.codex] ----------------
+
+    /// Every setting the two product tables hold, read through its accessor, as
+    /// text: an empty string is "no flag".
+    fn product_settings(brigade: &BrigadeConfig) -> Vec<String> {
+        let own = |value: Option<&str>| value.unwrap_or_default().to_string();
+        vec![
+            own(brigade.worker_model_for(AgentKind::ClaudeCode)),
+            own(brigade.worker_effort_for(AgentKind::ClaudeCode)),
+            own(brigade.worker_permission_mode()),
+            own(brigade.goinkyo_model()),
+            own(brigade.goinkyo_effort()),
+            own(brigade.goinkyo_permission_mode()),
+            own(brigade.goinkyo_disallowed_tools()),
+            own(brigade.worker_model_for(AgentKind::Codex)),
+            own(brigade.worker_effort_for(AgentKind::Codex)),
+        ]
+    }
+
+    /// The order of [`product_settings`]: claude worker model, effort and
+    /// permission mode; claude goinkyo model, effort, permission mode and
+    /// disallowed tools; codex worker model and effort.
+    const LEGACY_ONLY: &str = "[brigade]\n\
+        worker_model = \"l-wm\"\nworker_effort = \"l-we\"\nworker_permission_mode = \"l-wp\"\n\
+        goinkyo_model = \"l-gm\"\ngoinkyo_effort = \"l-ge\"\ngoinkyo_permission_mode = \"l-gp\"\n\
+        goinkyo_disallowed_tools = \"l-gd\"\n\
+        worker_model_codex = \"l-cm\"\nworker_effort_codex = \"l-ce\"\n";
+
+    const TABLES_ONLY: &str = "[brigade.claude]\n\
+        worker_model = \"t-wm\"\nworker_effort = \"t-we\"\nworker_permission_mode = \"t-wp\"\n\
+        goinkyo_model = \"t-gm\"\ngoinkyo_effort = \"t-ge\"\ngoinkyo_permission_mode = \"t-gp\"\n\
+        goinkyo_disallowed_tools = \"t-gd\"\n\
+        [brigade.codex]\nworker_model = \"t-cm\"\nworker_effort = \"t-ce\"\n";
+
+    #[test]
+    fn a_file_with_only_the_legacy_keys_reads_as_it_always_did() {
+        let config = parse(LEGACY_ONLY);
+        assert_eq!(
+            product_settings(&config.brigade),
+            [
+                "l-wm", "l-we", "l-wp", "l-gm", "l-ge", "l-gp", "l-gd", "l-cm", "l-ce"
+            ]
+        );
+        assert_eq!(config.brigade.claude, ClaudeBrigadeConfig::default());
+        assert_eq!(config.brigade.codex, CodexBrigadeConfig::default());
+    }
+
+    #[test]
+    fn a_file_with_only_the_product_tables_reads_them() {
+        let config = parse(TABLES_ONLY);
+        assert_eq!(
+            product_settings(&config.brigade),
+            [
+                "t-wm", "t-we", "t-wp", "t-gm", "t-ge", "t-gp", "t-gd", "t-cm", "t-ce"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_with_neither_keeps_every_built_in() {
+        let built_in = [
+            "sonnet",
+            "high",
+            "auto",
+            "opus",
+            "xhigh",
+            "auto",
+            "Edit,Write,NotebookEdit",
+            "terra",
+            "high",
+        ];
+        assert_eq!(product_settings(&BrigadeConfig::default()), built_in);
+        assert_eq!(
+            product_settings(&parse("[brigade]\nworkers = 2\n").brigade),
+            built_in
+        );
+    }
+
+    #[test]
+    fn the_table_wins_over_the_legacy_key_one_setting_at_a_time() {
+        // All nine in both places: every setting is the table's.
+        let both = parse(&format!("{LEGACY_ONLY}{TABLES_ONLY}"));
+        assert_eq!(
+            product_settings(&both.brigade),
+            [
+                "t-wm", "t-we", "t-wp", "t-gm", "t-ge", "t-gp", "t-gd", "t-cm", "t-ce"
+            ]
+        );
+        // Only some in the table: the rest still come from their legacy key, then
+        // from the built-in, so a half-migrated file means what it says.
+        let mixed = parse(
+            "[brigade]\nworker_model = \"l-wm\"\nworker_effort = \"l-we\"\n\
+             worker_model_codex = \"l-cm\"\n\
+             [brigade.claude]\nworker_model = \"t-wm\"\n",
+        );
+        assert_eq!(
+            product_settings(&mixed.brigade),
+            [
+                "t-wm",
+                "l-we",
+                "auto",
+                "opus",
+                "xhigh",
+                "auto",
+                "Edit,Write,NotebookEdit",
+                "l-cm",
+                "high"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_value_set_to_empty_is_the_escape_hatch_whatever_the_legacy_key_says() {
+        let config = parse(
+            "[brigade]\nworker_model = \"l-wm\"\nworker_model_codex = \"l-cm\"\n\
+             goinkyo_disallowed_tools = \"l-gd\"\n\
+             [brigade.claude]\nworker_model = \"\"\ngoinkyo_disallowed_tools = \"\"\n\
+             [brigade.codex]\nworker_model = \"  \"\n",
+        );
+        assert_eq!(config.brigade.worker_model_for(AgentKind::ClaudeCode), None);
+        assert_eq!(config.brigade.worker_model_for(AgentKind::Codex), None);
+        assert_eq!(config.brigade.goinkyo_disallowed_tools(), None);
+        // And an empty legacy key under a table that sets a value changes nothing.
+        let table_over_empty =
+            parse("[brigade]\nworker_model = \"\"\n[brigade.claude]\nworker_model = \"t-wm\"\n");
+        assert_eq!(
+            table_over_empty
+                .brigade
+                .worker_model_for(AgentKind::ClaudeCode),
+            Some("t-wm")
+        );
+    }
+
+    #[test]
+    fn a_product_table_banto_does_not_know_is_ignored_like_any_unknown_key() {
+        let config = parse(
+            "[brigade]\nworker_model = \"l-wm\"\n\
+             [brigade.antigravity]\nworker_model = \"x\"\nanything = 5\n\
+             [brigade.claude]\nno_such_key = true\n\
+             [brigade.codex]\nno_such_key = \"nothing reads this\"\n",
+        );
+        assert_eq!(
+            config.brigade.worker_model_for(AgentKind::ClaudeCode),
+            Some("l-wm")
+        );
+        // A key a known table does not have is ignored too.
+        assert_eq!(config.brigade.codex, CodexBrigadeConfig::default());
+        assert_eq!(config.brigade.claude, ClaudeBrigadeConfig::default());
+    }
+
+    #[test]
+    fn a_codex_goinkyo_has_its_own_model_and_effort_and_no_built_in() {
+        use AgentKind::{ClaudeCode, Codex};
+        let built_in = BrigadeConfig::default();
+        assert_eq!(built_in.goinkyo_model_for(Codex), None);
+        assert_eq!(built_in.goinkyo_effort_for(Codex), None);
+        // The Claude Goinkyo's built-ins are what they were.
+        assert_eq!(built_in.goinkyo_model_for(ClaudeCode), Some("opus"));
+        assert_eq!(built_in.goinkyo_effort_for(ClaudeCode), Some("xhigh"));
+
+        let config = parse(
+            "[brigade.codex]\ngoinkyo_model = \" terra \"\ngoinkyo_effort = \"xhigh\"\n\
+             [brigade.claude]\ngoinkyo_model = \"fable\"\ngoinkyo_effort = \"max\"\n",
+        );
+        let brigade = &config.brigade;
+        assert_eq!(brigade.goinkyo_model_for(Codex), Some("terra"));
+        assert_eq!(brigade.goinkyo_effort_for(Codex), Some("xhigh"));
+        // Each product reads its own table and never the other's.
+        assert_eq!(brigade.goinkyo_model_for(ClaudeCode), Some("fable"));
+        assert_eq!(brigade.goinkyo_effort_for(ClaudeCode), Some("max"));
+        assert_eq!(brigade.goinkyo_model(), Some("fable"));
+        assert_eq!(brigade.goinkyo_effort(), Some("max"));
+        // A Codex Worker's keys are its own: still the built-in.
+        assert_eq!(
+            brigade.worker_model_for(Codex),
+            BrigadeConfig::default().worker_model_for(Codex)
+        );
+    }
+
+    #[test]
+    fn a_codex_goinkyo_key_has_no_legacy_spelling_and_the_flat_goinkyo_keys_stay_claudes() {
+        use AgentKind::{ClaudeCode, Codex};
+        let config = parse(
+            "[brigade]\ngoinkyo_model = \"l-gm\"\ngoinkyo_effort = \"low\"\n\
+             goinkyo_model_codex = \"nope\"\ngoinkyo_effort_codex = \"nope\"\n",
+        );
+        let brigade = &config.brigade;
+        assert_eq!(brigade.goinkyo_model_for(ClaudeCode), Some("l-gm"));
+        assert_eq!(brigade.goinkyo_effort_for(ClaudeCode), Some("low"));
+        assert_eq!(brigade.goinkyo_model_for(Codex), None);
+        assert_eq!(brigade.goinkyo_effort_for(Codex), None);
+        assert!(brigade.codex.goinkyo_model.is_none() && brigade.codex.goinkyo_effort.is_none());
+    }
+
+    #[test]
+    fn an_empty_codex_goinkyo_value_passes_nothing_and_is_not_validated() {
+        use AgentKind::Codex;
+        let empty = parse("[brigade.codex]\ngoinkyo_model = \"\"\ngoinkyo_effort = \"  \"\n");
+        assert_eq!(empty.brigade.goinkyo_model_for(Codex), None);
+        assert_eq!(empty.brigade.goinkyo_effort_for(Codex), None);
+        let odd = parse(
+            "[brigade.codex]\ngoinkyo_model = \"gpt-nonsense\"\ngoinkyo_effort = \"extreme\"\n",
+        );
+        assert_eq!(odd.brigade.goinkyo_model_for(Codex), Some("gpt-nonsense"));
+        assert_eq!(odd.brigade.goinkyo_effort_for(Codex), Some("extreme"));
+        assert_wrong_type("[brigade.codex]\ngoinkyo_model = 5\n", "a string");
+        assert_wrong_type("[brigade.codex]\ngoinkyo_effort = true\n", "a string");
+    }
+
+    // --- a [brigade] key written below a [brigade.*] header ---------------------
+
+    /// `text` is refused for `key` being misplaced under `[brigade.<table>]`, at
+    /// `line`, with the offending line echoed as `toml` does for a wrong type.
+    fn assert_misplaced(text: &str, line: usize, key: &str, table: &str) -> String {
+        let message = refusal(text).unwrap_or_else(|| panic!("{text:?} loaded"));
+        assert!(
+            message.starts_with(&format!("TOML parse error at line {line}, column ")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("`{key}` "))
+                && message.contains(&format!("[brigade.{table}]")),
+            "{message}"
+        );
+        message
+    }
+
+    #[test]
+    fn a_plain_brigade_key_under_a_product_table_is_refused_where_it_is() {
+        // Not refused as a typo and not read at all, before this: the key
+        // belongs to the table above it.
+        let message = assert_misplaced(
+            "[brigade.claude]\nworker_model = \"x\"\nrelay = \"typo\"\n",
+            3,
+            "relay",
+            "claude",
+        );
+        assert!(
+            message.contains(
+                "`relay` is a [brigade] key, but it is written under [brigade.claude]; \
+                 move it above the first [brigade.*] table"
+            ),
+            "{message}"
+        );
+        // The offending line is shown, which is what makes the line number useful.
+        assert!(message.contains("relay = \"typo\""), "{message}");
+        assert_misplaced(
+            "[brigade.codex]\nworker_effort = \"low\"\nworkers = 5\n",
+            3,
+            "workers",
+            "codex",
+        );
+        // Every plain key, under either table, however good its value is.
+        for table in ["claude", "codex"] {
+            for key in PLAIN_BRIGADE_KEYS {
+                let text = format!("[brigade.{table}]\n{key} = 1\n");
+                assert_misplaced(&text, 2, key, table);
+            }
+        }
+    }
+
+    #[test]
+    fn a_legacy_flat_key_the_table_does_not_have_is_refused_where_it_is() {
+        let message = assert_misplaced(
+            "[brigade.claude]\nworker_model = \"x\"\nworker_model_codex = \"terra\"\n",
+            3,
+            "worker_model_codex",
+            "codex",
+        );
+        assert!(
+            message.contains(
+                "`worker_model_codex` is a legacy [brigade] key for `worker_model` under \
+                 [brigade.codex], but it is written under [brigade.claude]"
+            ),
+            "{message}"
+        );
+        // The same key in its own table: the name has changed there.
+        let message = assert_misplaced(
+            "[brigade.codex]\nworker_effort_codex = \"low\"\n",
+            2,
+            "worker_effort_codex",
+            "codex",
+        );
+        assert!(
+            message.contains("is the old [brigade] spelling of `worker_effort`"),
+            "{message}"
+        );
+        // A Claude-only legacy name under the Codex table.
+        assert_misplaced(
+            "[brigade.codex]\ngoinkyo_permission_mode = \"auto\"\n",
+            2,
+            "goinkyo_permission_mode",
+            "claude",
+        );
+        assert_misplaced(
+            "[brigade.codex]\ngoinkyo_disallowed_tools = \"\"\n",
+            2,
+            "goinkyo_disallowed_tools",
+            "claude",
+        );
+        assert_misplaced(
+            "[brigade.claude]\nworker_effort_codex = \"low\"\n",
+            2,
+            "worker_effort_codex",
+            "codex",
+        );
+    }
+
+    #[test]
+    fn a_key_that_is_the_tables_own_or_that_nothing_knows_still_loads() {
+        // Each table's own keys, including the ones the other table has too, and
+        // the shared name (`worker_model`) that is a legacy flat key as well.
+        for key in CLAUDE_TABLE_KEYS {
+            assert_eq!(misplaced_key("claude", &CLAUDE_TABLE_KEYS, key), None);
+        }
+        for key in CODEX_TABLE_KEYS {
+            assert_eq!(misplaced_key("codex", &CODEX_TABLE_KEYS, key), None);
+        }
+        // Unknown keys stay ignored, a typo of a plain key among them.
+        let config = parse(
+            "[brigade.claude]\nrelay_ = \"x\"\nsome_future_key = 1\n\
+             [brigade.codex]\nWorkers = 5\nnothing = true\n",
+        );
+        assert_eq!(config.brigade.claude, ClaudeBrigadeConfig::default());
+        assert_eq!(config.brigade.codex, CodexBrigadeConfig::default());
+        // And the plain keys above the first table are read, as they always were.
+        let config = parse(
+            "[brigade]\nworkers = 5\nrelay = \"manual\"\n[brigade.claude]\nworker_model = \"x\"\n",
+        );
+        assert_eq!(config.brigade.workers, 5);
+        assert_eq!(config.brigade.relay, RelayMode::Manual);
+    }
+
+    #[test]
+    fn the_key_lists_name_every_field_their_struct_has() {
+        // A field added to a struct breaks the destructuring below, which is the
+        // place to add it to the list: a misplaced key not on the list is not
+        // refused. The list is then held to the real field names by setting
+        // every key of it and finding each one set.
+        let ClaudeBrigadeConfig {
+            worker_model,
+            worker_effort,
+            worker_permission_mode,
+            goinkyo_model,
+            goinkyo_effort,
+            goinkyo_permission_mode,
+            goinkyo_disallowed_tools,
+        } = parse(&format!(
+            "[brigade.claude]\n{}",
+            CLAUDE_TABLE_KEYS
+                .map(|key| format!("{key} = \"x\"\n"))
+                .concat()
+        ))
+        .brigade
+        .claude;
+        for field in [
+            worker_model,
+            worker_effort,
+            worker_permission_mode,
+            goinkyo_model,
+            goinkyo_effort,
+            goinkyo_permission_mode,
+            goinkyo_disallowed_tools,
+        ] {
+            assert_eq!(field.as_deref(), Some("x"));
+        }
+        let CodexBrigadeConfig {
+            worker_model,
+            worker_effort,
+            goinkyo_model,
+            goinkyo_effort,
+        } = parse(&format!(
+            "[brigade.codex]\n{}",
+            CODEX_TABLE_KEYS
+                .map(|key| format!("{key} = \"x\"\n"))
+                .concat()
+        ))
+        .brigade
+        .codex;
+        for field in [worker_model, worker_effort, goinkyo_model, goinkyo_effort] {
+            assert_eq!(field.as_deref(), Some("x"));
+        }
+        // The plain keys: one by one, each one set to something other than its
+        // built-in changes the parsed config, so each is a real field.
+        let built_in = BrigadeConfig::default();
+        for (key, value) in [
+            ("workers", "7"),
+            ("worker_agent", "\"codex\""),
+            ("worker_autocompact", "\"auto\""),
+            ("relay", "\"manual\""),
+            ("request_attention", "false"),
+            ("director_prompt", "\"d\""),
+            ("goinkyo_consult", "\"off\""),
+            ("worker_prompt", "\"w\""),
+            ("goinkyo_prompt", "\"g\""),
+            ("goinkyo_agent", "\"codex\""),
+            ("message_log", "true"),
+        ] {
+            assert!(PLAIN_BRIGADE_KEYS.contains(&key), "{key}");
+            let parsed = parse(&format!("[brigade]\n{key} = {value}\n")).brigade;
+            assert_ne!(parsed, built_in, "{key} is not a field of BrigadeConfig");
+        }
+        let BrigadeConfig {
+            workers: _,
+            claude: _,
+            codex: _,
+            worker_agent: _,
+            worker_autocompact: _,
+            relay: _,
+            request_attention: _,
+            director_prompt: _,
+            goinkyo_consult: _,
+            worker_prompt: _,
+            goinkyo_prompt: _,
+            goinkyo_agent: _,
+            message_log: _,
+            worker_model: _,
+            worker_effort: _,
+            worker_permission_mode: _,
+            goinkyo_model: _,
+            goinkyo_effort: _,
+            goinkyo_permission_mode: _,
+            goinkyo_disallowed_tools: _,
+            worker_model_codex: _,
+            worker_effort_codex: _,
+            legacy_keys: _,
+        } = built_in;
+        // 23 fields: the 11 plain keys, the two tables, the 9 legacy keys and
+        // `legacy_keys`.
+        assert_eq!(
+            PLAIN_BRIGADE_KEYS.len() + 2 + LEGACY_BRIGADE_KEYS.len() + 1,
+            23
+        );
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_type_is_refused_in_a_table_and_under_a_legacy_key_alike() {
+        assert_wrong_type("[brigade.claude]\nworker_model = 5\n", "a string");
+        assert_wrong_type("[brigade.codex]\nworker_effort = true\n", "a string");
+        assert_wrong_type("[brigade]\nworker_model = 5\n", "a string");
+        assert_wrong_type("[brigade]\nworker_effort_codex = [\"high\"]\n", "a string");
+        // A legacy key beside a good table is still checked.
+        assert_wrong_type(
+            "[brigade]\ngoinkyo_model = 5\n[brigade.claude]\ngoinkyo_model = \"opus\"\n",
+            "a string",
+        );
+        // And the table has to be a table.
+        assert!(refusal("[brigade]\nclaude = \"opus\"\n").is_some());
+    }
+
+    #[test]
+    fn values_that_go_to_an_agent_are_not_validated_in_a_table_either() {
+        let config = parse(
+            "[brigade.claude]\nworker_effort = \"extreme\"\nworker_permission_mode = \"anything\"\n\
+             [brigade.codex]\nworker_model = \"gpt-nonsense\"\n",
+        );
+        assert_eq!(
+            config.brigade.worker_effort_for(AgentKind::ClaudeCode),
+            Some("extreme")
+        );
+        assert_eq!(config.brigade.worker_permission_mode(), Some("anything"));
+        assert_eq!(
+            config.brigade.worker_model_for(AgentKind::Codex),
+            Some("gpt-nonsense")
+        );
+    }
+
+    #[test]
+    fn the_legacy_keys_are_found_by_name_in_the_order_the_notice_gives() {
+        assert_eq!(
+            legacy_brigade_keys_in([
+                "worker_effort_codex",
+                "relay",
+                "claude",
+                "goinkyo_model",
+                "worker_model",
+                "worker_model_codex_",
+            ]),
+            ["worker_model", "goinkyo_model", "worker_effort_codex"]
+        );
+        assert!(legacy_brigade_keys_in(["relay", "workers", "claude", "codex"]).is_empty());
+    }
+
+    #[test]
+    fn the_legacy_key_notice_names_each_key_and_its_new_home() {
+        let brigade = BrigadeConfig {
+            legacy_keys: vec![
+                "worker_model",
+                "goinkyo_disallowed_tools",
+                "worker_model_codex",
+            ],
+            ..BrigadeConfig::default()
+        };
+        assert_eq!(
+            brigade.legacy_key_notice().as_deref(),
+            Some(
+                "config: legacy [brigade] keys (worker_model, goinkyo_disallowed_tools, \
+                 worker_model_codex) moved to [brigade.claude]/[brigade.codex]; see README"
+            )
+        );
+    }
+
+    #[test]
+    fn the_legacy_key_notice_stays_short_however_many_keys_the_file_has() {
+        // The status line clips what it draws at the terminal's width: nine keys
+        // said in full were ~690 characters, one key ~96.
+        let all = BrigadeConfig {
+            legacy_keys: LEGACY_BRIGADE_KEYS.iter().map(|key| key.legacy).collect(),
+            ..BrigadeConfig::default()
+        };
+        let notice = all.legacy_key_notice().unwrap();
+        assert_eq!(
+            notice,
+            "config: legacy [brigade] keys (worker_model, worker_effort, \
+             worker_permission_mode and 6 more) moved to [brigade.claude]/[brigade.codex]; \
+             see README"
+        );
+        assert!(notice.chars().count() < 150, "{}", notice.chars().count());
+        let one = BrigadeConfig {
+            legacy_keys: vec!["worker_model"],
+            ..BrigadeConfig::default()
+        };
+        assert!(one.legacy_key_notice().unwrap().chars().count() < 110);
+    }
+
+    #[test]
+    fn the_legacy_key_notice_says_a_legacy_key_is_ignored_when_its_table_sets_it() {
+        let brigade = BrigadeConfig {
+            legacy_keys: vec!["worker_effort", "worker_effort_codex"],
+            claude: ClaudeBrigadeConfig {
+                worker_effort: Some("low".to_string()),
+                ..ClaudeBrigadeConfig::default()
+            },
+            ..BrigadeConfig::default()
+        };
+        assert_eq!(
+            brigade.legacy_key_notice().as_deref(),
+            Some(
+                "config: legacy [brigade] keys (worker_effort, worker_effort_codex) moved to \
+                 [brigade.claude]/[brigade.codex]; see README; 1 ignored (the table wins)"
+            )
+        );
+    }
+
+    #[test]
+    fn there_is_no_legacy_key_notice_when_the_file_wrote_none() {
+        assert_eq!(BrigadeConfig::default().legacy_key_notice(), None);
+        // A product table alone is the new spelling, not a legacy one.
+        assert_eq!(parse(TABLES_ONLY).brigade.legacy_key_notice(), None);
     }
 }

@@ -54,13 +54,13 @@ pub fn activity_tag(activity: Activity) -> &'static str {
 
 /// Every notice the status line carries at startup, in the order it carries
 /// them: `trust_notice` (already decided, since it needs the store and the
-/// agent's own home), then `database_notices` (decided at startup, where the
-/// locations were resolved and the database claimed). A config value banto
-/// cannot use is not one of them: it stops the start instead
+/// agent's own home), then `boot_notices` (decided at startup, where the
+/// locations were resolved, the database claimed and the config read). A config
+/// value banto cannot use is not one of them: it stops the start instead
 /// (`crate::startup`). Pulled out of `crate::embedded::run` so that a notice
 /// dropped from the line is a failing test rather than a silent one.
-pub fn startup_notices(trust_notice: Option<String>, database_notices: Vec<String>) -> Vec<String> {
-    trust_notice.into_iter().chain(database_notices).collect()
+pub fn startup_notices(trust_notice: Option<String>, boot_notices: Vec<String>) -> Vec<String> {
+    trust_notice.into_iter().chain(boot_notices).collect()
 }
 
 /// Status-line notice telling the operator that Codex has not been asked to
@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_notices_carry_the_database_notices_right_after_the_trust_notice() {
+    fn startup_notices_carry_the_boot_notices_right_after_the_trust_notice() {
         let notices = startup_notices(
             Some("trust".to_string()),
             vec!["database".to_string(), "instance".to_string()],

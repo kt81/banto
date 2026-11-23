@@ -222,7 +222,10 @@ fn a_hook_without_the_variables_resolves_for_itself_and_empty_ones_change_nothin
 
     inputs.apply_parent_env(|_| Some(String::new()));
     assert!(
-        inputs.parent_config.is_none() && !inputs.parent_no_config && inputs.cli_db_path.is_none()
+        inputs.parent_config.is_none()
+            && !inputs.parent_no_config
+            && inputs.cli_db_path.is_none()
+            && inputs.cli_data_dir.is_none()
     );
     assert_eq!(resolved(&inputs), by_itself);
 }
@@ -669,6 +672,55 @@ fn a_hook_given_both_config_variables_resolves_to_no_config() {
     assert_eq!(resolved(&inputs).config_file, ConfigFile::None);
 }
 
+#[test]
+fn a_hook_resolves_the_data_directory_its_parent_handed_it() {
+    let m = Machine::new();
+    let parent = Resolved {
+        config_file: ConfigFile::None,
+        db_path: Some(m.path("db dir/banto.db")),
+        data_dir: Some(m.path("a chosen data dir")),
+        claude_home: None,
+        codex_home: None,
+    };
+    let given = parent.child_env();
+    let mut inputs = m.inputs();
+    inputs.apply_parent_env(|key| {
+        given
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    });
+    let hook = resolved(&inputs);
+    assert_eq!(hook.data_dir, parent.data_dir);
+    assert_ne!(
+        hook.data_dir,
+        resolved(&m.inputs()).data_dir,
+        "the platform's own directory is not what the hook took"
+    );
+    // The path a Goinkyo's briefing names is the one the parent wrote the
+    // request to.
+    assert_eq!(
+        hook.data_dir().unwrap().goinkyo_request_path(7),
+        parent.data_dir().unwrap().goinkyo_request_path(7)
+    );
+}
+
+#[test]
+fn a_parent_without_a_data_directory_sets_no_variable_for_it() {
+    let r = Resolved {
+        config_file: ConfigFile::None,
+        db_path: None,
+        data_dir: None,
+        claude_home: None,
+        codex_home: None,
+    };
+    assert!(
+        r.child_env()
+            .iter()
+            .all(|(name, _)| name != ENV_PARENT_DATA_DIR)
+    );
+}
+
 // --- an empty database path is a startup error ----------------------------------
 
 fn files_under(root: &Path) -> Vec<PathBuf> {
@@ -857,7 +909,7 @@ fn a_child_without_the_hand_off_finds_its_own_data_directory_as_before() {
 }
 
 #[test]
-fn the_data_directory_is_an_argument_for_mcp_and_not_handed_to_the_hook() {
+fn the_data_directory_is_an_argument_for_mcp_and_a_variable_for_the_hook() {
     let r = Resolved {
         config_file: ConfigFile::None,
         db_path: Some(PathBuf::from("/d/banto.db")),
@@ -868,12 +920,13 @@ fn the_data_directory_is_an_argument_for_mcp_and_not_handed_to_the_hook() {
     let args = r.child_args();
     let at = args.iter().position(|arg| arg == "--data-dir").unwrap();
     assert_eq!(args[at + 1], "/my data/banto");
-    // The hook opens the database (its own variable) and reads nothing else of
-    // banto's directory, so no variable names the data directory.
+    // The hook's command line cannot carry it, so a variable does: the one place
+    // the hook needs the directory is a Goinkyo's consultation request.
     assert!(
-        r.child_env()
-            .iter()
-            .all(|(_, value)| !value.contains("/my data")),
+        r.child_env().contains(&(
+            ENV_PARENT_DATA_DIR.to_string(),
+            "/my data/banto".to_string()
+        )),
         "{:?}",
         r.child_env()
     );

@@ -27,6 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
+use banto_core::config::legacy_brigade_keys_in;
 pub use banto_core::config::{ActivityConfig, BrigadeConfig, Config, KeysConfig, RelayMode};
 
 /// `dirs::config_dir()/banto/config.toml`
@@ -99,11 +100,27 @@ fn read_and_parse(path: &Path) -> Result<Option<Config>, ConfigError> {
             });
         }
     };
-    let config = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+    let mut config: Config = toml::from_str(&text).map_err(|source| ConfigError::Parse {
         path: path.to_path_buf(),
         source,
     })?;
+    config.brigade.legacy_keys = legacy_brigade_keys_written(&text);
     Ok(Some(config))
+}
+
+/// The legacy flat keys `text` wrote under `[brigade]`. Asked of the file and
+/// not of the parsed `Config`, whose flat fields hold the built-in when the
+/// key is absent and so cannot say whether the file wrote the built-in itself.
+/// `text` has already parsed, so a failure here only means there is nothing to
+/// report.
+fn legacy_brigade_keys_written(text: &str) -> Vec<&'static str> {
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let Some(brigade) = table.get("brigade").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    legacy_brigade_keys_in(brigade.keys().map(String::as_str))
 }
 
 /// Strict load, for a file banto found for itself (or one a parent banto
@@ -237,6 +254,200 @@ mod tests {
         let path = write_config(&dir, "claude_home = 5\n");
         assert!(matches!(load(&path), Err(ConfigError::Parse { .. })));
         assert_eq!(load_or_default(&path), Config::default());
+    }
+
+    #[test]
+    fn load_records_which_legacy_brigade_keys_the_file_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        // A legacy key that holds the built-in is still written; the same name
+        // inside a product table, or at the top level, is not a legacy key.
+        let path = write_config(
+            &dir,
+            "worker_model = \"top level, not [brigade]\"\n\
+             [brigade]\nworkers = 2\nworker_model = \"sonnet\"\nworker_effort_codex = \"low\"\n\
+             [brigade.claude]\nworker_effort = \"high\"\n\
+             [other]\ngoinkyo_model = \"x\"\n",
+        );
+        let config = load(&path).unwrap();
+        assert_eq!(
+            config.brigade.legacy_keys,
+            ["worker_model", "worker_effort_codex"]
+        );
+        // Strict, explicit and tolerant loads all say so: `_hook` reads the same file.
+        assert_eq!(load_explicit(&path).unwrap().brigade.legacy_keys.len(), 2);
+        assert_eq!(load_or_default(&path).brigade.legacy_keys.len(), 2);
+    }
+
+    #[test]
+    fn a_file_with_no_legacy_key_records_none_and_has_no_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            "[brigade]\nworkers = 2\n[brigade.claude]\nworker_model = \"opus\"\n\
+             [brigade.codex]\nworker_effort = \"low\"\n",
+        );
+        let config = load(&path).unwrap();
+        assert!(config.brigade.legacy_keys.is_empty());
+        assert_eq!(config.brigade.legacy_key_notice(), None);
+        assert_eq!(
+            load(&dir.path().join("absent.toml")).unwrap(),
+            Config::default()
+        );
+    }
+
+    #[test]
+    fn a_file_with_a_legacy_key_and_its_table_loads_with_the_table_winning_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            "[brigade]\nworker_model_codex = \"old\"\nworker_effort = \"low\"\n\
+             [brigade.codex]\nworker_model = \"new\"\n",
+        );
+        let config = load(&path).unwrap();
+        assert_eq!(
+            config
+                .brigade
+                .worker_model_for(banto_core::model::AgentKind::Codex),
+            Some("new")
+        );
+        assert_eq!(
+            config
+                .brigade
+                .worker_effort_for(banto_core::model::AgentKind::ClaudeCode),
+            Some("low")
+        );
+        assert_eq!(
+            config.brigade.legacy_key_notice().as_deref(),
+            Some(
+                "config: legacy [brigade] keys (worker_effort, worker_model_codex) moved to \
+                 [brigade.claude]/[brigade.codex]; see README; 1 ignored (the table wins)"
+            )
+        );
+    }
+
+    #[test]
+    fn a_wrong_type_in_a_product_table_or_a_legacy_key_stops_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        for text in [
+            "[brigade.claude]\nworker_model = 5\n",
+            "[brigade]\nworker_model = 5\n",
+        ] {
+            let path = write_config(&dir, text);
+            assert!(
+                matches!(load(&path), Err(ConfigError::Parse { .. })),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_brigade_key_written_below_a_product_table_stops_the_load_at_its_line() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, line, key) in [
+            (
+                "[brigade.claude]
+worker_model = \"x\"
+relay = \"typo\"
+",
+                3,
+                "relay",
+            ),
+            (
+                "[brigade.codex]
+workers = 5
+",
+                2,
+                "workers",
+            ),
+            (
+                "[brigade.claude]
+worker_model_codex = \"terra\"
+",
+                2,
+                "worker_model_codex",
+            ),
+        ] {
+            let path = write_config(&dir, text);
+            for error in [load(&path).unwrap_err(), load_explicit(&path).unwrap_err()] {
+                assert!(matches!(error, ConfigError::Parse { .. }), "{text}");
+                let reason = error.reason();
+                assert!(
+                    reason.starts_with(&format!("TOML parse error at line {line}, column ")),
+                    "{reason}"
+                );
+                assert!(reason.contains(&format!("`{key}` ")), "{reason}");
+            }
+            // `_hook` loads leniently and must go on without the file.
+            assert_eq!(load_or_default(&path), Config::default());
+        }
+    }
+
+    /// The Configuration example in a README, as `load` reads it. Both READMEs
+    /// carry the same keys, so both are held to the same thing: the file
+    /// parses, it uses no legacy key, and every product-table line says what
+    /// the built-in is, so an example that drifts from the defaults fails here.
+    fn readme_example_loads(readme: &str, heading: &str) {
+        use banto_core::model::AgentKind::{ClaudeCode, Codex};
+        let section = readme.find(heading).expect("the Configuration section");
+        let from = section
+            + readme[section..].find("```toml\n").expect("a toml block")
+            + "```toml\n".len();
+        let example = &readme[from..from + readme[from..].find("```").expect("its end")];
+        let dir = tempfile::tempdir().unwrap();
+        let config = load(&write_config(&dir, example)).unwrap();
+        let (brigade, built_in) = (&config.brigade, BrigadeConfig::default());
+        assert!(brigade.legacy_keys.is_empty());
+        assert_eq!(brigade.claude.worker_model.as_deref(), Some("sonnet"));
+        assert_eq!(brigade.codex.worker_model.as_deref(), Some("terra"));
+        for agent in [ClaudeCode, Codex] {
+            assert_eq!(
+                brigade.worker_model_for(agent),
+                built_in.worker_model_for(agent)
+            );
+            assert_eq!(
+                brigade.worker_effort_for(agent),
+                built_in.worker_effort_for(agent)
+            );
+        }
+        assert_eq!(brigade.goinkyo_model(), built_in.goinkyo_model());
+        assert_eq!(brigade.goinkyo_effort(), built_in.goinkyo_effort());
+        assert_eq!(
+            brigade.goinkyo_agent,
+            banto_core::config::GoinkyoAgentSetting::Inherit
+        );
+        // A Codex Goinkyo's two keys are written as "", the same as the built-in:
+        // no flag, so it runs the operator's own Codex default.
+        assert_eq!(brigade.codex.goinkyo_model.as_deref(), Some(""));
+        assert_eq!(brigade.codex.goinkyo_effort.as_deref(), Some(""));
+        for agent in [ClaudeCode, Codex] {
+            assert_eq!(
+                brigade.goinkyo_model_for(agent),
+                built_in.goinkyo_model_for(agent)
+            );
+            assert_eq!(
+                brigade.goinkyo_effort_for(agent),
+                built_in.goinkyo_effort_for(agent)
+            );
+        }
+        assert_eq!(brigade.goinkyo_model_for(Codex), None);
+        assert_eq!(
+            brigade.worker_permission_mode(),
+            built_in.worker_permission_mode()
+        );
+        assert_eq!(
+            brigade.goinkyo_permission_mode(),
+            built_in.goinkyo_permission_mode()
+        );
+        // The plain keys written above the tables are still the plain keys.
+        assert_eq!(brigade.workers, 1);
+        assert_eq!(brigade.relay, RelayMode::Auto);
+        assert!(brigade.request_attention);
+    }
+
+    #[test]
+    fn the_readmes_configuration_example_loads_and_matches_the_built_ins() {
+        readme_example_loads(include_str!("../../../README.md"), "\n## Configuration\n");
+        readme_example_loads(include_str!("../../../README.ja.md"), "\n## 設定\n");
     }
 
     /// A config file written when `opener` was a setting still loads, through

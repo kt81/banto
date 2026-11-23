@@ -53,6 +53,7 @@
 //! notifications (no `id`) get none. Nothing but valid MCP messages may go to
 //! stdout, so diagnostics would go to stderr.
 
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -60,16 +61,20 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use banto_core::config::{
+    CodexHookFacts, GoinkyoAgentSetting, GoinkyoRefusal, goinkyo_refusal, resolve_goinkyo_agent,
+};
 use banto_core::consultation::check_title;
 use banto_core::model::{
-    BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, GOINKYO_TOKEN, InterruptOutcome,
-    MemberToken, SessionId,
+    AgentKind, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, GOINKYO_TOKEN,
+    InterruptOutcome, MemberToken, SessionId,
 };
 use banto_io::brigade_log::{BrigadeLog, Entry, EntryKind, Party, Recipient};
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_activity::is_thread_idle;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::{SysinfoStartTime, is_thread_alive};
+use banto_io::codex_trust::{HookTrustState, hook_trust_state};
 use banto_io::status::{
     LIVE_STATUS_BUSY, LIVE_STATUS_SHELL, LIVE_STATUS_WAITING, LiveSession, ProcessProbe,
     SysinfoProbe, entry_is_alive, read_live_sessions,
@@ -111,7 +116,35 @@ struct ServerContext {
     claude_home: ClaudeHome,
     codex_home: Option<CodexHome>,
     goinkyo_dir: Option<PathBuf>,
+    goinkyo_policy: GoinkyoPolicy,
     message_log: Option<MessageLog>,
+}
+
+/// The settings `consult_goinkyo` resolves the Goinkyo's product from, as the
+/// parent banto handed them to this process at start. A config edited after
+/// that is not seen here, which is why the product is written on the member row
+/// and the engine reads it from there rather than resolving it a second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoinkyoPolicy {
+    /// `[brigade] goinkyo_agent`.
+    pub setting: GoinkyoAgentSetting,
+    /// The products the `agents` setting enables.
+    pub enabled: BTreeSet<AgentKind>,
+    /// Whether banto's own path can sit in a Codex hook command. Read from this
+    /// process's executable, which is the one the parent started it from.
+    pub hook_launchable: bool,
+}
+
+impl Default for GoinkyoPolicy {
+    /// The built-in config's: a Goinkyo that follows its Director, every product
+    /// enabled.
+    fn default() -> Self {
+        Self {
+            setting: GoinkyoAgentSetting::default(),
+            enabled: AgentKind::ALL.into_iter().collect(),
+            hook_launchable: true,
+        }
+    }
 }
 
 /// The opt-in brigade message log (`banto_io::brigade_log`) as this process
@@ -157,6 +190,7 @@ pub fn run_stdio_server(
     claude_home: ClaudeHome,
     codex_home: Option<CodexHome>,
     goinkyo_dir: Option<PathBuf>,
+    goinkyo_policy: GoinkyoPolicy,
     message_log: Option<BrigadeLog>,
 ) -> Result<()> {
     let mut ctx = ServerContext {
@@ -165,6 +199,7 @@ pub fn run_stdio_server(
         claude_home,
         codex_home,
         goinkyo_dir,
+        goinkyo_policy,
         message_log: message_log.map(|log| MessageLog { log, warned: false }),
     };
     serve_stdio(|line| handle_line(line, &mut ctx))
@@ -1147,6 +1182,23 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
         );
     }
 
+    // Before the request is read, let alone filed: a consultation that cannot
+    // start is not worth the Director's time writing up.
+    let director_agent = members
+        .iter()
+        .find(|m| m.role == BrigadeRole::Director)
+        .and_then(|m| m.agent);
+    let product = goinkyo_product(ctx.goinkyo_policy.setting, director_agent);
+    if let Some(product) = product
+        && let Some(refusal) = goinkyo_launch_refusal(ctx, product)
+    {
+        return tool_error(&goinkyo_refusal_message(
+            refusal,
+            ctx.goinkyo_policy.setting,
+            product,
+        ));
+    }
+
     let kind = match require_string_arg(msg, "kind") {
         Ok(value) => value,
         Err(message) => return tool_error(&message),
@@ -1269,7 +1321,9 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
         Ok(path) => path,
         Err(err) => return tool_error(&format!("failed to file the consultation: {err}")),
     };
-    let registered = ctx.store.add_goinkyo_member(brigade, &title);
+    let registered = ctx
+        .store
+        .add_goinkyo_member_with_agent(brigade, &title, product);
     // Logged as what the Goinkyo reads, and only once the call has succeeded: a
     // call that returns an error leaves no entry.
     if registered.is_ok()
@@ -1308,6 +1362,114 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
             path.display()
         )),
     }
+}
+
+/// The product `consult_goinkyo` records on the Goinkyo's row, or `None` when it
+/// cannot be told: `inherit` under a Director whose own row names no product
+/// (a row from before banto recorded it). Nothing is refused and the row
+/// records none then, and the engine resolves it with the Director's session in
+/// view ([`banto_core::engine::GoinkyoSpawnCandidate::director_agent`]); guessing
+/// Claude here would refuse nothing and could contradict that.
+///
+/// Defence more than a path: only a row from before the schema recorded the
+/// product is NULL, and an agent that can call this tool was opened through
+/// `execute_open_embedded`, the one place a member's MCP wiring is built, which
+/// writes the opened product onto the row (`set_member_agent`). The write comes
+/// after the process is spawned and its error is ignored, so a live Director with
+/// no product is a failed write, or a call that beats it.
+fn goinkyo_product(setting: GoinkyoAgentSetting, director: Option<AgentKind>) -> Option<AgentKind> {
+    match (setting, director) {
+        (GoinkyoAgentSetting::Inherit, None) => None,
+        (setting, director) => Some(resolve_goinkyo_agent(
+            setting,
+            director.unwrap_or(AgentKind::ClaudeCode),
+        )),
+    }
+}
+
+/// The condition, if any, that keeps a Goinkyo of `product` from working. Reads
+/// the one fact that can change under a running process, Codex's hook trust, fresh
+/// and only for a Codex Goinkyo, since the operator may have approved it since
+/// this process started.
+fn goinkyo_launch_refusal(ctx: &ServerContext, product: AgentKind) -> Option<GoinkyoRefusal> {
+    // This process only exists with a Claude home: startup fails without one,
+    // so there is no unresolved Claude home to refuse on.
+    let home_resolved = match product {
+        AgentKind::ClaudeCode => true,
+        AgentKind::Codex => ctx.codex_home.is_some(),
+    };
+    let hook_primed = product == AgentKind::Codex
+        && ctx
+            .codex_home
+            .as_ref()
+            .is_some_and(|home| hook_trust_state(home) == HookTrustState::Primed);
+    goinkyo_refusal(
+        product,
+        &ctx.goinkyo_policy.enabled,
+        home_resolved,
+        CodexHookFacts {
+            launchable: ctx.goinkyo_policy.hook_launchable,
+            primed: hook_primed,
+        },
+    )
+}
+
+/// The tool error for a refused consultation: which condition failed, why this
+/// product was the one, and what the operator can change. Written for a Director
+/// agent that can do none of it itself and must pass it on.
+fn goinkyo_refusal_message(
+    refusal: GoinkyoRefusal,
+    setting: GoinkyoAgentSetting,
+    product: AgentKind,
+) -> String {
+    let name = product.label();
+    let why = match setting {
+        GoinkyoAgentSetting::Inherit => format!(
+            "`[brigade] goinkyo_agent` is \"inherit\", so it follows this Director's product, {name}"
+        ),
+        GoinkyoAgentSetting::Claude => "`[brigade] goinkyo_agent` is \"claude\"".to_string(),
+        GoinkyoAgentSetting::Codex => "`[brigade] goinkyo_agent` is \"codex\"".to_string(),
+    };
+    let (failed, remedy) = match refusal {
+        GoinkyoRefusal::NotEnabled(_) => (
+            format!("the `agents` setting does not enable {name}"),
+            "The operator can add it to `agents` in banto's config.toml, or set \
+             `[brigade] goinkyo_agent` to a product `agents` does enable."
+                .to_string(),
+        ),
+        GoinkyoRefusal::HomeUnresolved(_) => {
+            let flag = product.as_token();
+            (
+                format!("banto found no {name} home directory"),
+                format!(
+                    "The operator can point banto at it (`--{flag}-home`, or `{flag}_home` in \
+                     config.toml), or set `[brigade] goinkyo_agent` to a product whose home \
+                     banto has."
+                ),
+            )
+        }
+        GoinkyoRefusal::CodexHookNotLaunchable => (
+            "banto's own path contains a space, which Codex cannot launch a hook from, so a \
+             Codex Goinkyo would start without its briefing and without saying so"
+                .to_string(),
+            "The operator can move banto to a path without a space and restart it, or set \
+             `[brigade] goinkyo_agent = \"claude\"`."
+                .to_string(),
+        ),
+        GoinkyoRefusal::CodexHookNotPrimed => (
+            "Codex has not been asked to trust banto's SessionStart hook, so a Codex Goinkyo \
+             would start without its briefing and without saying so"
+                .to_string(),
+            "The operator can approve the hook once in banto's Codex trust pane, which opens \
+             when a brigade that has a Codex member is formed, or set `[brigade] \
+             goinkyo_agent = \"claude\"`."
+                .to_string(),
+        ),
+    };
+    format!(
+        "consult_goinkyo refused: this Goinkyo would run as {name} ({why}), but {failed}. \
+         {remedy} Nothing was filed. Tell the operator, then call consult_goinkyo again."
+    )
 }
 
 /// `dismiss_goinkyo`: ends the brigade's active consultation by removing
@@ -2300,6 +2462,7 @@ mod tests {
             // success path sets a tempdir instead, so nothing ever writes
             // under the real `dirs::data_local_dir()`.
             goinkyo_dir: None,
+            goinkyo_policy: GoinkyoPolicy::default(),
             message_log: None,
         }
     }
@@ -3622,6 +3785,7 @@ mod tests {
             claude_home: ClaudeHome::new(PathBuf::from("/nonexistent")),
             codex_home: None,
             goinkyo_dir: None,
+            goinkyo_policy: GoinkyoPolicy::default(),
             message_log: None,
         };
         (dir, ctx, emporium)
@@ -5313,6 +5477,283 @@ mod tests {
                 "request file missing {expected:?}, got:\n{contents}"
             );
         }
+    }
+
+    /// A Director's context with `setting`/`enabled` as the parent handed them,
+    /// the Director's own row recording `director_agent`, and `codex_home` as the
+    /// resolved Codex home (`None` for one that did not resolve). The returned
+    /// tempdir holds the request files and must outlive the call.
+    fn policy_ctx(
+        setting: GoinkyoAgentSetting,
+        enabled: &[AgentKind],
+        director_agent: Option<AgentKind>,
+        codex_home: Option<&Path>,
+    ) -> (ServerContext, tempfile::TempDir) {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        if let Some(agent) = director_agent {
+            ctx.store.set_member_agent(1, "director", agent).unwrap();
+        }
+        // The Worker `full_goinkyo_args` names.
+        ctx.store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.goinkyo_dir = Some(tmp.path().join("goinkyo"));
+        ctx.codex_home = codex_home.map(|dir| CodexHome::new(dir.to_path_buf()));
+        ctx.goinkyo_policy = GoinkyoPolicy {
+            setting,
+            enabled: enabled.iter().copied().collect(),
+            hook_launchable: true,
+        };
+        (ctx, tmp)
+    }
+
+    /// A Codex home whose `config.toml` is `config`, or has none at all.
+    fn codex_home_with(config: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(config) = config {
+            std::fs::write(dir.path().join("config.toml"), config).unwrap();
+        }
+        dir
+    }
+
+    /// The shape of the trust record `codex_trust`'s own tests pin as primed: no
+    /// directory trust anywhere in it.
+    const PRIMED_CODEX_CONFIG: &str = r#"
+[hooks.state]
+
+[hooks.state.'C:\<session-flags>\config.toml:session_start:0:0']
+trusted_hash = "sha256:a751b947abc123"
+enabled = true
+"#;
+
+    fn goinkyo_row_agent(ctx: &ServerContext) -> Option<Option<AgentKind>> {
+        ctx.store
+            .brigade_members(1)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.role == BrigadeRole::Goinkyo)
+            .map(|m| m.agent)
+    }
+
+    const BOTH: [AgentKind; 2] = [AgentKind::ClaudeCode, AgentKind::Codex];
+
+    #[test]
+    fn consult_goinkyo_records_the_resolved_product_on_the_goinkyo_row() {
+        use GoinkyoAgentSetting::{Claude, Codex, Inherit};
+        let primed = codex_home_with(Some(PRIMED_CODEX_CONFIG));
+        for (setting, director, expected) in [
+            (Inherit, AgentKind::ClaudeCode, AgentKind::ClaudeCode),
+            (Inherit, AgentKind::Codex, AgentKind::Codex),
+            (Claude, AgentKind::Codex, AgentKind::ClaudeCode),
+            (Codex, AgentKind::ClaudeCode, AgentKind::Codex),
+        ] {
+            let (mut ctx, _tmp) = policy_ctx(setting, &BOTH, Some(director), Some(primed.path()));
+            let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+            assert_eq!(response["result"]["isError"], false, "got {response:?}");
+            assert_eq!(
+                goinkyo_row_agent(&ctx),
+                Some(Some(expected)),
+                "{setting:?} under a {director:?} Director"
+            );
+        }
+    }
+
+    #[test]
+    fn a_codex_goinkyo_is_refused_until_banto_s_hook_is_trusted() {
+        // Nothing in the home to read, and a config without the record: each is a
+        // hook Codex has not been asked to trust.
+        let unreadable = codex_home_with(None);
+        let unrecorded = codex_home_with(Some("model = \"x\"\n"));
+        for home in [&unreadable, &unrecorded] {
+            let (mut ctx, tmp) = policy_ctx(
+                GoinkyoAgentSetting::Inherit,
+                &BOTH,
+                Some(AgentKind::Codex),
+                Some(home.path()),
+            );
+            let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+            assert!(is_error(&response), "got {response:?}");
+            let text = result_text(&response);
+            for expected in [
+                "consult_goinkyo refused",
+                "Codex has not been asked to trust banto's SessionStart hook",
+                "goinkyo_agent",
+                "trust pane",
+                "Nothing was filed",
+            ] {
+                assert!(text.contains(expected), "{expected:?} missing from: {text}");
+            }
+            assert_no_goinkyo_side_effects(&ctx, 1, &tmp.path().join("goinkyo"));
+        }
+    }
+
+    #[test]
+    fn a_codex_goinkyo_is_refused_when_the_hook_cannot_carry_banto_s_path_even_if_trusted() {
+        // Trusted, and still refused: the hook never runs from a path with a
+        // space, so the trust record settles nothing.
+        let primed = codex_home_with(Some(PRIMED_CODEX_CONFIG));
+        for setting in [GoinkyoAgentSetting::Codex, GoinkyoAgentSetting::Inherit] {
+            let (mut ctx, tmp) =
+                policy_ctx(setting, &BOTH, Some(AgentKind::Codex), Some(primed.path()));
+            ctx.goinkyo_policy.hook_launchable = false;
+            let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+            assert!(is_error(&response), "{setting:?}: got {response:?}");
+            let text = result_text(&response);
+            for expected in [
+                "consult_goinkyo refused",
+                "banto's own path contains a space",
+                "goinkyo_agent",
+                "Nothing was filed",
+            ] {
+                assert!(text.contains(expected), "{expected:?} missing from: {text}");
+            }
+            assert!(
+                !text.contains("trust pane"),
+                "blamed the wrong thing: {text}"
+            );
+            assert_no_goinkyo_side_effects(&ctx, 1, &tmp.path().join("goinkyo"));
+        }
+    }
+
+    #[test]
+    fn a_claude_goinkyo_does_not_care_whether_the_codex_hook_is_launchable() {
+        let (mut ctx, _tmp) = policy_ctx(
+            GoinkyoAgentSetting::Claude,
+            &BOTH,
+            Some(AgentKind::Codex),
+            None,
+        );
+        ctx.goinkyo_policy.hook_launchable = false;
+        let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+        assert_eq!(response["result"]["isError"], false, "got {response:?}");
+    }
+
+    #[test]
+    fn a_trusted_hook_is_enough_for_a_codex_goinkyo_with_no_directory_trust_on_record() {
+        // A Codex pane started outside a git repository writes no directory
+        // trust key, so its absence is not a reason to refuse.
+        let primed = codex_home_with(Some(PRIMED_CODEX_CONFIG));
+        assert!(!PRIMED_CODEX_CONFIG.contains("projects"));
+        let (mut ctx, _tmp) = policy_ctx(
+            GoinkyoAgentSetting::Codex,
+            &BOTH,
+            Some(AgentKind::ClaudeCode),
+            Some(primed.path()),
+        );
+        let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+        assert_eq!(response["result"]["isError"], false, "got {response:?}");
+    }
+
+    #[test]
+    fn a_goinkyo_whose_product_agents_leaves_out_is_refused() {
+        let primed = codex_home_with(Some(PRIMED_CODEX_CONFIG));
+        for (setting, director, enabled, product) in [
+            (
+                GoinkyoAgentSetting::Codex,
+                AgentKind::ClaudeCode,
+                [AgentKind::ClaudeCode],
+                "Codex",
+            ),
+            // `inherit` follows the Director, so a Codex Director with Codex
+            // switched off is the same refusal.
+            (
+                GoinkyoAgentSetting::Inherit,
+                AgentKind::Codex,
+                [AgentKind::ClaudeCode],
+                "Codex",
+            ),
+            (
+                GoinkyoAgentSetting::Claude,
+                AgentKind::Codex,
+                [AgentKind::Codex],
+                "Claude",
+            ),
+        ] {
+            let (mut ctx, tmp) = policy_ctx(setting, &enabled, Some(director), Some(primed.path()));
+            let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+            assert!(is_error(&response), "{setting:?}: got {response:?}");
+            let text = result_text(&response);
+            let failed = format!("the `agents` setting does not enable {product}");
+            for expected in [
+                "consult_goinkyo refused",
+                failed.as_str(),
+                "goinkyo_agent",
+                "Nothing was filed",
+            ] {
+                assert!(text.contains(expected), "{expected:?} missing from: {text}");
+            }
+            assert_no_goinkyo_side_effects(&ctx, 1, &tmp.path().join("goinkyo"));
+        }
+    }
+
+    #[test]
+    fn a_codex_goinkyo_is_refused_when_banto_has_no_codex_home() {
+        for setting in [GoinkyoAgentSetting::Codex, GoinkyoAgentSetting::Inherit] {
+            let (mut ctx, tmp) = policy_ctx(setting, &BOTH, Some(AgentKind::Codex), None);
+            let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+            assert!(is_error(&response), "{setting:?}: got {response:?}");
+            let text = result_text(&response);
+            for expected in [
+                "banto found no Codex home directory",
+                "--codex-home",
+                "goinkyo_agent",
+                "Nothing was filed",
+            ] {
+                assert!(text.contains(expected), "{expected:?} missing from: {text}");
+            }
+            assert_no_goinkyo_side_effects(&ctx, 1, &tmp.path().join("goinkyo"));
+        }
+    }
+
+    #[test]
+    fn a_claude_goinkyo_never_asks_about_codex() {
+        // No Codex home, Codex switched off: nothing a Claude Goinkyo reads.
+        let (mut ctx, _tmp) = policy_ctx(
+            GoinkyoAgentSetting::Claude,
+            &[AgentKind::ClaudeCode],
+            Some(AgentKind::Codex),
+            None,
+        );
+        let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+        assert_eq!(response["result"]["isError"], false, "got {response:?}");
+        assert_eq!(goinkyo_row_agent(&ctx), Some(Some(AgentKind::ClaudeCode)));
+    }
+
+    #[test]
+    fn inherit_under_a_director_with_no_recorded_product_refuses_nothing_and_records_none() {
+        // A Director row from before banto recorded the product: not guessed at
+        // here, and left to the emporium, which can see the session. Even with
+        // nothing Codex could run on.
+        let (mut ctx, _tmp) = policy_ctx(
+            GoinkyoAgentSetting::Inherit,
+            &[AgentKind::ClaudeCode],
+            None,
+            None,
+        );
+        let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+        assert_eq!(response["result"]["isError"], false, "got {response:?}");
+        assert_eq!(goinkyo_row_agent(&ctx), Some(None));
+    }
+
+    #[test]
+    fn a_refusal_comes_before_the_request_is_even_read() {
+        // An empty call: the refusal, not a missing-field error, so a Director
+        // learns what cannot work before it writes anything up.
+        let (mut ctx, _tmp) = policy_ctx(
+            GoinkyoAgentSetting::Codex,
+            &[AgentKind::ClaudeCode],
+            Some(AgentKind::ClaudeCode),
+            None,
+        );
+        let response = call(&mut ctx, &goinkyo_call(json!({})));
+        assert!(is_error(&response));
+        assert!(result_text(&response).contains("consult_goinkyo refused"));
     }
 
     #[test]

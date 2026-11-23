@@ -604,6 +604,8 @@ fn goinkyo_line_names_its_fields_in_the_fixed_order() {
         },
         cwd: PathBuf::from("."),
         roster: Vec::new(),
+        agent: None,
+        director_agent: None,
     };
     assert_eq!(
         goinkyo_line(&look).body(),
@@ -650,6 +652,8 @@ fn old_gather_decision(look: &GoinkyoLook) -> Option<GoinkyoObservation> {
         brigade_id: look.brigade_id,
         cwd: look.cwd.clone(),
         roster: look.roster.clone(),
+        agent: look.agent,
+        director_agent: look.director_agent,
     }))
 }
 
@@ -677,6 +681,8 @@ fn decide_goinkyo_matches_the_gather_branches_it_replaces() {
                         },
                         cwd: PathBuf::from("/synthetic/cwd"),
                         roster: vec!["director".to_string(), "goinkyo".to_string()],
+                        agent: None,
+                        director_agent: None,
                     };
                     assert_eq!(
                         decide_goinkyo(&look),

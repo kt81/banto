@@ -271,6 +271,8 @@ mod tests {
             },
             cwd: PathBuf::from("."),
             roster: Vec::new(),
+            agent: None,
+            director_agent: None,
         }
     }
 

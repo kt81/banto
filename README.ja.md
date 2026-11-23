@@ -41,6 +41,8 @@ banto は MCP 上でメンバー間のメッセージを中継します。各メ
 - `interrupt_worker`: Claude の Worker が実行中のターンを Esc 1 回で止め、Director が書いた理由をメッセージとして渡します。Codex の Worker にはメッセージは届きますが、まだ中断はされません
 - `name_member`: Worker の常設の役割に表示名を付けます（宛先は引き続きトークンです）
 
+Goinkyo は、Director が `consult_goinkyo` で相談する助言役のセッションです。既定では Director と同じプロダクトで動くため、Codex の Director の Goinkyo は Codex になります（`goinkyo_agent`）。`goinkyo_agent = "claude"` にすると Claude のままです。Codex の Goinkyo は読み取り専用で、承認の確認なしに動くので、ビルドもテストもできません。Codex がまだ信頼していないディレクトリでの最初の相談は、Codex 自身の信頼の質問で止まり、Goinkyo のペインで答えるまで待ちます。Goinkyo のプロダクトが動かせないとき（`agents` で有効になっていない、ホームが見つからない、banto のフックが未信頼または起動できない）、`consult_goinkyo` は最初に拒否します。
+
 各メンバーには、所属する Brigade、トークン、同僚を示す役割ブリーフィングも渡します。Claude Code ではシステムプロンプトへ追記し、Codex では banto 自身の `SessionStart` フックで届けます。中継されたメッセージには、別の AI から来たものだと明示する枠を付けるので、操作者の入力と取り違えられることはありません。banto の**自動リレー**は、未読メッセージがあるアイドルのメンバーに、短い定型の Nudge（催促）を標準入力へ打ち込んで起こします。そのため Director→Worker→Director の往復に人手の橋渡しは要りません。`relay = "auto"` のとき、この起こし方はメンバーの文脈全体に対するターンを始めるので、メッセージに依頼の中身がなくても、アイドルのメンバーは 1 ターン分の費用を使うことがあります。このリポジトリの大部分は、このループで作られました。
 
 生きているメンバー全員が、実際の作業のあと 5 秒間アイドルだったとき、Brigade は静まったとみなされます。あなたの入力が求められる瞬間です。banto は Director に印を付け（一覧の行の待機ドット、マゼンタのペイン枠）、ターミナルのベルを鳴らします。ただし Director のペインを見ているあいだは鳴らしません。`F4` を押すと、そのときも鳴らします（ベルだけで、印は付きません）。
@@ -202,20 +204,10 @@ week_days = 7
 [brigade]           # Director/Worker の Brigade
 workers = 1         # Brigade ごとに自動起動する Worker の数（1..=8）
 worker_agent = "inherit"   # "inherit"（Director と同じプロダクト）| "claude" | "codex" | "select"（選択画面: エージェント、モデル、effort）
-# 新しい Worker のモデルと effort。作成時にだけ渡します。"" ならフラグを渡しません。
-worker_model = "sonnet"          # Claude: --model
-worker_effort = "high"           # Claude: --effort (low | medium | high | xhigh | max)
-worker_model_codex = "terra"     # Codex: slug、または最新の slug に解決されるファミリー名
-worker_effort_codex = "high"     # Codex: -c model_reasoning_effort
 # Worker の自動圧縮ウィンドウ。起動のたびに渡します（再開も含む）:
 # "auto"、100000..=1000000 の整数、または ""（フラグなし）。Director と Goinkyo には渡しません。
 # Codex はトークン数だけを受け付けます。"auto" では何も渡しません。
 worker_autocompact = 250000
-# 新しい Goinkyo のモデルと effort。作成時にだけ渡します。"" ならフラグを渡しません。
-# Fable と max は既定ではなく、選んで使うものです。Fable は一部のプランで使用クレジットに
-# 課金され、max は Claude が保存できないため再起動で外れます。
-goinkyo_model = "opus"           # Claude: --model
-goinkyo_effort = "xhigh"         # Claude: --effort (low | medium | high | xhigh | max)
 relay = "auto"      # "auto" | "manual" — 起こすための Nudge エンジン
 # Brigade のメッセージをすべて全文のまま <data dir>/logs/brigade-<id>.log に追記します。
 # このファイルには実際の会話内容が入り、ローテーションも削除もされません。コミットしないでください。
@@ -231,8 +223,36 @@ worker_prompt = "..."
 # Claude の Director は編集後に banto の再起動が必要です。Codex の Director はフックが
 # 次のセッション開始時に読み直します。動いている Director は変更を知りません。ペインで伝えてください。
 goinkyo_consult = "design"
+# Goinkyo が動くプロダクト: "inherit"（Director と同じ）| "claude" | "codex"。
+# Codex の Goinkyo は読み取り専用（-s read-only -a never）で動くため、ビルドもテストもできません。
+# モデルと effort は [brigade.codex] の goinkyo_model と goinkyo_effort です。
+goinkyo_agent = "inherit"
 # Director の request_decision は、行に印を付けてベルも鳴らします。false なら印だけです。
 request_attention = true
+
+# 片方のプロダクトだけが読む設定は、そのプロダクトのテーブルに置きます。これらのテーブルは、
+# 上にあるすべての [brigade] の通常のキーより下に書いてください。テーブルの下に書いた通常の
+# キーはそのテーブルのキーとして読まれるため、banto 自身のキーがそこにあると起動を拒否します。モデル、effort、パーミッションモードは
+# 新しい Worker や Goinkyo に、作成時にだけ渡します。"" ならフラグを渡しません。
+# [brigade] 直下の古い書き方（worker_model、worker_effort、worker_model_codex、
+# worker_effort_codex、worker_permission_mode、goinkyo_model、goinkyo_effort、
+# goinkyo_permission_mode、goinkyo_disallowed_tools）も引き続き読まれ、見つけたものは
+# 起動時に banto が知らせます。両方あるときはテーブルが優先されます。
+[brigade.claude]
+worker_model = "sonnet"          # --model
+worker_effort = "high"           # --effort (low | medium | high | xhigh | max)
+worker_permission_mode = "auto"  # --permission-mode
+# Fable と max は既定ではなく、選んで使うものです。Fable は一部のプランで使用クレジットに
+# 課金され、max は Claude が保存できないため再起動で外れます。
+goinkyo_model = "opus"
+goinkyo_effort = "xhigh"
+goinkyo_permission_mode = "auto"
+
+[brigade.codex]
+worker_model = "terra"           # slug、または最新の slug に解決されるファミリー名
+worker_effort = "high"           # -c model_reasoning_effort
+goinkyo_model = ""               # Codex の Goinkyo のモデル。"" は Codex の既定
+goinkyo_effort = ""              # Codex の Goinkyo の -c model_reasoning_effort。"" は渡さない
 
 [keys]
 prefix = "C-b"      # ペインのプレフィックスのキー

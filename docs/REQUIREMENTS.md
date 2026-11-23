@@ -863,10 +863,180 @@ a decision to record here, not a value to change in the code.
 - A Goinkyo created from now on is `--model opus --effort xhigh`. One that already
   has a session keeps what its own record says (nothing is passed on a resume).
 - Whoever wants the earlier behaviour writes `goinkyo_model = "fable"` and
-  `goinkyo_effort = "max"` under `[brigade]`; the README's configuration example names
-  both keys.
+  `goinkyo_effort = "max"` under `[brigade.claude]` (the flat `[brigade]` spelling
+  still works, see "Decision (2026-11-23): per-product settings live in product
+  tables"); the README's configuration example names both keys.
 - `tools/measure/what_ran.py` keeps its own copy of the built-ins, which no test
   compares with `BrigadeConfig::default`; it was changed in the same commit.
+
+## Decision (2026-11-23): per-product settings live in product tables
+
+Decision of the operator, 2026-11-23, after a Goinkyo design consultation: the
+settings that only one product reads move from flat `[brigade]` keys into a table
+per product, `[brigade.claude]` and `[brigade.codex]`. His words: "製品ごとに
+なってたほうがTOMLを生かしてるっぽくてステキに見えます。それでGo".
+
+*Why.* A third product is likely (Antigravity). The flat keys told the products
+apart by a suffix that only Codex had (`worker_model_codex`), so every further
+product would have added a suffix to every key, and the Claude keys, which have none,
+would have kept reading as the default for products that are not Claude. And the
+knobs differ by product: Claude has a permission mode and a tool denylist, Codex has
+neither, and each product's model and effort words belong to that product. A table
+holds exactly the keys its product has, and a product with no table yet costs
+nothing.
+
+*The shape.* `[brigade]` keeps what is not about one product: `workers`,
+`worker_agent`, `goinkyo_agent`, `worker_autocompact`, `relay`, the prompts,
+`goinkyo_consult`, `message_log`, `request_attention`. The rest move, with the key
+names inside a table losing their suffix:
+
+| Legacy flat key | Now |
+| --- | --- |
+| `worker_model`, `worker_effort`, `worker_permission_mode` | the same names under `[brigade.claude]` |
+| `goinkyo_model`, `goinkyo_effort`, `goinkyo_permission_mode`, `goinkyo_disallowed_tools` | the same names under `[brigade.claude]` |
+| `worker_model_codex`, `worker_effort_codex` | `worker_model`, `worker_effort` under `[brigade.codex]` |
+
+`[agent_binaries]`, `claude_home` and `codex_home` stay where they are, because they
+apply to solo sessions as well as to a brigade.
+
+*Resolution, per setting:* the table's value if the table sets it, else the legacy
+flat key if the file sets it, else the built-in. A table value of `""` is set: it is
+the escape hatch (no flag) and beats a legacy key. The accessors
+(`BrigadeConfig::worker_model_for`, `worker_effort_for`, `worker_permission_mode`,
+`goinkyo_model`, `goinkyo_effort`, `goinkyo_permission_mode`,
+`goinkyo_disallowed_tools`) keep their signatures, so nothing that launches a
+member changed. In the struct the flat fields stay as they were and hold the legacy
+value, or the built-in when the file writes none; the tables are `Option`s, `None`
+when absent. A product table banto does not know (`[brigade.antigravity]`) is an
+unknown key and is ignored, and so is a key a known table does not have, with the
+one exception under "Placement" below.
+
+*Values are not validated,* here as before: banto passes a model, an effort or a
+permission mode on as written and the agent says what it thinks of it. A value of the
+wrong TOML type is refused under a table and under a legacy key alike ("A config
+file that is there must be usable", under Brigade).
+
+*The legacy keys are an alias, not a deprecation with a date.* A file that only has
+them reads exactly as it did. When the file writes any, startup shows one notice
+(`BrigadeConfig::legacy_key_notice`, carried by `startup::boot_notices`) that names
+the keys and nothing more, for example
+``config: legacy [brigade] keys (worker_model_codex) moved to [brigade.claude]/[brigade.codex]; see README``;
+after the first three names it says `and N more`, and `; N ignored (the table
+wins)` follows when the table also sets some of them. It is short on purpose: the
+status line draws one unwrapped span and clips it at the terminal's width, and a
+sentence per key was ~96 characters for one key and ~690 for nine, most of it lost.
+Which keys the file wrote is read from the parsed table by
+`banto_io::config::load` (`BrigadeConfig::legacy_keys`, not deserialized): the flat
+fields hold the built-in when a key is absent, so the parsed struct cannot say
+whether the file wrote the built-in itself. `_hook`, which loads leniently, fills it
+the same way and shows no notice.
+
+*Placement.* In the TOML text every plain `[brigade]` key has to come before the first
+`[brigade.…]` sub-table: a plain key written below one belongs to that table. Left
+there it would vanish without a word, `relay = "typo"` included, which is a value
+the file's own rule would have refused. So a `[brigade.claude]` or `[brigade.codex]`
+holding a key that is a plain `[brigade]` key (`workers`, `relay`, `worker_agent`,
+`goinkyo_agent`, `worker_autocompact`, `request_attention`, `message_log`,
+`goinkyo_consult`, the three prompts), or a legacy flat name its table does not have
+(`worker_model_codex` under `[brigade.claude]`, `goinkyo_permission_mode` under
+`[brigade.codex]`), is refused at the offending value, with `toml`'s own line,
+column and echoed line, like a value of the wrong type: ``"`relay` is a [brigade] key,
+but it is written under [brigade.claude]; move it above the first [brigade.*] table"``.
+Every other unknown key inside a product table stays ignored. The refusal is a
+custom `Deserialize` on the two fields (`guarded_table`, in `banto-core`, which stays
+free of I/O), raised from inside the value's own deserialization so that `toml`
+attaches the span. The key lists it checks are constants, held to the structs by a
+test that fails to compile when a field is added. The README's example is written
+with the plain keys first and says so.
+
+*Added later (2026-11-23).* `[brigade.codex]` also holds a
+Codex Goinkyo's `goinkyo_model` and `goinkyo_effort`. They are new keys, so they have
+no legacy flat spelling (a flat `goinkyo_model` is, and stays, the Claude Goinkyo's)
+and their built-in is the empty string, not a word: a Codex Goinkyo runs the
+operator's own Codex default unless a key says otherwise. See "Goinkyo's product"
+below.
+
+## Goinkyo's product: `goinkyo_agent` (2026-11-23)
+
+A Goinkyo runs as Claude Code or as Codex. The key is `[brigade] goinkyo_agent`:
+`inherit`, `claude` or `codex`, read like `worker_agent` (trimmed, case-insensitive;
+anything else, `""` included, is refused when the file is read). The built-in is
+`inherit`: the Goinkyo runs as its Director's own product, so a Codex Director's
+Goinkyo is Codex and a Claude Director's is Claude. `goinkyo_agent = "claude"` keeps
+every Goinkyo on Claude, as before the key existed. What was run and measured on a
+Codex Goinkyo is in `docs/notes/codex-goinkyo-spike-2026-11-23.md`.
+
+Where the product is decided:
+
+- One pure function, `banto_core::config::resolve_goinkyo_agent(setting,
+  director's product)`, resolves `inherit`.
+- The Goinkyo's member row is the source of truth. `consult_goinkyo` (the
+  Director's `_mcp` process) calls the resolver with the product on the caller's own
+  Director row and writes the answer to the Goinkyo's row
+  (`Store::add_goinkyo_member_with_agent`). The emporium spawns whatever the row
+  says and resolves it itself only for a row that records none, from the setting
+  and the Director's product (`GoinkyoSpawnCandidate::{agent, director_agent}`,
+  both `serde(default)`, so an older capture replays as before). The refusal and the
+  spawn therefore cannot disagree after the config is edited: `_mcp` reads the
+  config once, when the Director starts.
+- A Director row with no recorded product (one written before banto recorded it),
+  under `inherit`, refuses nothing and records no product on the Goinkyo's row; the
+  emporium then resolves it from the Director's session, and from Claude when that
+  says nothing either. The operator's live database had 2 such Director rows of 12
+  on 2026-11-23. A live Director cannot normally be one of them: its pane is opened
+  through `execute_open_embedded`, the only place a member's MCP wiring is built,
+  and that writes the opened product onto the row after the spawn, ignoring a
+  failed write. The branch is kept for that failed write, and for a call that beats
+  it.
+
+`consult_goinkyo` refuses, before it reads the request and before it files or
+writes anything, when the resolved product is Codex and banto's hook cannot be
+launched (banto's own path has a space in it, which a hook command cannot carry;
+checked first, as formation does, since a trust record for a hook that never runs
+settles nothing) or is not trusted (`hook_trust_state` is not `Primed`; unreadable
+counts as not primed), when the `agents` setting leaves the product out, or when
+its home did not resolve (only a Codex home can fail to; `_mcp` does not start
+without a Claude one). Each error names the failed condition, `goinkyo_agent` and
+what the operator can change. The Codex hook error points at the trust pane, which
+has no direct entry: it opens when a brigade with a Codex member is formed.
+Directory trust is not a condition: Codex writes no trust key outside a git
+repository, so a missing one does not mean it will ask. When it does ask, the
+Goinkyo waits at Codex's own question until it is answered in its pane, after which
+the kickoff is typed automatically (one run waited about 92 s).
+
+What a Codex Goinkyo is:
+
+- It is started by the Codex kickoff a fresh Codex member gets, not by the
+  Goinkyo's own live-file kickoff, whose gate reads a file only Claude writes.
+- Launch policy. It is launched with no permission mode or denylist: those two
+  settings hold Claude flags. It always carries Codex's own `-s read-only -a never`
+  (`--sandbox read-only --ask-for-approval never`), on a creation and on a resume
+  alike, since banto does not count on a resumed session remembering a launch flag.
+  Both flags are listed by `codex --help` and `codex resume --help` at 0.171.0.
+  Workers and Directors carry neither.
+- The cost of that policy: a Codex Goinkyo cannot build or run tests, and its shell
+  has no network. Reads, `git log`/`git status` and banto's three MCP tools worked
+  under the flags in four runs on Windows with no prompt. The write block was
+  measured in Codex's sandbox alone (`codex sandbox`, three shells refused, a
+  workspace-write control succeeded); a Goinkyo that was asked to write declined in
+  both runs that asked, so a refused write from a running Goinkyo was not observed.
+- Its model and effort are its own keys, `[brigade.codex] goinkyo_model` and
+  `goinkyo_effort`, built-in empty (no `-m`, no effort: the operator's Codex
+  default), never the Claude Goinkyo's and never on a resume. The model may be a
+  slug or a family word and is held for the catalog like a Codex Worker's (see "A
+  Codex model as a family word"). Values are not validated.
+- Its briefing comes from the `SessionStart` hook like any Codex member's. The hook
+  names the consultation request file by reading the data directory from a third
+  `BANTO_PARENT_*` variable (`BANTO_PARENT_DATA_DIR`), which keeps the hook's command
+  string, and so Codex's trust hash for it, unchanged.
+- Its `banto` MCP server launches with `default_tools_approval_mode="approve"` like
+  every Codex member's: under `approval_policy = "never"` a tool that needs
+  approval is denied, not asked about.
+- A consultation costs about 160k input tokens, mostly cached, and under 1k output
+  (measured).
+- Known and unhandled: a window of up to ~40 ms in which a banto restart or a pane
+  death loses the kickoff (the paragraph on re-staging a Goinkyo below says
+  why, and the note has the timeline).
 
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
@@ -1224,7 +1394,8 @@ resolves to `all` rather than to an empty set that would discover nothing.
 
 **Startup notices.** What banto has to say at startup that is not a refusal (the
 Codex hook-trust notice, see "Brigade", formation gate 3; what startup found about
-the database and the executable) is computed by the shell and handed to the core as
+the database and the executable; the config's legacy `[brigade]` keys, see "Decision
+(2026-11-23): per-product settings live in product tables") is computed by the shell and handed to the core as
 one event (`Event::StartupNotices`; nothing is sent when there is none). The core
 shows them on the status line one after the other, each for the status line's
 normal duration, the next taking the line when it becomes free, a notice waiting
@@ -2276,10 +2447,12 @@ disagreement or to think a design or a course through, addressable by name but n
 MCP tool (see "MCP mediation server" below), which files a written
 consultation request and creates the member row; once a tick observes that
 row with no session id yet, it is auto-spawned the same way a fresh Worker
-is, for any brigade whose Director's pane is hosted, on stage or not (Claude
-only — `goinkyo_model`/`goinkyo_effort`/`goinkyo_permission_mode`/
-`goinkyo_disallowed_tools` below; the model and the effort only because this is a
-creation, see "Model and effort: only when a session is created"), briefed from `goinkyo_prompt` with
+is, for any brigade whose Director's pane is hosted, on stage or not (a Claude
+Goinkyo reads `[brigade.claude] goinkyo_model`/`goinkyo_effort`/
+`goinkyo_permission_mode`/`goinkyo_disallowed_tools` below, a Codex one
+`[brigade.codex] goinkyo_model`/`goinkyo_effort` and nothing else; the model and the
+effort only because this is a creation, see "Model and effort: only when a session is
+created"), briefed from `goinkyo_prompt` with
 `{request}` substituted for the consultation file's path. The spawn is
 attempted at most once per consultation (`EmporiumState::goinkyo_pane`, one
 guard per brigade, mapped
@@ -2597,8 +2770,8 @@ path — `stage_brigade`'s undiscovered-member branch is Worker-only — but
 stays a fresh-spawn candidate for the ordinary tick mechanism above for as
 long as the brigade's Director is hosted (a creation, so it gets its model and effort).
 
-**A third case — a stranded Goinkyo — sits between those two.** A Goinkyo
-can have a session id (its own discovery already ran once) that still
+**A third case — a stranded Goinkyo — sits between those two.** A Claude
+Goinkyo can have a session id (its own discovery already ran once) that still
 resolves to no row: Claude Code writes no `projects/*.jsonl` transcript
 until a session's first turn, so a Goinkyo that never got as far as its own
 kickoff (closed, or the operator's machine restarted, before it ran one)
@@ -2622,6 +2795,20 @@ keyed on that same session id, so clearing it would break `send_to_peer`/
 `check_messages` for a Goinkyo still mid-consultation. `stage_brigade` tells
 the two apart by checking whether a live pane already answers to that key;
 if one does, it's reused, not reset.
+
+A Codex Goinkyo is not stranded this way, and has a gap of its own. Codex writes a
+session's `threads` row and rollout at its first persist, which is the kickoff's
+turn (the rollout was born 8 ms after the kickoff's Enter), and banto discovers
+the session 1.03-1.17 s after that in all 8 measured runs, so a Codex Goinkyo's
+id resolves to a row from discovery on and a re-stage takes the ordinary resume
+path, which expects no kickoff. (`threads.created_at` is a creation stamp 2.6-3.8 s
+before the file exists, not the time the row was written.) What is left is a
+window of up to ~40 ms, measured: in 3 of the 8 runs discovery came 25-39 ms
+before Codex had written the briefing and kickoff records of that same turn.
+A banto restart or a pane death inside it ends the turn before the kickoff record
+exists, and the re-stage resumes the Goinkyo without a kickoff. Nothing handles
+that; `a_codex_goinkyo_restaged_before_its_first_turn_is_recorded_is_resumed_without_a_kickoff`
+pins it as the current behaviour.
 
 **Formation.** `B` on a selected session appoints it Director and auto-spawns
 `workers` (config, default 1, clamped 1..=8) fresh Workers beside it. `b` spawns
@@ -2947,12 +3134,9 @@ resume guard remain tracked until a later confirmed exit. A historical
 ```rust
 pub struct BrigadeConfig {
     pub workers: u32,               // auto-spawned per cell, clamped 1..=8, default 1
-    pub worker_model: String,       // --model for a NEW Claude Worker only (never a resume); "" = no flag; default "sonnet"
-    pub worker_effort: String,      // --effort for a NEW Claude Worker only; "" = no flag; default "high"
-    pub worker_model_codex: String, // -m for a NEW Codex Worker only, a slug or a family word; "" = no flag; default "terra"
-    pub worker_effort_codex: String, // -c model_reasoning_effort for a NEW Codex Worker only; "" = no flag; default "high"
+    pub claude: ClaudeBrigadeConfig, // [brigade.claude]: the Claude-only settings, each an Option (None = not set) — see below
+    pub codex: CodexBrigadeConfig,   // [brigade.codex]: the Codex-only settings, each an Option — see below
     pub worker_agent: WorkerAgentSetting, // Inherit (default) | Select | Claude | Codex — see below
-    pub worker_permission_mode: String, // --permission-mode for an auto-spawned Worker; "" = no flag; default "auto"; Claude only
     pub worker_autocompact: String, // a Worker's auto-compact window, every launch; "auto", 100000..=1000000 or ""; default 250000; Claude --autocompact, Codex -c model_auto_compact_token_limit
     pub relay: RelayMode,           // Auto | Manual, default Auto — see "Auto-relay" below
     pub request_attention: bool,    // a Director's decision request also marks and rings, like a quiet fire; default true, read at start; false = the tag only
@@ -2960,21 +3144,54 @@ pub struct BrigadeConfig {
     pub goinkyo_consult: String,    // how readily a Director consults the Goinkyo: "off" | "disputes" | "design" | "decisions"; default "design"; "" = no paragraph — see "Role briefings" below
     pub worker_prompt: String,      // role briefing template for each Worker
     pub goinkyo_prompt: String,     // role briefing template for a Goinkyo; also substitutes {request}
-    pub goinkyo_model: String,      // --model for a NEW Goinkyo only; "" = no flag; default "opus"; Claude only
-    pub goinkyo_effort: String,     // --effort for a NEW Goinkyo only; "" = no flag; default "xhigh"; Claude only
-    pub goinkyo_permission_mode: String, // --permission-mode for an auto-spawned Goinkyo; "" = no flag; default "auto"; Claude only
-    pub goinkyo_disallowed_tools: String, // --disallowedTools for an auto-spawned Goinkyo; "" = no flag; default "Edit,Write,NotebookEdit"; Claude only
+    pub goinkyo_agent: GoinkyoAgentSetting, // Inherit (default) | Claude | Codex — see "Goinkyo's product" below; a Codex Goinkyo gets none of the Claude settings in `claude`, and its own two in `codex`
     pub message_log: bool,          // append every brigade message to a plain-text file under banto's data dir (see "Message log" below); default false
+    // The legacy flat spellings, still read; each holds its legacy value, or the built-in when the file writes none:
+    pub worker_model: String,       // = [brigade.claude] worker_model
+    pub worker_effort: String,      // = [brigade.claude] worker_effort
+    pub worker_permission_mode: String, // = [brigade.claude] worker_permission_mode
+    pub goinkyo_model: String,      // = [brigade.claude] goinkyo_model
+    pub goinkyo_effort: String,     // = [brigade.claude] goinkyo_effort
+    pub goinkyo_permission_mode: String, // = [brigade.claude] goinkyo_permission_mode
+    pub goinkyo_disallowed_tools: String, // = [brigade.claude] goinkyo_disallowed_tools
+    pub worker_model_codex: String, // = [brigade.codex] worker_model
+    pub worker_effort_codex: String, // = [brigade.codex] worker_effort
+    #[serde(skip)]
+    pub legacy_keys: Vec<&'static str>, // which of those the file wrote, filled by banto_io::config::load
+}
+
+pub struct ClaudeBrigadeConfig {    // [brigade.claude]; every field Option<String>
+    pub worker_model: Option<String>,       // --model for a NEW Claude Worker only (never a resume); "" = no flag; built-in "sonnet"
+    pub worker_effort: Option<String>,      // --effort for a NEW Claude Worker only; "" = no flag; built-in "high"
+    pub worker_permission_mode: Option<String>, // --permission-mode for an auto-spawned Worker; "" = no flag; built-in "auto"
+    pub goinkyo_model: Option<String>,      // --model for a NEW Goinkyo only; "" = no flag; built-in "opus"
+    pub goinkyo_effort: Option<String>,     // --effort for a NEW Goinkyo only; "" = no flag; built-in "xhigh"
+    pub goinkyo_permission_mode: Option<String>, // --permission-mode for an auto-spawned Goinkyo; "" = no flag; built-in "auto"
+    pub goinkyo_disallowed_tools: Option<String>, // --disallowedTools for an auto-spawned Goinkyo; "" = no flag; built-in "Edit,Write,NotebookEdit"
+}
+
+pub struct CodexBrigadeConfig {     // [brigade.codex]; every field Option<String>
+    pub worker_model: Option<String>,       // -m for a NEW Codex Worker only, a slug or a family word; "" = no flag; built-in "terra"
+    pub worker_effort: Option<String>,      // -c model_reasoning_effort for a NEW Codex Worker only; "" = no flag; built-in "high"
+    pub goinkyo_model: Option<String>,      // -m for a NEW Codex Goinkyo only, a slug or a family word; "" = no flag; built-in "" (no legacy key)
+    pub goinkyo_effort: Option<String>,     // -c model_reasoning_effort for a NEW Codex Goinkyo only; "" = no flag; built-in "" (no legacy key)
 }
 ```
+
+The two tables and the legacy keys they replaced are described in "Decision
+(2026-11-23): per-product settings live in product tables". Below, a setting is
+named by its key alone, as the paragraphs were written; `[brigade.claude]` and
+`[brigade.codex]` (and the comments in the listing above) say which table holds it.
+Wherever one is read, the table's value, then the legacy key's, then the built-in
+applies.
 
 `worker_agent` decides which product a brigade's Workers run as, independent of the
 Director's own product: `Inherit` (default) matches the Director's; `Claude`/`Codex`
 fix it regardless; `Select` defers the choice to formation gate 2 above. The model
-and effort settings come in pairs per product, `worker_model`/`worker_effort` for
-Claude and `worker_model_codex`/`worker_effort_codex` for Codex, independent of each
-other, since the two products don't share a model namespace or an effort vocabulary:
-one shared field could never default sensibly for both at once. A key absent from
+and effort settings come in pairs per product, `worker_model`/`worker_effort` under
+`[brigade.claude]` and under `[brigade.codex]`, independent of each other, since the
+two products don't share a model namespace or an effort vocabulary: one shared field
+could never default sensibly for both at once. A key absent from
 the file is banto's built-in for that key alone (the built-ins name no version:
 `sonnet`/`high`, `terra`/`high`, and the Goinkyo's `opus`/`xhigh`); every model and
 effort value is trimmed (`config::flag_value`, the one rule for the file, the
@@ -3020,9 +3237,10 @@ value in the message is escaped and cut to 40 characters. A
 Director and a Goinkyo never get it, whichever agent they run, so their compaction
 stays whatever that agent's own settings say.
 
-**Model and effort: only when a session is created.** `worker_model`,
-`worker_effort`, `worker_model_codex`, `worker_effort_codex`, `goinkyo_model` and
-`goinkyo_effort` apply when a member's session is created, and never when one is
+**Model and effort: only when a session is created.** `worker_model` and
+`worker_effort` and `goinkyo_model` and `goinkyo_effort` (each under
+`[brigade.claude]` and under `[brigade.codex]`) apply when a member's
+session is created, and never when one is
 reopened (decision 2026-11-14 above). In the code `launch::SessionStart` is either
 `Resume(id)`, which has no field for either, or `Create { model, effort }`; the
 emporium's `build_open_launch` drops them for a resume whatever its caller hands it.
@@ -3038,10 +3256,10 @@ and not checked (Codex knows its levels), among the `-c` overrides, ahead of the
 brigade's own. An empty or whitespace-only value passes nothing; any other is
 trimmed and passed as it is.
 
-**A Codex model as a family word.** `worker_model_codex` (and the picker's Model
-field) is a slug or a family word, and a word has to meet the installed Codex's
+**A Codex model as a family word.** `worker_model` and `goinkyo_model` under
+`[brigade.codex]` (and the picker's Model field) are a slug or a family word, and a word has to meet the installed Codex's
 catalog before it can be passed, because Codex has no alias for `-m`. The core holds
-the Worker's `Cmd::OpenEmbedded`, asks the shell for the catalog
+the Worker's (or a Goinkyo's) `Cmd::OpenEmbedded`, asks the shell for the catalog
 (`Cmd::ReadCodexCatalog { round }`: `codex debug models --bundled`, run through the
 `[agent_binaries]` entry or `codex` on the path, standard input closed, standard
 error dropped, at most 5 s and 8 MiB of output, on the event loop's thread, so the
@@ -3078,6 +3296,21 @@ a fresh creation is held, and the held creation is then dropped at its answer. *
 looked pane-less to a check made under the placeholder key and would have been
 created a second time; then, a held creation was released beside a resume whose pane
 had not arrived yet.
+
+A Goinkyo's creation is held the same way and is the one member whose token and
+placeholder key every consultation reuses (`new-worker::<id>::goinkyo`). Two things
+keep a dismissed consultation from opening the next one's Goinkyo twice or
+untracked. The tick that sees the row gone (`NoGoinkyo`) drops that member's held
+creation and releases the one-shot guard on the placeholder key
+(`forget_unopened_worker`), so the next consultation asks for its own round; and a
+release lets only the last held creation of a member through, because
+`creation_still_wanted` does not count a creation's own key and could not tell two
+apart. A dismissal and a new consultation inside one tick are not seen as an end:
+the new row simply has no session yet, so the creation already held is the one that
+opens. *Why (found by a test written first):* with the drop removed,
+a consultation dismissed and asked again while the read was out opened the first
+consultation's command and left the pane out of `goinkyo_pane`, so a later dismissal
+could not close it.
 
 A held creation is carried out only if it is still wanted when its round's answer
 arrives (`creation_still_wanted`): the brigade exists and is not being disbanded or
@@ -3124,6 +3357,8 @@ what happened:
 
 Several Workers created together with different words are each resolved and each
 said, joined with `; `. The picker's Codex model is shown as typed in all of this.
+The status line begins `codex worker:` for a Goinkyo's resolution too: the one
+`codex_model::resolve` writes it, and it has no role to name.
 The effort has no resolution step: whatever the fields or the config hold goes into
 the `-c` as it is.
 
@@ -3537,8 +3772,8 @@ A string the key does not take is the same as a value of the wrong type (decisio
 and column `toml` reports, with `` `worker_agent` does not take "typo"; it takes
 "inherit", "claude", "codex" or "select" `` under it. Every setting that reads one
 of a fixed set of words is held to it when the file is read: `relay` (`auto` or
-`manual`), `worker_agent`, `goinkyo_consult`, `worker_autocompact`, `agents` and
-`[keys] prefix`, each trimmed and case-insensitive, and with `""` valid only where
+`manual`), `worker_agent`, `goinkyo_agent`, `goinkyo_consult`, `worker_autocompact`,
+`agents` and `[keys] prefix`, each trimmed and case-insensitive, and with `""` valid only where
 it is documented as an escape (`goinkyo_consult`, `worker_autocompact`, `agents`).
 Free text that goes to an agent (the model, effort and permission-mode settings,
 the prompts) has no fixed set and is not checked: the agent says what it thinks of

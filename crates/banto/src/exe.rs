@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 use banto_io::file_identity::{FileIdentity, file_identity};
 
+use crate::launch;
+
 /// What a refused open says. One line, the status channel's.
 pub const REPLACED: &str = "banto was replaced on disk; restart banto";
 
@@ -67,6 +69,15 @@ impl BantoExe {
             BantoExe::Known { path, .. } => Some(path),
             BantoExe::Unknown(_) => None,
         }
+    }
+
+    /// Whether the Codex hook command could carry the executable's path (no space
+    /// in it), by the path resolved at start. An unknowable path counts as
+    /// launchable: blaming a space nothing has established is there would be worse
+    /// than leaving the trust question to speak for itself.
+    pub fn hook_launchable(&self) -> bool {
+        self.path()
+            .is_none_or(|exe| launch::hook_command_is_launchable(&launch::forward_slash_path(exe)))
     }
 
     /// What the operator is told at start when a replacement of the executable

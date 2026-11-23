@@ -316,6 +316,11 @@ fn main() -> Result<()> {
                 claude_home,
                 codex_home,
                 goinkyo_dir,
+                mcp::GoinkyoPolicy {
+                    setting: config.brigade.goinkyo_agent,
+                    enabled: resolved_agents.enabled.clone(),
+                    hook_launchable: exe::BantoExe::resolve().hook_launchable(),
+                },
                 message_log,
             )
         }
@@ -355,10 +360,12 @@ fn main() -> Result<()> {
                     resolved_agents: &resolved_agents,
                     child: &resolved,
                     exe: &banto_exe,
-                    database_notices: startup::split_database_notice(&inputs, &config, &resolved)
-                        .into_iter()
-                        .chain(instance_notice)
-                        .collect(),
+                    boot_notices: startup::boot_notices(
+                        &inputs,
+                        &config,
+                        &resolved,
+                        instance_notice,
+                    ),
                 },
             )
         }

@@ -912,6 +912,8 @@ fn a_goinkyo_is_not_spawned_for_a_closing_brigade_and_stays_a_member() {
         brigade_id: 1,
         cwd: PathBuf::from("/work/alpha"),
         roster: Vec::new(),
+        agent: None,
+        director_agent: None,
     };
     let awaiting = || Event::GoinkyoAwaitingSpawn {
         observation: GoinkyoObservation::AwaitingSpawn(candidate()),

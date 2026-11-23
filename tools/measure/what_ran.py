@@ -36,6 +36,10 @@ _MIN_TS = datetime.min.replace(tzinfo=timezone.utc)
 # the built-in until then, so with no config.toml those sessions read as a difference.
 BUILT_IN = {"worker": ("sonnet", "high"), "goinkyo": ("opus", "xhigh")}
 CONFIG_KEYS = {"worker": ("worker_model", "worker_effort"), "goinkyo": ("goinkyo_model", "goinkyo_effort")}
+# These four live in `[brigade.claude]` (a decision of 2026-11-23, docs/REQUIREMENTS.md); the flat
+# `[brigade]` spelling is still read by banto, with the table winning, and so is it here. A Codex
+# Worker's `[brigade.codex]` keys are not read: the ledger's roles are Claude sessions.
+CLAUDE_TABLE = "brigade.claude"
 
 
 def build_parser():
@@ -102,15 +106,16 @@ def _toml_value(raw):
     return raw.split("#", 1)[0].strip()
 
 
-def parse_brigade_table(text):
-    """{key: text} of the `[brigade]` table of a config.toml. Only top-level scalars of that one
-    table; python 3.9 has no TOML reader and this reads four keys."""
+def parse_table(text, name):
+    """{key: text} of the table `name` ("brigade", "brigade.claude") of a config.toml. Only the
+    scalars written directly under that one header; python 3.9 has no TOML reader and this reads
+    four keys."""
     found, inside = {}, False
     for line in text.splitlines():
         s = line.strip()
         if s.startswith("["):
-            # TOML allows blanks inside the brackets: "[ brigade ]" is the same table.
-            inside = re.sub(r"\s+", "", s.split("#", 1)[0]) == "[brigade]"
+            # TOML allows blanks inside the brackets: "[ brigade . claude ]" is the same table.
+            inside = re.sub(r"\s+", "", s.split("#", 1)[0]) == "[" + name + "]"
             continue
         if not inside or not s or s.startswith("#"):
             continue
@@ -118,6 +123,12 @@ def parse_brigade_table(text):
         if m:
             found[m.group(1)] = _toml_value(m.group(2))
     return found
+
+
+def parse_brigade_table(text):
+    """{key: text} of the `[brigade]` table alone: the legacy flat spellings of what is now in
+    `[brigade.claude]`."""
+    return parse_table(text, "brigade")
 
 
 def load_expected(config_path=None, env=None, home=None, platform=None):
@@ -145,11 +156,12 @@ def load_expected(config_path=None, env=None, home=None, platform=None):
         path = next((c for c in config_candidates(env, home, platform) if os.path.isfile(c)), None)
         if path is None:
             note = "no config.toml found; built-in defaults used"
-    table = {}
+    legacy, table = {}, {}
     if path:
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                table = parse_brigade_table(fh.read())
+                text = fh.read()
+            legacy, table = parse_brigade_table(text), parse_table(text, CLAUDE_TABLE)
             stamp = datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc)
             note = (f"config {path} (modified {tr.iso(stamp)}); its value is what it says NOW, not what it said "
                     "when each session was created")
@@ -159,10 +171,11 @@ def load_expected(config_path=None, env=None, home=None, platform=None):
     expected = {}
     for role, (mkey, ekey) in CONFIG_KEYS.items():
         model, effort = BUILT_IN[role]
-        if path and mkey in table:
-            model = table[mkey]
-        if path and ekey in table:
-            effort = table[ekey]
+        # The table's value, else the legacy flat key's, else the built-in, one key at a time, as
+        # banto resolves it; an empty string is a value (no flag), so it beats a legacy key too.
+        if path:
+            model = table.get(mkey, legacy.get(mkey, model))
+            effort = table.get(ekey, legacy.get(ekey, effort))
         expected[role] = (model.strip() or None, effort.strip() or None)
     return expected, note
 

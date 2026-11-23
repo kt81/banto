@@ -45,8 +45,19 @@ conversation text; still real session metadata, so keep them out of any reposito
 - **Section 4, configured versus observed.** Per session and UTC day, with the first and
   last call time: what it ran, and whether that differs from what was expected. The
   expectation comes, in this order, from `--expect ROLE=MODEL[/EFFORT]` (repeatable); the
-  `worker_model`, `worker_effort`, `goinkyo_model` and `goinkyo_effort` keys in the
-  `[brigade]` table of banto's `config.toml`. An explicit file (`--config FILE`, else
+  `worker_model`, `worker_effort`, `goinkyo_model` and `goinkyo_effort` keys of the
+  `[brigade.claude]` table of banto's `config.toml`, else the same keys flat in `[brigade]`
+  (the older spelling banto still reads; the table wins, one key at a time). A
+  Codex Worker's or Goinkyo's `[brigade.codex]` keys are not read. From 2026-11-23 a
+  Codex Director's consultations run on a Codex Goinkyo by default, which `what_ran.py`
+  does not read, so the Goinkyo share it reports drops from that date for Codex
+  Directors. The reader is a line
+  scanner, not a TOML parser: it sees `key = value` lines under a plain `[brigade]` or
+  `[brigade.claude]` header, and does not apply dotted keys (`claude.worker_model = ...`),
+  inline tables (`claude = { worker_model = ... }`) or quoted table headers
+  (`[brigade."claude"]`), which banto reads (a dotted key comes back under its dotted
+  name, which nothing looks up). A file written that way reads as if the keys were
+  absent, so section 4 expects the built-ins. An explicit file (`--config FILE`, else
   `$BANTO_CONFIG`, even when empty) is used as it is: when it is missing, section 4 says
   so and the built-in defaults are used, as banto's strict startup would refuse to run
   and not read another file. Without one, the first of `$XDG_CONFIG_HOME/banto/` and

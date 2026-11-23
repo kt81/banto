@@ -252,6 +252,7 @@ impl Resolved {
 pub const ENV_PARENT_CONFIG: &str = "BANTO_PARENT_CONFIG";
 pub const ENV_PARENT_NO_CONFIG: &str = "BANTO_PARENT_NO_CONFIG";
 pub const ENV_PARENT_DB: &str = "BANTO_PARENT_DB";
+pub const ENV_PARENT_DATA_DIR: &str = "BANTO_PARENT_DATA_DIR";
 
 impl Resolved {
     /// The command-line flags that make a `banto` child resolve what this
@@ -289,11 +290,15 @@ impl Resolved {
     /// The same facts as environment variables, for the `_hook` process: its
     /// command line is hashed by Codex to decide whether to trust it, so it
     /// cannot carry them (and cannot be quoted, so a path in it would break on a
-    /// space), but it inherits the environment of the agent that runs it. Only
-    /// the config file and the database: the hook resolves no agent home and
-    /// looks in nothing in the data directory (it opens the database, which has
-    /// its own variable), so neither is handed to it. The one other file it
-    /// reads, the session's rollout, is named by Codex on the hook's stdin.
+    /// space), but it inherits the environment of the agent that runs it. The
+    /// config file, the database and the data directory: the hook resolves no
+    /// agent home, and the data directory is only for the one file it reads from
+    /// there, a Goinkyo's consultation request. The session's rollout, the other
+    /// file it reads, is named by Codex on the hook's stdin.
+    ///
+    /// These reach the environment of every brigade member's pane, Claude ones
+    /// included (`embedded::brigade_env` sets them for any member), and only `_hook`
+    /// reads them.
     pub fn child_env(&self) -> Vec<(String, String)> {
         let mut env = Vec::new();
         match &self.config_file {
@@ -304,6 +309,9 @@ impl Resolved {
         }
         if let Some(db) = &self.db_path {
             env.push((ENV_PARENT_DB.to_string(), db.display().to_string()));
+        }
+        if let Some(dir) = &self.data_dir {
+            env.push((ENV_PARENT_DATA_DIR.to_string(), dir.display().to_string()));
         }
         env
     }
@@ -320,7 +328,8 @@ impl Inputs {
     /// [`Resolved::child_env`]) from `get`. Variables that are absent or empty
     /// change nothing, so a hook started without them resolves for itself. If
     /// both `BANTO_PARENT_CONFIG` and `BANTO_PARENT_NO_CONFIG` are set, "no
-    /// config" wins (banto never sets both).
+    /// config" wins (banto never sets both). The data directory is read as the
+    /// `--data-dir` flag a handed-over process takes (`data_dir_source`).
     pub fn apply_parent_env(&mut self, get: impl Fn(&str) -> Option<String>) {
         let value = |key: &str| get(key).filter(|value| !value.is_empty());
         if value(ENV_PARENT_NO_CONFIG).is_some() {
@@ -331,6 +340,9 @@ impl Inputs {
         }
         if let Some(path) = value(ENV_PARENT_DB) {
             self.cli_db_path = Some(PathBuf::from(path));
+        }
+        if let Some(path) = value(ENV_PARENT_DATA_DIR) {
+            self.cli_data_dir = Some(PathBuf::from(path));
         }
     }
 }
@@ -411,8 +423,9 @@ pub fn resolve(inputs: &Inputs, strictness: Strictness) -> Result<(Config, Resol
                 .flatten()
         });
     // The hook must never fail the operator's own agent over banto's
-    // configuration, and reads no data directory: where this one is refused it
-    // goes without.
+    // configuration, and reads the data directory only to name a Goinkyo's
+    // consultation request: where this one is refused it goes without, and the
+    // briefing then has no request path.
     let data_dir = match checked_data_dir(
         inputs,
         &config,
@@ -567,6 +580,25 @@ pub fn split_database_notice(
          MCP, request and log files stay in the data directory"
             .to_string()
     })
+}
+
+/// What startup has to say to the operator before the first frame, in the order
+/// the status line carries it: the database that is not where the data directory
+/// is ([`split_database_notice`]), then `instance_notice` (`single_instance`'s,
+/// about the check for another banto on the database), then the config's legacy
+/// `[brigade]` keys. Pulled out of `main` so that a notice dropped from the line
+/// is a failing test.
+pub fn boot_notices(
+    inputs: &Inputs,
+    config: &Config,
+    resolved: &Resolved,
+    instance_notice: Option<String>,
+) -> Vec<String> {
+    split_database_notice(inputs, config, resolved)
+        .into_iter()
+        .chain(instance_notice)
+        .chain(config.brigade.legacy_key_notice())
+        .collect()
 }
 
 /// The agent home that `path` is, or lies inside, with its name for an error.

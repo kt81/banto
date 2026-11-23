@@ -127,6 +127,13 @@ worker_model = "elsewhere"
         got = what_ran.parse_brigade_table('[ brigade ]\nworker_model = "opus"\n[ brigade.extra ]\nworker_model = "haiku"\n')
         self.assertEqual(got, {"worker_model": "opus"})
 
+    def test_a_product_table_is_read_by_its_own_name(self):
+        text = ('[brigade]\nworker_model = "flat"\n[ brigade . claude ]\nworker_model = "haiku"  # c\n'
+                'goinkyo_effort = \'low\'\n[brigade.codex]\nworker_model = "terra"\n')
+        self.assertEqual(what_ran.parse_table(text, "brigade.claude"), {"worker_model": "haiku", "goinkyo_effort": "low"})
+        self.assertEqual(what_ran.parse_table(text, "brigade.codex"), {"worker_model": "terra"})
+        self.assertEqual(what_ran.parse_brigade_table(text), {"worker_model": "flat"})
+
     def write(self, text):
         d = tempfile.mkdtemp(prefix="measure-cfg-")
         self.addCleanup(synth.rmtree, d)
@@ -152,6 +159,21 @@ worker_model = "elsewhere"
     def test_a_key_the_file_leaves_out_keeps_its_default(self):
         expected, _ = what_ran.load_expected(self.write("[brigade]\nworker_model = \"opus\"\n"))
         self.assertEqual(expected["worker"], ("opus", "high"))
+
+    def test_the_claude_table_is_read_and_beats_the_legacy_key_one_key_at_a_time(self):
+        table_only = '[brigade.claude]\nworker_model = "haiku"\nworker_effort = "low"\ngoinkyo_model = ""\n'
+        expected, _ = what_ran.load_expected(self.write(table_only))
+        self.assertEqual(expected["worker"], ("haiku", "low"))
+        self.assertEqual(expected["goinkyo"], (None, "xhigh"))
+        both = ('[brigade]\nworker_model = "flat"\nworker_effort = "medium"\ngoinkyo_effort = "max"\n'
+                '[brigade.claude]\nworker_model = "haiku"\ngoinkyo_model = ""\n')
+        expected, _ = what_ran.load_expected(self.write(both))
+        self.assertEqual(expected["worker"], ("haiku", "medium"))      # table model, legacy effort
+        self.assertEqual(expected["goinkyo"], (None, "max"))           # "" in the table is a value
+        # A Codex table, or a product banto has not heard of, changes nothing here.
+        other = '[brigade.codex]\nworker_model = "terra"\n[brigade.antigravity]\nworker_model = "x"\n'
+        expected, _ = what_ran.load_expected(self.write(other))
+        self.assertEqual(expected, {"worker": ("sonnet", "high"), "goinkyo": ("opus", "xhigh")})
 
     def test_the_search_order_follows_banto(self):
         """banto: $XDG_CONFIG_HOME, ~/.config, then the platform directory (%APPDATA% on Windows,

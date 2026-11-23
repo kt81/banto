@@ -634,6 +634,53 @@ fn on_windows_a_share_is_the_same_share_verbatim_or_not() {
 
 // --- telling the operator the database lives elsewhere ---------------------------
 
+#[test]
+fn boot_notices_carry_the_database_then_the_instance_then_the_legacy_keys() {
+    let m = Machine::new();
+    m.write(
+        "cwd/all.toml",
+        "data_dir = \"data\"\ndb_path = \"elsewhere/banto.db\"\n\
+         [brigade]\nworker_model_codex = \"terra\"\n",
+    );
+    m.write(
+        "cwd/legacy-only.toml",
+        "[brigade]\nworker_effort = \"low\"\n",
+    );
+    m.write(
+        "cwd/new-spelling.toml",
+        "[brigade.claude]\nworker_effort = \"low\"\n",
+    );
+    let notices = |file: &str, instance: Option<&str>| {
+        let mut inputs = m.inputs();
+        inputs.cli_config = Some(PathBuf::from(file));
+        let (config, r) = resolve(&inputs, Strictness::Strict).unwrap();
+        boot_notices(&inputs, &config, &r, instance.map(str::to_string))
+    };
+
+    let all = notices("all.toml", Some("instance"));
+    assert_eq!(all.len(), 3, "{all:?}");
+    assert!(
+        all[0].starts_with("data_dir: the database is not in it"),
+        "{all:?}"
+    );
+    assert_eq!(all[1], "instance");
+    assert_eq!(
+        all[2],
+        "config: legacy [brigade] keys (worker_model_codex) moved to \
+         [brigade.claude]/[brigade.codex]; see README"
+    );
+
+    let legacy_only = notices("legacy-only.toml", None);
+    assert_eq!(legacy_only.len(), 1, "{legacy_only:?}");
+    assert!(
+        legacy_only[0].contains("(worker_effort)"),
+        "{legacy_only:?}"
+    );
+
+    // The new spelling says nothing.
+    assert!(notices("new-spelling.toml", None).is_empty());
+}
+
 fn notice_for(inputs: &Inputs) -> Option<String> {
     let (config, r) = resolve(inputs, Strictness::Strict).unwrap();
     split_database_notice(inputs, &config, &r)
@@ -714,11 +761,13 @@ fn a_child_is_handed_the_directory_the_parent_chose_by_whatever_means() {
         args[at + 1],
         m.path("cwd").join("chosen").display().to_string()
     );
-    // The hook is handed none, as before: its variables name the config and the
-    // database, never the directory.
+    // The hook is handed it too, through the environment: it reads a Goinkyo's
+    // consultation request from there.
     let dir = m.path("cwd").join("chosen").display().to_string();
     assert!(
-        parent.child_env().iter().all(|(_, value)| *value != dir),
+        parent
+            .child_env()
+            .contains(&(ENV_PARENT_DATA_DIR.to_string(), dir)),
         "{:?}",
         parent.child_env()
     );

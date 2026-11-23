@@ -769,8 +769,8 @@ impl WorkerAgentPickerState {
     }
 
     /// The model confirming would create the Workers with (empty means "pass
-    /// no model flag at all", the same escape hatch `worker_model`/
-    /// `worker_model_codex` already have in config.toml).
+    /// no model flag at all", the same escape hatch `worker_model` has under
+    /// `[brigade.claude]` and `[brigade.codex]` in config.toml).
     pub fn model_input(&self) -> &str {
         &self.model_input
     }

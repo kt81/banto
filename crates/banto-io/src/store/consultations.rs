@@ -60,6 +60,18 @@ impl Store {
         brigade_id: BrigadeId,
         title: &str,
     ) -> Result<(), StoreError> {
+        self.add_goinkyo_member_with_agent(brigade_id, title, Some(AgentKind::ClaudeCode))
+    }
+
+    /// [`Self::add_goinkyo_member`] recording the product the Goinkyo will run as,
+    /// which is what the emporium spawns it as. `None` leaves the row without a
+    /// product, for the emporium to resolve from the setting and its Director.
+    pub fn add_goinkyo_member_with_agent(
+        &mut self,
+        brigade_id: BrigadeId,
+        title: &str,
+        agent: Option<AgentKind>,
+    ) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
         insert_member(
             &tx,
@@ -67,7 +79,7 @@ impl Store {
             GOINKYO_TOKEN,
             BrigadeRole::Goinkyo,
             None,
-            Some(AgentKind::ClaudeCode),
+            agent,
         )?;
         tx.execute(
             "UPDATE brigade_members SET consult_title = ?3

@@ -459,6 +459,21 @@ const NOTIFICATION_OVERRIDES: [&str; 3] = [
     NOTIFICATION_CONDITION_OVERRIDE,
 ];
 
+/// The policy a Codex Goinkyo is launched under, as Codex's own first-class
+/// flags: `--sandbox read-only --ask-for-approval never`. A Goinkyo is an
+/// unattended advisor, so it must neither write nor stop at an approval nobody
+/// answers. Passed on a resume as on a creation, because banto does not count on
+/// a resumed session remembering a launch flag (the rule [`AgentLaunch::Claude`]'s
+/// `permission_mode` and `disallowed_tools` follow).
+///
+/// Measured on codex-cli 0.171.0 (Windows, four runs): reads, `git log` and
+/// `git status`, and banto's three MCP tools all worked under these with no
+/// prompt, which holds only because every Codex member's launch also carries
+/// `mcp_servers.banto.default_tools_approval_mode="approve"` ([`CodexBrigade`]).
+/// That a write is blocked is not measured. The cost is that a Codex Goinkyo
+/// cannot build or run tests, and its shell has no network.
+const GOINKYO_CODEX_POLICY: [&str; 4] = ["-s", "read-only", "-a", "never"];
+
 impl AgentLaunch {
     /// [`Self::argv_with_snapshot_off`] with the flag left off, the common case
     /// in the tests. A real launch always has a say in
@@ -480,7 +495,11 @@ impl AgentLaunch {
     /// [`NOTIFICATION_OVERRIDES`]), then `-c model_reasoning_effort` (a new
     /// session with an effort), then `-c model_auto_compact_token_limit` (a
     /// Worker's, create or resume), then brigade `-c` overrides (if any — see
-    /// [`CodexBrigade::overrides`]), then `-C <cwd>` last, always present.
+    /// [`CodexBrigade::overrides`]), then a Goinkyo's `-s read-only -a never`
+    /// ([`GOINKYO_CODEX_POLICY`], create or resume), then `-C <cwd>` last, always
+    /// present. After the session id and among the options on a resume as well:
+    /// `codex resume --help` lists both flags, and the `-c`/`-C` options banto
+    /// already places after the id parse there.
     ///
     /// With `snapshot_off` set and a Claude launch carrying a briefing, also
     /// `--system-prompt-snapshot off`: Claude then renders the system prompt
@@ -581,6 +600,9 @@ impl AgentLaunch {
                     for value in brigade.overrides() {
                         argv.push("-c".to_string());
                         argv.push(value);
+                    }
+                    if brigade.role == BrigadeRole::Goinkyo {
+                        argv.extend(GOINKYO_CODEX_POLICY.map(str::to_string));
                     }
                 }
                 argv.push("-C".to_string());
@@ -1393,6 +1415,117 @@ mod tests {
             ]
             .map(str::to_string)
         );
+    }
+
+    #[test]
+    fn a_codex_goinkyo_launch_carries_the_hook_the_mcp_server_and_its_approval_bypass() {
+        // Under `approval_policy = "never"` an MCP tool that needs approval is
+        // denied rather than asked about, and nobody is at a Goinkyo's keyboard
+        // to approve one: the override has to ride on this role's launch too.
+        let launch = AgentLaunch::Codex {
+            start: SessionStart::Create {
+                model: None,
+                effort: None,
+            },
+            cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
+            brigade: Some(CodexBrigade {
+                exe: PathBuf::from("/opt/banto/banto"),
+                brigade_id: 1,
+                token: "goinkyo".to_string(),
+                role: BrigadeRole::Goinkyo,
+                session: None,
+                child_args: Vec::new(),
+            }),
+        };
+        let argv = launch.argv("codex");
+        for expected in [
+            "mcp_servers.banto.default_tools_approval_mode=\"approve\"",
+            "mcp_servers.banto.args=[\"_mcp\",\"--brigade\",\"1\",\"--member\",\"goinkyo\",\"--role\",\"goinkyo\"]",
+            "hooks.SessionStart=[{matcher=\"\",hooks=[{type=\"command\",timeout_sec=600,command=\"/opt/banto/banto _hook\"}]}]",
+        ] {
+            assert!(
+                argv.contains(&expected.to_string()),
+                "{expected} in {argv:?}"
+            );
+        }
+        assert_eq!(&argv[argv.len() - 2..], ["-C", "/work/alpha"]);
+    }
+
+    fn codex_member_launch(start: SessionStart, role: BrigadeRole) -> AgentLaunch {
+        AgentLaunch::Codex {
+            start,
+            cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
+            brigade: Some(CodexBrigade {
+                exe: PathBuf::from("/opt/banto/banto"),
+                brigade_id: 1,
+                token: "member".to_string(),
+                role,
+                session: None,
+                child_args: Vec::new(),
+            }),
+        }
+    }
+
+    fn create() -> SessionStart {
+        SessionStart::Create {
+            model: None,
+            effort: None,
+        }
+    }
+
+    /// Whether `argv` carries `-s read-only` and `-a never` as adjacent pairs.
+    fn read_only_and_never(argv: &[String]) -> (bool, bool) {
+        let has = |flag: &str, value: &str| {
+            argv.windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value)
+        };
+        (has("-s", "read-only"), has("-a", "never"))
+    }
+
+    #[test]
+    fn a_fresh_codex_goinkyo_is_launched_read_only_with_no_approval_prompts() {
+        let argv = codex_member_launch(create(), BrigadeRole::Goinkyo).argv("codex");
+        assert_eq!(read_only_and_never(&argv), (true, true), "{argv:?}");
+        assert_eq!(&argv[argv.len() - 2..], ["-C", "/work/alpha"]);
+    }
+
+    #[test]
+    fn a_resumed_codex_goinkyo_is_launched_read_only_with_no_approval_prompts_too() {
+        let argv = codex_member_launch(
+            SessionStart::Resume("codex-uuid-1".to_string()),
+            BrigadeRole::Goinkyo,
+        )
+        .argv("codex");
+        assert_eq!(&argv[..3], ["codex", "resume", "codex-uuid-1"]);
+        assert_eq!(read_only_and_never(&argv), (true, true), "{argv:?}");
+        assert_eq!(&argv[argv.len() - 2..], ["-C", "/work/alpha"]);
+    }
+
+    #[test]
+    fn a_codex_worker_or_director_carries_neither_sandbox_nor_approval_flags() {
+        for role in [BrigadeRole::Worker, BrigadeRole::Director] {
+            for start in [create(), SessionStart::Resume("codex-uuid-1".to_string())] {
+                let argv = codex_member_launch(start, role).argv("codex");
+                assert!(
+                    !argv.iter().any(|arg| matches!(
+                        arg.as_str(),
+                        "-s" | "--sandbox" | "-a" | "--ask-for-approval"
+                    )),
+                    "{role:?}: {argv:?}"
+                );
+            }
+        }
+        // Nor a plain, brigade-less launch.
+        let plain = AgentLaunch::Codex {
+            start: create(),
+            cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
+            brigade: None,
+        }
+        .argv("codex");
+        assert_eq!(read_only_and_never(&plain), (false, false));
     }
 
     #[test]
