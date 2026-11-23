@@ -178,7 +178,9 @@ impl CodexLogScan {
         self.started.is_some()
     }
 
-    /// Return an identity only after all rows through this poll's high-water mark are read.
+    /// Return an identity only after all rows through this poll's high-water mark
+    /// are read, and only when exactly one of the pid's logged threads is among
+    /// `candidates` (the caller's `threads` rows for this pane).
     pub fn poll(
         &mut self,
         home: &CodexHome,
@@ -248,19 +250,23 @@ impl CodexLogScan {
         if self.cursor < high {
             return None;
         }
-        let threads = open_read_only(&home.threads_db_path()).ok();
-        let mut eligible = self.associations.iter().filter(|id| {
-            !threads.as_ref().is_some_and(|conn| {
-                conn.query_row(
-                    "SELECT source FROM threads WHERE id = ?1",
-                    [id.as_str()],
-                    |row| Ok(crate::provider::codex::is_subagent_source(row.get_ref(0)?)),
-                )
-                .unwrap_or(false)
-            })
-        });
+        // Only an id the caller holds a `threads` row for can be the pane's
+        // thread. Codex logs other ids from the same pid that never get a row:
+        // its TUI starts an ephemeral thread to title the conversation after the
+        // first message (seen on codex-cli 0.171.0), and counting those made
+        // every operator-started pane ambiguous for good. Brigade panes escaped
+        // because their title thread fails to start. The candidates already
+        // exclude sub-agent threads (`find_new_sessions_in`), so that test is
+        // not repeated here. A real thread's row exists only once its first
+        // message is persisted, which comes before the title thread's first log
+        // row, so until then nothing resolves and afterwards the real id is the
+        // one candidate.
+        let mut eligible = self
+            .associations
+            .iter()
+            .filter(|id| candidates.contains(id));
         let id = eligible.next()?;
-        (eligible.next().is_none() && candidates.contains(id)).then(|| id.clone())
+        eligible.next().is_none().then(|| id.clone())
     }
 }
 
@@ -524,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_rejects_an_unindexed_second_thread_for_the_same_pid() {
+    fn identity_ignores_a_logged_thread_that_is_not_a_candidate() {
         let dir = TempDir::new().unwrap();
         let home = codex_home(&dir);
         write_log_row(&home, 500, "old", Some("pid:100:old"));
@@ -533,15 +539,91 @@ mod tests {
         write_log_row(&home, 1_000, "unindexed", Some("pid:100:abc"));
         let starts = MockStartTime(HashMap::from([(100, 900)]));
         assert!(scan.bind_pid(100, &starts));
-        assert_eq!(scan.poll(&home, &["own".into()], 100, 950, &starts), None);
+        assert_eq!(
+            scan.poll(&home, &["own".into()], 100, 950, &starts),
+            Some("own".into())
+        );
     }
 
     #[test]
-    fn recognized_subagent_does_not_make_the_root_ambiguous() {
+    fn two_candidate_threads_from_one_pid_stay_unresolved() {
         let dir = TempDir::new().unwrap();
         let home = codex_home(&dir);
         let db = Connection::open(home.threads_db_path()).unwrap();
-        db.execute_batch("CREATE TABLE threads (id TEXT, source TEXT); INSERT INTO threads VALUES ('own', 'cli'), ('guardian', '{\"subagent\":{}}');").unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads (id TEXT, source TEXT, cwd TEXT);              INSERT INTO threads VALUES ('first', 'cli', '/work/project'),              ('second', 'cli', '/work/project');",
+        )
+        .unwrap();
+        write_log_row(&home, 500, "old", Some("pid:100:old"));
+        let mut scan = CodexLogScan::open(&home).unwrap();
+        // A `/new` inside the pane: the pid has written two real threads.
+        write_log_row(&home, 1_000, "first", Some("pid:100:abc"));
+        write_log_row(&home, 1_100, "second", Some("pid:100:abc"));
+        let starts = MockStartTime(HashMap::from([(100, 900)]));
+        assert!(scan.bind_pid(100, &starts));
+        let ids = vec!["first".into(), "second".into()];
+        assert_eq!(scan.poll(&home, &ids, 100, 950, &starts), None);
+    }
+
+    #[test]
+    fn the_real_thread_resolves_once_its_row_exists_whatever_logs_beside_it() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let db = Connection::open(home.threads_db_path()).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT, source TEXT, cwd TEXT);")
+            .unwrap();
+        write_log_row(&home, 500, "old", Some("pid:100:old"));
+        let mut scan = CodexLogScan::open(&home).unwrap();
+        let starts = MockStartTime(HashMap::from([(100, 900)]));
+        assert!(scan.bind_pid(100, &starts));
+        // The real thread logs from TUI start, before it has a row: nothing to
+        // resolve yet.
+        write_log_row(&home, 1_000, "real", Some("pid:100:abc"));
+        assert_eq!(scan.poll(&home, &[], 100, 950, &starts), None);
+        // The first message persists the row, then the title thread logs.
+        db.execute(
+            "INSERT INTO threads VALUES ('real', 'cli', '/work/project')",
+            [],
+        )
+        .unwrap();
+        write_log_row(&home, 1_001, "title", Some("pid:100:abc"));
+        assert_eq!(
+            scan.poll(&home, &["real".into()], 100, 950, &starts),
+            Some("real".into())
+        );
+    }
+
+    /// The sub-agent thread Codex starts beside a launch is kept out by the
+    /// candidates, which `poll` takes as given: built here the way the shell
+    /// builds them, from the provider.
+    #[test]
+    fn recognized_subagent_does_not_make_the_root_ambiguous() {
+        use crate::provider::SessionProvider;
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let db = Connection::open(home.threads_db_path()).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads (id TEXT, source TEXT, cwd TEXT, updated_at_ms INTEGER);",
+        )
+        .unwrap();
+        for (id, source) in [("own", "cli"), ("guardian", "{\"subagent\":{}}")] {
+            db.execute(
+                "INSERT INTO threads VALUES (?1, ?2, ?3, 2000000)",
+                rusqlite::params![id, source, cwd.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+        let candidates: Vec<String> = crate::provider::codex::CodexProvider::new(home.clone())
+            .find_new_sessions_in(
+                &crate::file_identity::DirectorySpellings::of(&cwd),
+                std::time::UNIX_EPOCH,
+            )
+            .into_iter()
+            .map(|id| id.0)
+            .collect();
+        assert_eq!(candidates, ["own"]);
         write_log_row(&home, 500, "old", Some("pid:100:old"));
         let mut scan = CodexLogScan::open(&home).unwrap();
         write_log_row(&home, 1_000, "own", Some("pid:100:abc"));
@@ -549,8 +631,33 @@ mod tests {
         let starts = MockStartTime(HashMap::from([(100, 900)]));
         assert!(scan.bind_pid(100, &starts));
         assert_eq!(
-            scan.poll(&home, &["own".into()], 100, 950, &starts),
+            scan.poll(&home, &candidates, 100, 950, &starts),
             Some("own".into())
+        );
+    }
+
+    /// Codex logs a second thread id from the same pid around the first user
+    /// message (the TUI's title thread, seen live on codex-cli 0.171.0) and
+    /// never gives it a `threads` row. The pane's own thread has one: this is
+    /// the shape that left an operator-started pane unidentified for good.
+    #[test]
+    fn identity_resolves_the_thread_with_a_row_beside_an_auxiliary_one_without() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let db = Connection::open(home.threads_db_path()).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads (id TEXT, source TEXT, cwd TEXT);              INSERT INTO threads VALUES ('real', 'cli', '/work/project');",
+        )
+        .unwrap();
+        write_log_row(&home, 500, "old", Some("pid:100:old"));
+        let mut scan = CodexLogScan::open(&home).unwrap();
+        write_log_row(&home, 1_000, "real", Some("pid:100:abc"));
+        write_log_row(&home, 1_000, "auxiliary", Some("pid:100:abc"));
+        let starts = MockStartTime(HashMap::from([(100, 900)]));
+        assert!(scan.bind_pid(100, &starts));
+        assert_eq!(
+            scan.poll(&home, &["real".into()], 100, 950, &starts),
+            Some("real".into())
         );
     }
 
@@ -577,8 +684,11 @@ mod tests {
         conn.execute_batch("BEGIN; INSERT INTO logs (ts, ts_nanos, level, target, thread_id, process_uuid) VALUES (1000, 0, 'INFO', 'test', 'own', 'pid:100:x'); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 2048) INSERT INTO logs (ts, ts_nanos, level, target, thread_id, process_uuid) SELECT 1000, 0, 'INFO', 'test', 'other', 'pid:101:x' FROM n; INSERT INTO logs (ts, ts_nanos, level, target, thread_id, process_uuid) VALUES (1000, 0, 'INFO', 'test', 'hidden', 'pid:100:x'); COMMIT;").unwrap();
         let starts = MockStartTime(HashMap::from([(100, 900)]));
         assert!(scan.bind_pid(100, &starts));
-        assert_eq!(scan.poll(&home, &["own".into()], 100, 950, &starts), None);
-        assert_eq!(scan.poll(&home, &["own".into()], 100, 950, &starts), None);
+        // `hidden` is a candidate that only the last batch reaches: deciding on
+        // `own` before it is read would resolve a pane that is ambiguous.
+        let ids = vec!["own".into(), "hidden".into()];
+        assert_eq!(scan.poll(&home, &ids, 100, 950, &starts), None);
+        assert_eq!(scan.poll(&home, &ids, 100, 950, &starts), None);
     }
 
     #[test]
