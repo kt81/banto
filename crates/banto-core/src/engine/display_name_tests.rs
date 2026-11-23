@@ -401,10 +401,12 @@ fn the_exit_the_added_and_the_directory_statuses_use_the_name_when_there_is_one(
 
     // A Claude Worker whose directory is not trusted.
     scene.feed(Event::ClaudeWorkerDirectoryUntrusted {
+        brigade_id: Some(1),
         token: "worker-1".to_string(),
     });
     assert!(status(&scene).starts_with("\"impl\": Claude hasn't been told to trust"));
     scene.feed(Event::ClaudeWorkerDirectoryUntrusted {
+        brigade_id: Some(1),
         token: "worker-2".to_string(),
     });
     assert!(status(&scene).starts_with("worker-2: Claude hasn't been told to trust"));
@@ -412,6 +414,35 @@ fn the_exit_the_added_and_the_directory_statuses_use_the_name_when_there_is_one(
     // A Worker just added has no name yet: its token.
     scene.add_worker(1, WORKER_3);
     assert_eq!(status(&scene), "worker-3 added");
+}
+
+#[test]
+fn the_directory_status_names_a_worker_by_its_own_brigade_not_the_staged_one() {
+    let mut scene = Scene::two_brigades(true);
+    // Brigade 2's Worker is "x1"; the operator then looks at brigade 1, whose own
+    // `worker-1` is a different member.
+    scene.set_name(2, "worker-1", Some("x1"));
+    scene.stage_two();
+    scene.stage_one();
+    scene.set_name(1, "worker-1", Some("impl"));
+    scene.tick_with_names();
+
+    scene.feed(Event::ClaudeWorkerDirectoryUntrusted {
+        brigade_id: Some(2),
+        token: "worker-1".to_string(),
+    });
+    assert!(
+        status(&scene).starts_with("\"x1\": Claude hasn't been told to trust"),
+        "{}",
+        status(&scene)
+    );
+
+    // A capture from before the field existed reads the staged brigade.
+    scene.feed(Event::ClaudeWorkerDirectoryUntrusted {
+        brigade_id: None,
+        token: "worker-1".to_string(),
+    });
+    assert!(status(&scene).starts_with("\"impl\": Claude hasn't been told to trust"));
 }
 
 fn shown(scene: &Scene, token: &str) -> Option<String> {

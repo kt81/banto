@@ -899,7 +899,7 @@ fn event_loop(
                 let facts = pane_facts_for(&state, app, &handles, &ev, now);
                 log.emit_all(&pane_lines::event_lines(&ev, &facts));
             }
-            let cmds = engine::update(&mut state, app, brigade, ev, now);
+            let cmds = update_event(&mut state, app, brigade, ev, now, &mut discovery);
             for cmd in cmds {
                 if let Cmd::RingHostBell { cause } = &cmd {
                     let entry = bell_log.as_mut().map(|file| BellEntry {
@@ -1614,9 +1614,13 @@ fn execute_open_embedded(
             .iter()
             .any(|tracker| tracker.agent == AgentKind::Codex)
     {
+        // The core's own filter refuses the same open with the same error; what
+        // the operator is told, and what comes forward, is the core's answer to
+        // this event (`settle_identification_refusal`), so neither guard can say
+        // something the other does not.
         return vec![Event::SpawnFailed {
             key,
-            error: "waiting to identify a new Codex pane before resuming".to_string(),
+            error: engine::CODEX_IDENTIFYING_ERROR.to_string(),
             refusal: SpawnRefusal::CodexIdentifying,
             os_error: None,
         }];
@@ -2175,6 +2179,38 @@ fn drop_trackers_of_gone_panes(trackers: &mut Vec<DiscoveryTracker>, state: &Emp
     trackers.retain(|tracker| state.screens.contains_key(&tracker.key));
 }
 
+/// [`engine::update`], and then the tracker of the pane whose end this event
+/// reported is dropped, before anything the update asked for is executed.
+///
+/// The sweep above runs once per drain of the event queue, after every command has
+/// run, which is too late for one case: the end of the last unidentified Codex pane
+/// is what releases a Worker's held reopen, in that same update, and the open is
+/// executed with the dead pane's tracker still there — so the guard in
+/// [`execute_open_embedded`] would turn the very reopen the wait was for away, and
+/// the core would hold it again. Not the whole sweep: a pane that was spawned a
+/// moment ago has a tracker already while its `Spawned` event is still queued, and
+/// is without a screen until that is folded.
+fn update_event(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade: &BrigadeConfig,
+    ev: Event,
+    now: Instant,
+    trackers: &mut Vec<DiscoveryTracker>,
+) -> Vec<Cmd> {
+    let ended = match &ev {
+        Event::PtyExited { key, .. } | Event::PtyOutputLost { key } => Some(key.clone()),
+        _ => None,
+    };
+    let cmds = engine::update(state, app, brigade, ev, now);
+    if let Some(key) = ended
+        && !state.screens.contains_key(&key)
+    {
+        trackers.retain(|tracker| tracker.key != key);
+    }
+    cmds
+}
+
 fn poll_solo_codex_discovery(
     trackers: &mut Vec<DiscoveryTracker>,
     home: &CodexHome,
@@ -2421,12 +2457,12 @@ fn poll_discovery(
         })
         .collect();
     events.extend(newly_untrusted.iter().filter_map(|&i| {
-        trackers[i]
-            .member
-            .as_ref()
-            .map(|(_, token)| Event::ClaudeWorkerDirectoryUntrusted {
+        trackers[i].member.as_ref().map(|(brigade_id, token)| {
+            Event::ClaudeWorkerDirectoryUntrusted {
+                brigade_id: Some(*brigade_id),
                 token: token.clone(),
-            })
+            }
+        })
     }));
     for &i in &newly_untrusted {
         trackers[i].notified_untrusted = true;
@@ -11345,8 +11381,109 @@ mod tests {
             &mut handles,
             &mut discovery,
         );
-        assert!(matches!(events.as_slice(), [Event::SpawnFailed { .. }]));
+        // The refusal carries the core's own error text and the kind that makes
+        // the core's `SpawnFailed` arm answer it as it answers its own filter's
+        // refusal, so the operator is told the same either way.
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::SpawnFailed {
+                    error,
+                    refusal: SpawnRefusal::CodexIdentifying,
+                    ..
+                }] if error == engine::CODEX_IDENTIFYING_ERROR
+            ),
+            "{events:?}"
+        );
         assert!(fixture.launches().is_empty());
+    }
+
+    /// The end of the last unidentified pane and the reopen it releases are one
+    /// update's work, executed before the loop's sweep of trackers runs. The
+    /// tracker of the pane that just ended must therefore be gone by the time its
+    /// update returns, or the guard above refuses the reopen. A tracker of another
+    /// pane stays, including one that has no screen yet because its `Spawned` is
+    /// still queued.
+    #[test]
+    fn the_tracker_of_a_pane_that_just_ended_is_gone_before_its_update_is_executed() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = SpawnFixture::new(dir.path().to_path_buf());
+        let mut handles = HashMap::new();
+        let mut ended = codex_tracker(1, "ended", SystemTime::now());
+        ended.member = None;
+        let mut fresh = codex_tracker(1, "fresh", SystemTime::now());
+        fresh.member = None;
+        let mut discovery = vec![ended, fresh];
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = App::new(Vec::new());
+
+        // The control: with both trackers there, a Codex resume is turned away.
+        // This is the state the reopen is executed in when the end of the last
+        // unidentified pane releases it, unless `update_event` has dropped the
+        // ended pane's tracker first.
+        let refused = execute_cmd(
+            open_embedded_cmd(AgentKind::Codex, "known", dir.path()),
+            &fixture.deps(),
+            &mut handles,
+            &mut discovery,
+        );
+        assert!(
+            matches!(
+                refused.as_slice(),
+                [Event::SpawnFailed {
+                    refusal: SpawnRefusal::CodexIdentifying,
+                    ..
+                }]
+            ),
+            "{refused:?}"
+        );
+
+        update_event(
+            &mut state,
+            &mut app,
+            &BrigadeConfig::default(),
+            Event::PtyExited {
+                key: pending_key("ended"),
+                reason: None,
+            },
+            Instant::now(),
+            &mut discovery,
+        );
+        let kept: Vec<_> = discovery
+            .iter()
+            .map(|tracker| tracker.key.clone())
+            .collect();
+        assert_eq!(kept, vec![pending_key("fresh")]);
+
+        // An unrelated event leaves the remaining tracker alone.
+        update_event(
+            &mut state,
+            &mut app,
+            &BrigadeConfig::default(),
+            Event::Tick {
+                relay: Vec::new(),
+                brigades: Vec::new(),
+            },
+            Instant::now(),
+            &mut discovery,
+        );
+        assert_eq!(discovery.len(), 1);
+
+        // With the last tracker gone the same open goes through.
+        discovery.clear();
+        let events = execute_cmd(
+            open_embedded_cmd(AgentKind::Codex, "known", dir.path()),
+            &fixture.deps(),
+            &mut handles,
+            &mut discovery,
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::SpawnFailed { .. })),
+            "{events:?}"
+        );
+        assert_eq!(fixture.launches().len(), 1);
     }
 
     #[test]
@@ -11734,7 +11871,7 @@ mod tests {
         assert!(
             matches!(
                 events.as_slice(),
-                [Event::ClaudeWorkerDirectoryUntrusted { token }] if token == "worker-1"
+                [Event::ClaudeWorkerDirectoryUntrusted { brigade_id: Some(1), token }] if token == "worker-1"
             ),
             "{events:?}"
         );

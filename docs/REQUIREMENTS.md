@@ -751,9 +751,21 @@ in each of the three situations, and no quiet ring after the Director's turn; af
 the operator's answering Enter, the end of the Director's next stretch rang as a
 quiet fire.
 
-*Known limit, not about requests.* Texts banto did not write that go through the
-column-shortening helper (brigade names, the first line of a message) can still
-carry an unbounded run of combining marks: a follow-up.
+*Not about requests (settled later).* Texts banto did not write used to carry an
+unbounded run of combining marks through every helper that cuts or cleans a line,
+since a zero-width character costs no column and so neither a width test nor a
+budget stopped it. The cap is one function, `banto_core::display_text::cap_zero_width_runs`,
+and it cuts every run of zero-width characters to eight (`MAX_ZERO_WIDTH_RUN`),
+whether or not the text needed shortening. Real text stacks two or three; the cap
+only removes what is not text. It is applied by the core's `display_safe` (and so
+`display_name`: a brigade's or a member's name, a session title, the first line of a
+message the store strip shows) and `shorten_to_columns` (the quit question's names,
+the brigade name in a status, the nudge's prompt), and by the tui's
+`truncate_to_width` and `truncate_to_width_leading` (the list's titles and paths,
+dialog text), which call the core's function because the dependency runs from the
+tui to the core. A line that reaches the screen by a route that uses none of these
+is not covered; the routes were not all enumerated. A string cut in the middle of a
+cluster, from the left, can still begin with marks whose letter was cut off.
 
 ## Decision (2026-11-15): a background command is named, not hidden
 
@@ -781,7 +793,9 @@ of his for it is recorded here.
    only background commands: `Esc again to quit — 2 in background: x, y`; both:
    `Esc again to quit — 2 not idle, 1 in background: a (unknown), b (busy), c (bg)`.
    A pane that took input in the last 3 seconds is counted as not idle, and no pane
-   is counted twice.
+   is counted twice. The reason words are `unknown`, `input` (the operator's key or
+   paste), `nudged` (only banto's own write: a nudge, a kickoff or their Enter), `busy`
+   and, apart, `bg`.
 3. **`brigade_status` says what it is.** A shell peer prints as `idle (background
    command running)`; a Codex peer prints `busy (turn in progress)` or `idle (turn
    ended; background work not visible)` from its rollout, or `running` or `not
@@ -2071,7 +2085,9 @@ brigade bell alike.
   or something banto wrote itself to start or continue a turn: the relay's nudge
   line and its delayed submitting Enter, a Codex Worker's or a Goinkyo's kickoff
   line and its retries (an Enter-only retry included) — whatever its sample says.
-  A pane in the background that took such input counts as not idle, not as
+  The prompt names the first kind `(input)` and the second `(nudged)`, so a pane the
+  operator never typed into does not read as typed into; when both are inside the
+  window it is `(input)`. A pane in the background that took such input counts as not idle, not as
   background, since the input may have started a turn, and no pane is counted twice.
   The focus reports banto writes to a pane start nothing and do not count. The
   sample is up to a tick plus the product's own report lag behind a turn that input
@@ -2085,6 +2101,8 @@ One `q`/`Esc` quits when no hosted pane is counted; otherwise the first press ar
 the prompt, which names each counted pane and why it counts: `Esc again to quit — 2
 not idle: a (unknown), b (busy)`, `Esc again to quit — 2 in background: x, y` with
 only background commands, and `(bg)` beside the not-idle panes when both are there.
+The reasons are `(unknown)`, `(input)`, `(nudged)` (banto wrote into it, the operator
+did not) and `(busy)`.
 A pane is counted once: as not idle when it took
 input within the window or reads not idle or unknown, as background only when the
 background command is its whole reason. The window, the second key and the ways it
@@ -2558,7 +2576,9 @@ deterrent against that drift, not a defense against a hostile session — and
 not free: it also blocks whatever a scratchpad or memory write would use.
 
 The briefing alone is not a turn: Claude Code does nothing with a system
-prompt until it receives one, so once the Goinkyo's own pane goes quiet
+prompt until it receives one. (This is a Claude Goinkyo's kickoff; a Codex
+Goinkyo is started by the Codex member kickoff instead, see "What a Codex Goinkyo
+is" above.) So once the Goinkyo's own pane goes quiet
 (`GOINKYO_KICKOFF_QUIET_PERIOD`) and is at its prompt, banto types a fixed
 kickoff line into it — the same bootstrap problem, and the same shape of fix,
 `CODEX_WORKER_KICKOFF_LINE` solves for a freshly-spawned Codex Worker. "At its
@@ -2697,10 +2717,14 @@ the operator's own `/rename` (a Claude `custom-title` record, which sets
 `title_is_custom` and is never replaced), then banto's title, then what the provider
 derived (Claude's `ai-title`, the first user message). `title_is_custom` is `false`
 for every Codex session: Codex's title is already a pick among three sources and
-nothing in the chosen string says whether a person wrote it, and a consultation's
-title is only ever recorded for a Claude session (the `goinkyo_*` settings are Claude
-only). The title is read before the hidden ids and the archive marks, so a
-dismissal landing in between yields a session archived and not yet named in that
+nothing in the chosen string says whether a person wrote it, so a consultation's
+title always applies to a Codex session. A title is recorded against the session id
+alone, whichever product the Goinkyo ran as, so a Codex Goinkyo is named like a
+Claude one. Of the `goinkyo_*` settings only `goinkyo_permission_mode` and
+`goinkyo_disallowed_tools` are Claude-only (Claude flags, left off a Codex launch);
+the model and the effort are read per product (`goinkyo_model_for`,
+`goinkyo_effort_for`). The title is read before the hidden ids and the archive marks,
+so a dismissal landing in between yields a session archived and not yet named in that
 load, never named and not archived; the next reload has both.
 
 The limit of 24 columns is the member display name's (`MEMBER_NAME_COLUMNS`, which has
@@ -2763,7 +2787,9 @@ reopens through (`stage_brigade`) — `--permission-mode` and
 "who's here to click 'allow'" and "what may this role attempt", not "what should
 this session think with"; `--model` and `--effort` do not (2026-11-14: a session
 keeps what it last used, so a Goinkyo reopened after a restart is on its own
-model and the effort from the operator's Claude settings, not the creation flag;
+model and the effort from the operator's own settings (Claude's, for a Claude
+Goinkyo; a Codex Goinkyo's launch never carries either on a resume), not the
+creation flag;
 "Decision (2026-11-14)"). A Goinkyo that was never discovered
 (its pane died before it had a session id) does *not* reopen through that
 path — `stage_brigade`'s undiscovered-member branch is Worker-only — but
@@ -2881,9 +2907,69 @@ than leaving a Director with no wiring at all.
 until its first turn. While any such pane is unidentified, banto holds Codex
 resumes, and formation or staging that would resume a Codex member, until
 discovery or process exit resolves the uncertainty. If formation has already
-been saved when this uncertainty appears, the brigade stays saved and a status
-message asks the operator to identify the pane before staging it. This guard
+been saved when this uncertainty appears, the brigade stays saved and the
+operator is told so first ("Brigade saved — ", or they form it again and it
+is saved twice), then what the pane is waiting for (below). This guard
 reduces the risk of an unknown pane and a resumed session sharing a history.
+
+Decision (2026-11-23): the refusal brings the pane that causes it forward. The
+guard itself is not loosened (no timeout, no "open anyway"): until the pane is
+named, a second resume of its session could be the double resume the guard
+exists to stop. What changed is how it refuses. These entrances turn the
+operator away for an unidentified pane — a Codex resume from the list, staging a
+brigade with a Codex member that has no pane, forming a brigade (the `B` key,
+its Director reopen, its trust check, and the saved brigade's staging) with a
+Codex Director while one waits, and `x` on a Codex row with no
+pane (which used to say "has no open pane", false when the pane is open and just
+not tied to the row) — and all of them, and the shell's own guard on a Codex
+resume, are one answer. It names the pane, shows it and gives it the keys (a lone
+pane takes the stage; a pane on the stage is focused, its tile opened if it was
+collapsed; a brigade member's brigade stays where it is), marks its tile title
+` · unidentified`, and says on the status line that banto cannot yet tell which
+session that pane is (it may be the very row that was asked for, so it is never
+called another session): close it with the prefix chord and `x`, then press Enter
+on the row again — the conversation stays in the list, and a row's resume
+carries its id, so it is identified for certain — or send the pane's first
+message. For a brigade member the line names the Worker and its brigade and
+says to try again in a moment first, since its first turn's hook identifies it,
+and then, for a hook that never lands (an untrusted directory, a path with a
+space, a store that cannot be written), to remove it with the prefix chord and
+`x` on its tile: a Worker is disposable. With several unidentified panes, the one already on
+the stage is named, otherwise the one that has waited longest. The mark is only
+for a pane that a refusal named, and goes when the pane is identified or exits;
+panes that identify in seconds are never marked.
+
+A Codex Worker that exits on its own while a pane is unidentified is not turned
+away, because nobody asked: its reopen is held. Its tile stays on the stage,
+empty, and its place in the roster is untouched; the status line says that the
+Worker's restart is held and which pane it waits for, and that pane's tile gets
+the same mark. Nothing moves on the stage or in focus (an automatic event never
+steals either). When no Codex pane is unidentified any more, the reopen is made,
+once, at the end of that same update, and the relaunch cooldown starts then, not
+when the Worker exited. It is checked again just before: if the key has a
+process, the member was removed or renumbered, its brigade is closing or being
+disbanded, or its row cannot be resumed, the hold is dropped and nothing else
+happens. Which brigade is on the stage by then is not asked: a Worker of a brigade
+that is not shown is reopened when nothing waits, so it is when something did.
+Enter on the held tile is the operator asking, and brings the pane
+it waits for onto the stage like a refusal; other keys are not forwarded to a
+tile that has no process. If the shell turns the reopen away anyway for a pane
+its own tracking knows of and the core does not, it goes back to being held, and
+is made again only after an event that can change what the shell tracks (a pane
+ending, a pane identified), never on a tick, and once after each such event.
+Enter on that tile, when no pane is unidentified in the core's view (so there is
+no cause to bring forward), makes the reopen again at once: the operator's way
+out of a wait that no event ends. Closing the brigade or dismissing the Worker
+drops the hold.
+(No path to that state was found other than a window of one drain of the event
+queue, which that rule covers; the rule is there so that a state not found cannot
+make the reopen spin.) A reopen whose process cannot be started removes the
+Worker from its brigade exactly as one that exited twice is, with the reason in
+the status line: a frame with no process behind it and a name on the roster that
+nobody can reach is worse than a Worker that left. Any other reason it fails
+(the banto executable was replaced while it ran, the MCP configuration could not
+be written, the session is already running in another pane) says so and leaves
+the frame and the roster, as any failed open does, for restaging to reopen.
 
 For a solo Codex creation, discovery snapshots the Codex log database before
 spawn and associates later log rows with the spawned PID and its process start
@@ -3081,9 +3167,14 @@ event. Dropping the PTY master is what hangs a Windows pane up, and per Microsof
 documentation (not measured here) `ClosePseudoConsole` before Windows 11 24H2 (build
 26100) waits for the process to exit, so the drop is done on a thread of its own. On Unix the hang-up is `SIGHUP` to the process group and the force, new
 with this, a `SIGKILL` (the PTY library's own killer only sends `SIGHUP`).
-Unverified: macOS (never run); that an agent's `SessionEnd` hooks run for a session
-ended this way, which was not measured; and how an agent mid-turn answers a hang-up.
-The Linux half has run green under WSL.
+Unverified: that an agent's `SessionEnd` hooks run for a session ended this way, which
+was not measured; and how an agent mid-turn answers a hang-up. The Linux half has run
+green under WSL, and the Unix hang-up timings were measured there. macOS is checked
+less: CI builds it and runs the test suite on `macos-latest`, and one Apple silicon Mac
+has installed v0.1.0 and opened and closed sessions in panes (README, "macOS is lightly
+checked"), but the hang-up and force-kill timings were not measured on macOS, and
+resume, the list following session-file changes and input in detail are unchecked
+there.
 
 *Why the Director's prefix-`x` changed (operator's decision, 2026-11-20).* It used
 to end only the Director's process. The operator's reason: a brigade with only its
@@ -3357,8 +3448,9 @@ what happened:
 
 Several Workers created together with different words are each resolved and each
 said, joined with `; `. The picker's Codex model is shown as typed in all of this.
-The status line begins `codex worker:` for a Goinkyo's resolution too: the one
-`codex_model::resolve` writes it, and it has no role to name.
+The status line begins `codex goinkyo:` instead of `codex worker:` for a Goinkyo's
+resolution: `codex_model::resolve` is given the role and names it, and a Worker and
+a Goinkyo that ask for the same word are two answers and two lines.
 The effort has no resolution step: whatever the fields or the config hold goes into
 the `-c` as it is.
 
@@ -4199,7 +4291,10 @@ line banto itself has in a pane: while a typed line (a kickoff sentence, or a
 nudge) still waits for its delayed Enter, or an Enter went out into the pane on
 this very tick, the pane counts as not idle for the relay, so its idle streak
 starts over — otherwise one Enter would submit the two lines as a single message,
-and the idle reading would be from before the line. Everything above is about a
+and the idle reading would be from before the line. A delayed Enter still queued
+when its pane exits and is opened again (a relaunch), or is taken off the stage, is
+dropped, not written to what comes next: the pane's queue goes with its key.
+Everything above is about a
 member that is idle; the one key banto writes into a busy pane, the Director's
 interrupt, and the Enter-only form of the nudge it brings, are under "Interrupting
 a Worker's turn" at the end of this section.
@@ -4410,11 +4505,12 @@ unrecognised shape still holds until a later recognised empty reading or an Ente
 reaches the pane. Claude's reader can additionally detect `HasText` without a
 mark; Codex's cannot.
 
-**Known limit (an observation of 2026-11-14, found by reading and by a test that
-tripped on it, not seen in the field):** a nudge's delayed submitting Enter that is
-still queued when its pane is relaunched is written to the new process, and counts
-as work given to it. It needs a nudge written less than 300 ms
-(`RELAY_SUBMIT_DELAY`) before the pane exits.
+**Settled (found 2026-11-14 by reading and by a test that tripped on it, not seen in
+the field):** a nudge's delayed submitting Enter still queued when its pane was
+relaunched used to be written to the new process, and counted as work given to it;
+that needed a nudge written less than 300 ms (`RELAY_SUBMIT_DELAY`) before the pane
+exited. `unstage` and `relaunch_member` now drop the queued Enter of the key, so it
+never reaches a new process.
 
 `[brigade].relay` in config.toml (`RelayMode`, default `Auto`) toggles this
 off (`Manual`) for an operator who would rather prompt `check_messages`

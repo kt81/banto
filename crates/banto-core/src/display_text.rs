@@ -8,8 +8,59 @@
 //! reduced here, once, before it is cut to width or interpolated into a status
 //! or a strip, and nowhere else decides what is "safe".
 
+use std::borrow::Cow;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// The most zero-width characters (combining marks, joiners, variation
+/// selectors) kept in a row. A zero-width character costs no column, so neither
+/// a width test nor a budget ever stops a run of them: a title or a name with
+/// thousands of marks after one letter came through whole, as one cell's
+/// symbol. Real text stacks a few at most (a Thai vowel and a tone mark, Hebrew
+/// points with a cantillation mark, an emoji's joiner and selector), so the cap
+/// sits well above that and only cuts what is not text.
+///
+/// Held here, with [`cap_zero_width_runs`], for every path that puts someone
+/// else's text on screen: [`display_safe`] and [`shorten_to_columns`] apply it
+/// here, and `banto_tui::text`'s two column-cutting helpers call the same
+/// function (the dependency runs from the tui to the core, not back).
+pub const MAX_ZERO_WIDTH_RUN: usize = 8;
+
+/// `s` with every run of zero-width characters cut to [`MAX_ZERO_WIDTH_RUN`];
+/// borrowed when none is longer.
+pub fn cap_zero_width_runs(s: &str) -> Cow<'_, str> {
+    let mut run = 0usize;
+    let mut too_long = false;
+    for c in s.chars() {
+        if c.width().unwrap_or(0) == 0 {
+            run += 1;
+            if run > MAX_ZERO_WIDTH_RUN {
+                too_long = true;
+                break;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    if !too_long {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut run = 0usize;
+    for c in s.chars() {
+        if c.width().unwrap_or(0) == 0 {
+            run += 1;
+            if run > MAX_ZERO_WIDTH_RUN {
+                continue;
+            }
+        } else {
+            run = 0;
+        }
+        out.push(c);
+    }
+    Cow::Owned(out)
+}
 
 /// Whether `c` is a Unicode *format* character (general category Cf):
 /// invisible characters that change how neighbouring text is laid out or
@@ -57,19 +108,27 @@ pub fn is_format_char(c: char) -> bool {
 /// control characters (the escape that opens a sequence, the C1 range, a
 /// carriage return) and format characters (bidi overrides and isolates,
 /// zero-width spaces and joiners) are dropped, a tab becomes a space. Nothing
-/// else is touched — no trimming, no folding of whitespace.
+/// else is touched — no trimming, no folding of whitespace — but a run of
+/// zero-width characters is cut to [`MAX_ZERO_WIDTH_RUN`].
 ///
 /// A zero-width joiner is dropped like the rest, so an emoji sequence the
 /// joiner held together shows as its parts: the price of one rule with no
 /// exception for the one Cf character that is sometimes meaningful.
 pub fn display_safe(text: &str) -> String {
-    text.chars()
+    let kept: String = text
+        .chars()
         .filter_map(|c| match c {
             '\t' => Some(' '),
             c if c.is_control() || is_format_char(c) => None,
             c => Some(c),
         })
-        .collect()
+        .collect();
+    // After the drops: a joiner or a control character between two marks was
+    // not a break in the run.
+    match cap_zero_width_runs(&kept) {
+        Cow::Borrowed(_) => kept,
+        Cow::Owned(capped) => capped,
+    }
 }
 
 /// `text` as a one-line name: every whitespace run (a newline included)
@@ -95,8 +154,11 @@ pub fn display_name(text: &str) -> Option<String> {
 /// character takes two columns. By grapheme cluster, not characters: a base
 /// letter and the combining mark after it, a flag's two regional indicators,
 /// an emoji and its skin-tone modifier are kept or cut together — cutting
-/// between them would leave a mark on nothing, or half a flag.
+/// half a flag. A run of zero-width characters is cut to [`MAX_ZERO_WIDTH_RUN`]
+/// whether or not the text needed shortening.
 pub fn shorten_to_columns(text: &str, columns: usize) -> String {
+    let text = cap_zero_width_runs(text);
+    let text = text.as_ref();
     if text.width() <= columns {
         return text.to_string();
     }
@@ -282,5 +344,42 @@ mod tests {
             assert_eq!(body.chars().count() % 2, 0, "columns {columns}: {cut:?}");
             assert!(cut.width() <= columns, "{cut:?}");
         }
+    }
+
+    #[test]
+    fn a_run_of_combining_marks_is_cut_in_a_name_and_in_a_shortened_text() {
+        // One letter and a thousand combining acutes is one column wide: it fits
+        // any budget, and the width test and the cut both used to let it through.
+        let text = format!("e{}", "\u{0301}".repeat(1000));
+        let expected = 1 + MAX_ZERO_WIDTH_RUN;
+        assert_eq!(shorten_to_columns(&text, 60).chars().count(), expected);
+        assert_eq!(display_safe(&text).chars().count(), expected);
+        assert_eq!(
+            display_name(&text)
+                .expect("a letter is visible")
+                .chars()
+                .count(),
+            expected
+        );
+        // Also when the text is cut: the marks after the last letter that fits.
+        let long = format!("abc{}def", "\u{0301}".repeat(1000));
+        let cut = shorten_to_columns(&long, 4);
+        assert!(cut.chars().count() <= 3 + MAX_ZERO_WIDTH_RUN + 1, "{cut:?}");
+        assert!(cut.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn a_run_within_the_cap_is_left_alone_and_each_run_counts_from_zero() {
+        for text in [
+            "\u{0e01}\u{0e34}\u{0e48}",
+            "e\u{0302}\u{0301}",
+            "\u{1f469}\u{1f4bb}\u{fe0f}",
+        ] {
+            assert_eq!(shorten_to_columns(text, 20), text);
+            assert_eq!(display_safe(text), text);
+        }
+        let text = format!("{0}a{0}b", "\u{0301}".repeat(MAX_ZERO_WIDTH_RUN));
+        assert_eq!(shorten_to_columns(&text, 10), text);
+        assert_eq!(cap_zero_width_runs(&text), text);
     }
 }

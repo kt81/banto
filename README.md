@@ -311,7 +311,8 @@ hosted. Otherwise it asks first, and a second `q`/`Esc` within 3 seconds quits,
 since quitting ends every hosted process. The status bar names each session it
 counts and why, for example `Esc again to quit — 2 not idle: レビュー (unknown), 実装
 (busy)`: `unknown` (the pane could not be read, or it is on a dialog), `input` (typed
-to in the last 3 seconds), `busy` (working, waiting, or a state banto can't read),
+to in the last 3 seconds), `nudged` (only banto wrote to it in the last 3 seconds:
+a relay nudge or a kickoff, not you), `busy` (working, waiting, or a state banto can't read),
 `bg` (a Claude Code turn has ended but a background command still runs). Each session is then closed in turn and
 given up to 5 seconds to finish.
 

@@ -22,6 +22,8 @@
 
 use serde::Deserialize;
 
+use crate::model::BrigadeRole;
+
 /// What one catalog entry says about itself.
 #[derive(Debug, Clone, PartialEq)]
 struct CatalogModel {
@@ -155,6 +157,17 @@ pub struct Resolved {
     pub notice: Option<String>,
 }
 
+/// The word a notice names the session by. A Goinkyo's model is resolved by the
+/// same rules as a Worker's and the status line is the operator's only sight of
+/// it, so the line says which of the two it is about.
+fn role_label(role: BrigadeRole) -> &'static str {
+    match role {
+        BrigadeRole::Director => "director",
+        BrigadeRole::Worker => "worker",
+        BrigadeRole::Goinkyo => "goinkyo",
+    }
+}
+
 /// Resolve `requested` (a family word or a slug, as configured or typed)
 /// against what the catalog command produced: its standard output, or why it
 /// could not be run.
@@ -168,7 +181,8 @@ pub struct Resolved {
 /// 5. The catalog could not be read: a request holding a digit is taken for a
 ///    slug and passed as it is; a bare family word is not passed at all, and
 ///    the notice says Codex will then use its own default.
-pub fn resolve(requested: &str, catalog: &Result<String, String>) -> Resolved {
+pub fn resolve(requested: &str, catalog: &Result<String, String>, role: BrigadeRole) -> Resolved {
+    let who = role_label(role);
     let requested = requested.trim();
     if requested.is_empty() {
         return Resolved {
@@ -187,7 +201,7 @@ pub fn resolve(requested: &str, catalog: &Result<String, String>) -> Resolved {
                 Resolved {
                     model: Some(requested.to_string()),
                     notice: Some(format!(
-                        "codex worker: could not read Codex's model list ({why}) — \
+                        "codex {who}: could not read Codex's model list ({why}) — \
                          \"{requested}\" passed as given"
                     )),
                 }
@@ -195,7 +209,7 @@ pub fn resolve(requested: &str, catalog: &Result<String, String>) -> Resolved {
                 Resolved {
                     model: None,
                     notice: Some(format!(
-                        "codex worker: could not read Codex's model list ({why}) — \
+                        "codex {who}: could not read Codex's model list ({why}) — \
                          \"{requested}\" not resolved, so no -m: Codex uses its own default model"
                     )),
                 }
@@ -216,12 +230,12 @@ pub fn resolve(requested: &str, catalog: &Result<String, String>) -> Resolved {
     match family {
         Some(model) => Resolved {
             model: Some(model.slug.clone()),
-            notice: Some(format!("codex worker: {requested} → {}", model.slug)),
+            notice: Some(format!("codex {who}: {requested} → {}", model.slug)),
         },
         None => Resolved {
             model: Some(requested.to_string()),
             notice: Some(format!(
-                "codex worker: \"{requested}\" is not in Codex's model list — passed as given"
+                "codex {who}: \"{requested}\" is not in Codex's model list — passed as given"
             )),
         },
     }
@@ -230,6 +244,11 @@ pub fn resolve(requested: &str, catalog: &Result<String, String>) -> Resolved {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Worker's resolution, which is what nearly every case here is about.
+    fn resolve(requested: &str, catalog: &Result<String, String>) -> Resolved {
+        super::resolve(requested, catalog, BrigadeRole::Worker)
+    }
 
     /// A synthetic catalog: the fields this module reads plus ones it must
     /// ignore, in the order a real one is unlikely to have.
@@ -285,6 +304,25 @@ mod tests {
             resolved.notice.as_deref(),
             Some("codex worker: terra → gpt-6.1-terra")
         );
+    }
+
+    #[test]
+    fn every_notice_names_the_role_it_is_about() {
+        let cases = [
+            ("terra", catalog()),
+            ("gpt-9-mystery", catalog()),
+            ("gpt-6.1-terra", Err("codex was not found".to_string())),
+            ("terra", Err("codex was not found".to_string())),
+        ];
+        for (role, who) in [
+            (BrigadeRole::Worker, "codex worker: "),
+            (BrigadeRole::Goinkyo, "codex goinkyo: "),
+        ] {
+            for (word, result) in &cases {
+                let notice = super::resolve(word, result, role).notice.unwrap();
+                assert!(notice.starts_with(who), "{role:?} {word}: {notice}");
+            }
+        }
     }
 
     #[test]

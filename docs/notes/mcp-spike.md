@@ -78,6 +78,13 @@ non-interactive `-p` mode.
   transport one).
 - Non-Windows.
 
+*Later, item by item:* the second was answered by the follow-up below ("the open
+question, answered on the Director side"): a Worker is made to pull by the relay
+forcing the turn, not by hoping. The third has partly run since: the Linux half
+ran green under WSL, and `docs/REQUIREMENTS.md` ("How a pane ends") says how far macOS
+is checked. The first, several `_mcp` servers under real sqlite contention, is still
+listed as not yet verified in `docs/REQUIREMENTS.md` ("MCP mediation server").
+
 Spike code (`crate::mcp` + the hidden `_mcp` subcommand) is kept as the seed of
 2c; the throwaway config file lived in the scratchpad (never committed).
 

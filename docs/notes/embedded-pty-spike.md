@@ -143,6 +143,12 @@ Internal term — never surfaced externally.)
   many panes.
 - Non-Windows behavior (raw Unix PTY; see the ConPTY note above).
 
+*Later, for the second item:* the Unix teardown was measured on Linux (WSL), see
+"Unix follow-up (2026-07-25)" below, and `docs/REQUIREMENTS.md` ("How a pane ends")
+says what is still unverified there: macOS is checked less than Linux. The first item
+(resize under stress, heavy output) is still listed as unverified in
+`docs/REQUIREMENTS.md` ("The emporium: hosted panes").
+
 ## Two of the above landed
 
 Mouse forwarding into the child and scrollback viewing were both on the list

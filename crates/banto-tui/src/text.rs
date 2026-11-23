@@ -4,6 +4,9 @@
 //! list's title/cwd truncation) — a rendering concern, not a domain one, so
 //! it lives in `banto-tui` rather than `banto-core`.
 
+#[cfg(test)]
+use banto_core::display_text::MAX_ZERO_WIDTH_RUN;
+use banto_core::display_text::cap_zero_width_runs;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Truncate `s` to fit within `max_width` display columns (a full-width
@@ -13,8 +16,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// own area boundary, so this isn't papering over a rendering bug — it's so
 /// long content (a session title, a cwd, a group name) that gets cut ends in
 /// a visible `…` instead of silently vanishing past the edge with no
-/// indication anything was hidden.
+/// indication anything was hidden. A run of zero-width characters is cut to
+/// [`MAX_ZERO_WIDTH_RUN`] whether or not the text needed shortening.
 pub fn truncate_to_width(s: &str, max_width: u16) -> String {
+    let s = cap_zero_width_runs(s);
+    let s = s.as_ref();
     let max_width = max_width as usize;
     if s.width() <= max_width {
         return s.to_string();
@@ -41,8 +47,11 @@ pub fn truncate_to_width(s: &str, max_width: u16) -> String {
 /// within `max_width` display columns, prefixing a leading ellipsis when
 /// anything was cut. For content where the *tail* carries the information —
 /// a cwd path, where "…project/src/main.rs" is more useful than
-/// "/home/user/deeply/nested/…".
+/// "/home/user/deeply/nested/…". Zero-width runs are cut as in
+/// [`truncate_to_width`].
 pub fn truncate_to_width_leading(s: &str, max_width: u16) -> String {
+    let s = cap_zero_width_runs(s);
+    let s = s.as_ref();
     let max_width = max_width as usize;
     if s.width() <= max_width {
         return s.to_string();
@@ -131,5 +140,49 @@ mod tests {
         assert!(truncated.starts_with('\u{2026}'));
         assert!(truncated.width() <= 10);
         assert!(path.ends_with(truncated.trim_start_matches('\u{2026}')));
+    }
+
+    #[test]
+    fn a_run_of_combining_marks_is_cut_even_when_the_text_fits() {
+        // One letter and a thousand combining acutes is one column wide, so it
+        // fits any budget and used to come through whole.
+        let text = format!("e{}", "\u{0301}".repeat(1000));
+        for out in [
+            truncate_to_width(&text, 10),
+            truncate_to_width_leading(&text, 10),
+        ] {
+            assert_eq!(out.chars().count(), 1 + MAX_ZERO_WIDTH_RUN);
+            assert!(out.starts_with('e'));
+        }
+    }
+
+    #[test]
+    fn marks_after_the_last_letter_that_fits_stop_at_the_cap() {
+        // The budget is spent on the letters; the marks after the last one kept
+        // cost no column, so only the cap bounds them.
+        let text = format!("abc{}def", "\u{0301}".repeat(1000));
+        let out = truncate_to_width(&text, 4);
+        assert_eq!(out.chars().count(), 3 + MAX_ZERO_WIDTH_RUN + 1);
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn a_run_within_the_cap_is_left_alone() {
+        // A Thai letter with its vowel and tone mark, a decomposed Vietnamese
+        // letter with two marks, an emoji with its joiner and selector: text.
+        for text in [
+            "\u{0e01}\u{0e34}\u{0e48}",
+            "e\u{0302}\u{0301}",
+            "\u{1f469}\u{200d}\u{1f4bb}\u{fe0f}",
+        ] {
+            assert_eq!(truncate_to_width(text, 20), text);
+            assert_eq!(truncate_to_width_leading(text, 20), text);
+        }
+    }
+
+    #[test]
+    fn marks_separated_by_letters_are_each_counted_from_zero() {
+        let text = format!("{0}a{0}b", "\u{0301}".repeat(MAX_ZERO_WIDTH_RUN));
+        assert_eq!(truncate_to_width(&text, 10), text);
     }
 }

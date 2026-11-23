@@ -306,6 +306,13 @@ const INTERRUPT_STALE_AFTER: Duration = Duration::from_secs(10);
 const INTERRUPT_SETTLE_TICKS: u32 = 3;
 /// How long a transient status message shows before [`update_tick`] clears it.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// What a Codex resume refused for an unidentified pane carries as its error. Both
+/// refusals, the core's filter at the end of [`update`] and the shell's guard in
+/// `execute_open_embedded`, use it, so the pane log reads the same either way; what
+/// the operator is told is [`settle_identification_refusal`]'s, not this.
+pub const CODEX_IDENTIFYING_ERROR: &str = "waiting to identify a new Codex pane before resuming";
+/// Appended to the title of a tile that a refusal has named as unidentified.
+const UNIDENTIFIED_MARK: &str = " \u{b7} unidentified";
 /// How long the status line stays clear — showing the key guidance — between
 /// one showing of a recurring notice and the next (see [`StatusReminder`]).
 /// With [`STATUS_TIMEOUT`] that makes a 30s cycle, five seconds of notice and
@@ -1279,6 +1286,54 @@ pub struct Ghost {
 /// What the status line says while a tile is being moved.
 const MOVE_HINT: &str = "move: release to drop · Esc cancels";
 
+/// A Worker whose reopen is held. The identity is kept to check it again when the
+/// wait ends: the member may have been dismissed, or its brigade closed, since.
+struct HeldRelaunch {
+    key: SessionKey,
+    brigade_id: BrigadeId,
+    token: MemberToken,
+    /// Held because the shell turned the open away for a pane its own trackers know
+    /// of and the core does not. The core cannot see that state, so nothing it knows
+    /// says when it ends: such a hold is tried again only after an event that can
+    /// change the shell's trackers ([`changes_shell_trackers`]), never on a tick,
+    /// which would be refused and held again every tick.
+    shell_refused: bool,
+}
+
+/// A set of keys that remembers the order they were added in. The core's one
+/// need for that order is to name the longest-waiting unidentified pane the same
+/// way every time; a `HashSet` would pick any.
+#[derive(Debug, Default)]
+struct PendingKeys(Vec<SessionKey>);
+
+impl PendingKeys {
+    fn insert(&mut self, key: SessionKey) -> bool {
+        if self.0.contains(&key) {
+            return false;
+        }
+        self.0.push(key);
+        true
+    }
+
+    fn remove(&mut self, key: &SessionKey) -> bool {
+        let before = self.0.len();
+        self.0.retain(|held| held != key);
+        self.0.len() != before
+    }
+
+    fn contains(&self, key: &SessionKey) -> bool {
+        self.0.contains(key)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &SessionKey> {
+        self.0.iter()
+    }
+}
+
 pub struct EmporiumState {
     pub screens: HashMap<SessionKey, crate::screen::Screen>,
     /// The product actually launched, available before session discovery.
@@ -1478,7 +1533,45 @@ pub struct EmporiumState {
     pending_goinkyo_kickoffs: Vec<PendingGoinkyoKickoff>,
     pending_submits: Vec<PendingSubmit>,
     pending_opens: HashMap<SessionKey, PendingOpen>,
-    unresolved_codex: HashSet<SessionKey>,
+    /// Codex panes opened without a session id (a new session, a new Worker or
+    /// Director), until discovery names the session or the pane exits. In the
+    /// order they were opened, which is what picks the one a refusal names
+    /// ([`EmporiumState::identification_cause`]).
+    unresolved_codex: PendingKeys,
+    /// The panes a refusal has named as what it was waiting for
+    /// ([`settle_identification_refusal`]), so their tile says so
+    /// ([`EmporiumState::tile_label`]) until they are identified or gone. A pane
+    /// that is identified within a few seconds, as nearly all are, is never in it.
+    /// Pruned to [`Self::unresolved_codex`] at the end of every update.
+    refused_for: HashSet<SessionKey>,
+    /// Something in this update was turned away because a Codex pane is still
+    /// being identified: a resume, the staging of a brigade, a close on a row with
+    /// no pane. The entrances only raise this; the end of the update answers it
+    /// once, so all of them say the same thing ([`settle_identification_refusal`]).
+    identification_refused: bool,
+    /// The refusal is one the operator asked for, so the pane that causes it comes
+    /// forward ([`EmporiumState::bring_forward`]). Not raised by what banto does on
+    /// its own: a held relaunch tells the operator and moves nothing.
+    identification_forward: bool,
+    /// The refusal is about this member's held relaunch, which changes what is said.
+    identification_held: Option<SessionKey>,
+    /// The refusal is of a brigade that was formed and saved a moment ago, which the
+    /// line says first: told only that a pane is unidentified, an operator who
+    /// believes the formation failed forms it again, and the brigade is saved twice.
+    identification_saved_brigade: bool,
+    /// Workers that exited on their own while a Codex pane was unidentified, whose
+    /// reopen waits for the wait to end ([`hold_relaunch`], [`release_held_relaunches`]).
+    /// Kept in the order they exited. Their tiles stay staged with no screen.
+    held_relaunches: Vec<HeldRelaunch>,
+    /// Keys whose `OpenEmbedded` is a relaunch after the Worker's own exit, until
+    /// the spawn is answered. What tells a failed relaunch (the Worker leaves
+    /// like one that exited twice, [`update_spawn_failed`]) from a failed open of
+    /// anything else.
+    relaunching: HashSet<SessionKey>,
+    /// Why a Worker's relaunch could not open, kept until the store has removed the
+    /// member ([`update_exited_worker_dismissed`]), whose answer says it instead of
+    /// "exited again".
+    relaunch_failures: HashMap<(BrigadeId, MemberToken), String>,
     lost_output_waiting_for_exit: HashSet<SessionKey>,
     /// The one membership question in flight: what it was asked for, and the
     /// session id it was asked about, which the answer has to carry back
@@ -1921,7 +2014,15 @@ impl EmporiumState {
             pending_goinkyo_kickoffs: Vec::new(),
             pending_submits: Vec::new(),
             pending_opens: HashMap::new(),
-            unresolved_codex: HashSet::new(),
+            unresolved_codex: PendingKeys::default(),
+            refused_for: HashSet::new(),
+            identification_refused: false,
+            identification_forward: false,
+            identification_held: None,
+            identification_saved_brigade: false,
+            held_relaunches: Vec::new(),
+            relaunching: HashSet::new(),
+            relaunch_failures: HashMap::new(),
             lost_output_waiting_for_exit: HashSet::new(),
             pending_membership: None,
             pending_brigade_formation: None,
@@ -2171,6 +2272,7 @@ impl EmporiumState {
         self.codex_turn_ran.remove(key);
         self.unbriefed_told.remove(key);
         self.latched_attention_panes.remove(key);
+        self.pending_submits.retain(|pending| &pending.key != key);
         self.pending_kickoffs.retain(|pending| &pending.key != key);
         self.pending_goinkyo_kickoffs
             .retain(|pending| &pending.key != key);
@@ -2724,6 +2826,15 @@ impl EmporiumState {
     /// has to stay off exactly the cells this text is drawn on
     /// ([`crate::layout::title_columns`]).
     pub fn tile_label(&self, key: &SessionKey) -> String {
+        let label = self.tile_label_bare(key);
+        if self.refused_for.contains(key) && self.unresolved_codex.contains(key) {
+            format!("{label}{UNIDENTIFIED_MARK}")
+        } else {
+            label
+        }
+    }
+
+    fn tile_label_bare(&self, key: &SessionKey) -> String {
         match &self.stage {
             Stage::Brigade { id, director, .. } => {
                 if director.as_ref() == Some(key) {
@@ -3073,7 +3184,11 @@ impl EmporiumState {
         for key in self.screens.keys().filter(|key| wanted(key)) {
             let reading = self.quiescence_of(app, key);
             let kind = if self.took_input_recently(key, now) {
-                QuitKind::NotIdle(QuitReason::Input)
+                QuitKind::NotIdle(if self.given_input_recently(key, now) {
+                    QuitReason::Input
+                } else {
+                    QuitReason::Nudged
+                })
             } else if reading == Quiescence::Background {
                 QuitKind::Background
             } else if reading == Quiescence::Unknown {
@@ -3268,10 +3383,25 @@ impl EmporiumState {
     /// and keeps its timing, so such a key counts here too. It can only make the
     /// quit prompt ask. No mouse event is in it, a press included.
     fn took_input_recently(&self, key: &SessionKey, now: Instant) -> bool {
-        [self.last_given_input.get(key), self.last_prompted.get(key)]
-            .into_iter()
-            .flatten()
-            .any(|at| now.saturating_duration_since(*at) < QUIT_RECENT_INPUT_WINDOW)
+        self.given_input_recently(key, now) || self.prompted_recently(key, now)
+    }
+
+    /// The operator's key or paste ([`Self::last_given_input`]) is inside
+    /// [`QUIT_RECENT_INPUT_WINDOW`]: what the quit question calls
+    /// [`QuitReason::Input`].
+    fn given_input_recently(&self, key: &SessionKey, now: Instant) -> bool {
+        self.last_given_input
+            .get(key)
+            .is_some_and(|at| now.saturating_duration_since(*at) < QUIT_RECENT_INPUT_WINDOW)
+    }
+
+    /// banto's own write ([`Self::last_prompted`]) is inside
+    /// [`QUIT_RECENT_INPUT_WINDOW`]: what the quit question calls
+    /// [`QuitReason::Nudged`], unless the operator's input is also inside it.
+    fn prompted_recently(&self, key: &SessionKey, now: Instant) -> bool {
+        self.last_prompted
+            .get(key)
+            .is_some_and(|at| now.saturating_duration_since(*at) < QUIT_RECENT_INPUT_WINDOW)
     }
 
     /// Whether the brigade-quiet bell rings with the Director's pane focused
@@ -3390,8 +3520,9 @@ enum QuitKind {
 }
 
 /// Why a pane counts as not idle for the quit question. The one the count went
-/// by: a pane that took input is `Input` whatever the sample says of it. The
-/// variants are in the order [`QuitKind`] lists them.
+/// by: a pane that took input is `Input`, or `Nudged` when only banto wrote to
+/// it, whatever the sample says of it. The variants are in the order
+/// [`QuitKind`] lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum QuitReason {
     /// Nothing was read of it: no sample, no live file, no report.
@@ -3399,6 +3530,13 @@ enum QuitReason {
     /// It was given input within [`QUIT_RECENT_INPUT_WINDOW`], which the sample
     /// may not show yet.
     Input,
+    /// banto itself wrote into it within [`QUIT_RECENT_INPUT_WINDOW`] to start or
+    /// continue a turn (a relay nudge and its delayed Enter, a kickoff and its
+    /// retries), and the operator gave it nothing in that time. Counted for the
+    /// same reason as `Input`, but named apart: with nobody having typed, the
+    /// operator reads "input" as a fault in the question. `Input` wins when both
+    /// are inside the window.
+    Nudged,
     /// The sample reads it as working, waiting, or in a dialog it has no word for.
     Busy,
 }
@@ -3408,6 +3546,7 @@ impl QuitReason {
         match self {
             Self::Unknown => "unknown",
             Self::Input => "input",
+            Self::Nudged => "nudged",
             Self::Busy => "busy",
         }
     }
@@ -4394,6 +4533,12 @@ pub enum Event {
     /// is identified and seen idle), and discovery never gives up on a clock:
     /// this only ever adds a one-time status line on top of the wait.
     ClaudeWorkerDirectoryUntrusted {
+        /// The brigade `token` belongs to, so the line names the member by that
+        /// brigade's names: the operator may be looking at another one. `None`
+        /// in a capture from before the field existed, which then reads the
+        /// staged brigade, as it did.
+        #[serde(default)]
+        brigade_id: Option<BrigadeId>,
         token: MemberToken,
     },
     ArchiveDone {
@@ -4675,6 +4820,10 @@ pub fn update(
     // pane's report asks for it. Nothing is remembered between updates, so there
     // is nothing for a handler to forget.
     let mut overlay_may_have_changed = true;
+    // A refused open that is answered by a held reopen must not release it in the
+    // same update: the shell's refusal is what said the wait is not over.
+    let spawn_failed = matches!(ev, Event::SpawnFailed { .. });
+    let tracker_event = changes_shell_trackers(&ev);
     let mut cmds = match ev {
         Event::Input(input) => update_input(state, app, brigade, input, now),
         Event::Resized { width, height } => update_resized(state, app, width, height),
@@ -4722,7 +4871,19 @@ pub fn update(
             update_new_session_cwd_checked(state, app, cwd, is_dir)
         }
         Event::Spawned { key, agent } => update_spawned(state, brigade, key, agent, now),
-        Event::SpawnFailed { key, error, .. } => update_spawn_failed(state, key, error, now),
+        Event::SpawnFailed {
+            key,
+            error,
+            refusal,
+            ..
+        } => {
+            // The shell's guard is the same refusal as the filter at the end of
+            // this function, and is answered by the same code.
+            if refusal == SpawnRefusal::CodexIdentifying {
+                state.refuse_reopen_for_unidentified_codex(&key);
+            }
+            update_spawn_failed(state, app, key, error, refusal, now)
+        }
         Event::RowsLoaded {
             rows,
             hidden,
@@ -4738,14 +4899,15 @@ pub fn update(
             session_id,
             member,
         } => update_discovery_result(state, key, session_id, member, now),
-        Event::ClaudeWorkerDirectoryUntrusted { token } => {
-            // Only the token travels with this event: the staged brigade is the
-            // one the operator is looking at when it is raised.
-            let staged = match &state.stage {
+        Event::ClaudeWorkerDirectoryUntrusted { brigade_id, token } => {
+            // The member's own brigade, which need not be the staged one: an
+            // off-stage brigade's Worker is looked up under the wrong names (or
+            // none) otherwise.
+            let brigade_id = brigade_id.or(match &state.stage {
                 Stage::Brigade { id, .. } => Some(*id),
                 _ => None,
-            };
-            let call = state.member_call(staged, &token);
+            });
+            let call = state.member_call(brigade_id, &token);
             state.set_status(
                 format!(
                     "{call}: Claude hasn't been told to trust this directory yet — \
@@ -4996,14 +5158,34 @@ pub fn update(
             true
         });
         for key in blocked {
-            let error = if state.lost_output_waiting_for_exit.contains(&key) {
+            let output_lost = state.lost_output_waiting_for_exit.contains(&key);
+            let error = if output_lost {
                 "waiting for the previous process to exit before resuming"
             } else {
-                "waiting to identify a new Codex pane before resuming"
+                CODEX_IDENTIFYING_ERROR
             };
-            update_spawn_failed(state, key, error.to_string(), now);
+            // The Codex refusal's words are not `update_spawn_failed`'s: every
+            // entrance that turns an operator away for an unidentified pane says
+            // the same thing, below. Asked before it, which forgets whether the
+            // open was a Worker's own relaunch.
+            if !output_lost {
+                state.refuse_reopen_for_unidentified_codex(&key);
+            }
+            cmds.extend(update_spawn_failed(
+                state,
+                app,
+                key,
+                error.to_string(),
+                if output_lost {
+                    SpawnRefusal::Unspecified
+                } else {
+                    SpawnRefusal::CodexIdentifying
+                },
+                now,
+            ));
         }
     }
+    settle_identification_refusal(state, app, now);
     for cmd in &cmds {
         if let Cmd::OpenEmbedded { key, target, .. } = cmd
             && target.agent == AgentKind::Codex
@@ -5011,6 +5193,10 @@ pub fn update(
         {
             state.unresolved_codex.insert(key.clone());
         }
+    }
+    if !spawn_failed && state.unresolved_codex.is_empty() && !state.held_relaunches.is_empty() {
+        let released = release_held_relaunches(state, app, brigade, &cmds, tracker_event, now);
+        cmds.extend(released);
     }
     // Before anything sizes a tile: whatever rebuilt `panes` this event is
     // put back in the operator's order first.
@@ -6214,6 +6400,33 @@ fn update_key(
     match state.focus {
         Focus::Pane => {
             if let Some(target) = state.stage.focused_key().cloned() {
+                // A Worker's tile whose reopen is held has no process behind it:
+                // a key forwarded there finds no pane to write to. Enter is the
+                // operator asking what it waits for, and is answered like a
+                // refusal (the pane that causes it comes forward); any other key
+                // is nothing to send.
+                if state.is_held(&target) {
+                    if code == KeyCode::Enter {
+                        if state.unresolved_codex.is_empty() {
+                            // A hold the shell refused for a pane only it knows of
+                            // has no cause to bring forward, and nothing the core
+                            // sees ends it. The operator asking is the way out: the
+                            // reopen is tried again at the end of this update, and
+                            // goes back to being held if the shell refuses again.
+                            for held in state
+                                .held_relaunches
+                                .iter_mut()
+                                .filter(|held| held.key == target)
+                            {
+                                held.shell_refused = false;
+                            }
+                        } else {
+                            state.refuse_for_unidentified_codex();
+                            state.identification_held = Some(target);
+                        }
+                    }
+                    return Vec::new();
+                }
                 let (bytes, effect) =
                     key_to_encoded_input(&key, state.uses_codex_win32_input(app, &target));
                 state.last_forwarded_input.insert(target.clone(), now);
@@ -6662,13 +6875,16 @@ fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<C
     let Some(formation) = state.pending_brigade_formation.take() else {
         return Vec::new();
     };
-    if (formation.director_agent == AgentKind::Codex && !state.unresolved_codex.is_empty())
-        || state
-            .lost_output_waiting_for_exit
-            .contains(&SessionKey::from_id(&formation.director_row_id))
+    if formation.director_agent == AgentKind::Codex && !state.unresolved_codex.is_empty() {
+        state.refuse_for_unidentified_codex();
+        return Vec::new();
+    }
+    if state
+        .lost_output_waiting_for_exit
+        .contains(&SessionKey::from_id(&formation.director_row_id))
     {
         state.status =
-            Some("waiting to identify a new Codex pane before forming a brigade".to_string());
+            Some("waiting for the previous process to exit before forming a brigade".to_string());
         return Vec::new();
     }
     state.last_worker_agent = Some(worker_agent);
@@ -7133,6 +7349,10 @@ fn update_membership_resolved(
                 if state.screens.contains_key(&key) {
                     let title = row.sentence_name();
                     app.open_confirm_kill_modal(key.as_str().to_string(), title, None);
+                } else if row.agent == AgentKind::Codex && !state.unresolved_codex.is_empty() {
+                    // Not "no open pane": a new Codex pane that banto has not
+                    // identified may well be this row's, and it has no way to say.
+                    state.refuse_for_unidentified_codex();
                 } else {
                     state.status = Some(format!("{} has no open pane", row.sentence_name()));
                 }
@@ -7164,13 +7384,16 @@ fn update_membership_resolved(
             // pane is about to restart anyway would be the wrong order. See
             // `confirm_director_reopen_modal`/`update_pty_exited` for the
             // other half of this round trip.
-            None if (row.agent == AgentKind::Codex && !state.unresolved_codex.is_empty())
-                || state
-                    .lost_output_waiting_for_exit
-                    .contains(&SessionKey::from_id(&row.id)) =>
+            None if row.agent == AgentKind::Codex && !state.unresolved_codex.is_empty() => {
+                state.refuse_for_unidentified_codex();
+                Vec::new()
+            }
+            None if state
+                .lost_output_waiting_for_exit
+                .contains(&SessionKey::from_id(&row.id)) =>
             {
                 state.status = Some(
-                    "waiting to identify a new Codex pane before forming a brigade".to_string(),
+                    "waiting for the previous process to exit before forming a brigade".to_string(),
                 );
                 Vec::new()
             }
@@ -7211,8 +7434,7 @@ fn begin_brigade_formation(
     row: &SessionRow,
 ) -> Vec<Cmd> {
     if row.agent == AgentKind::Codex && !state.unresolved_codex.is_empty() {
-        state.status =
-            Some("waiting to identify a new Codex pane before forming a brigade".to_string());
+        state.refuse_for_unidentified_codex();
         return Vec::new();
     }
     if brigade.worker_agent == WorkerAgentSetting::Select {
@@ -7308,13 +7530,16 @@ fn update_codex_trust_checked(
     let Some(formation) = state.pending_codex_trust_formation.take() else {
         return Vec::new();
     };
-    if (formation.director_agent == AgentKind::Codex && !state.unresolved_codex.is_empty())
-        || state
-            .lost_output_waiting_for_exit
-            .contains(&SessionKey::from_id(&formation.director_row_id))
+    if formation.director_agent == AgentKind::Codex && !state.unresolved_codex.is_empty() {
+        state.refuse_for_unidentified_codex();
+        return Vec::new();
+    }
+    if state
+        .lost_output_waiting_for_exit
+        .contains(&SessionKey::from_id(&formation.director_row_id))
     {
         state.set_status(
-            "waiting to identify a new Codex pane before forming a brigade".to_string(),
+            "waiting for the previous process to exit before forming a brigade".to_string(),
             now,
         );
         return Vec::new();
@@ -7384,16 +7609,21 @@ fn confirm_director_reopen_modal(state: &mut EmporiumState, app: &mut App) -> Ve
         return Vec::new();
     };
     let director_row_id = director_row_id.clone();
+    if !state.unresolved_codex.is_empty()
+        && app
+            .row_for_id(&director_row_id)
+            .is_none_or(|row| row.agent == AgentKind::Codex)
+    {
+        state.refuse_for_unidentified_codex();
+        app.close_modal();
+        return Vec::new();
+    }
     if state
         .lost_output_waiting_for_exit
         .contains(&SessionKey::from_id(&director_row_id))
-        || (!state.unresolved_codex.is_empty()
-            && app
-                .row_for_id(&director_row_id)
-                .is_none_or(|row| row.agent == AgentKind::Codex))
     {
         state.status =
-            Some("waiting to identify a new Codex pane before forming a brigade".to_string());
+            Some("waiting for the previous process to exit before forming a brigade".to_string());
         app.close_modal();
         return Vec::new();
     }
@@ -7416,7 +7646,7 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
         return Vec::new();
     }
     if row.agent == AgentKind::Codex && !state.unresolved_codex.is_empty() {
-        state.status = Some("waiting to identify a new Codex pane before resuming".to_string());
+        state.refuse_for_unidentified_codex();
         return Vec::new();
     }
     state.pending_opens.insert(key.clone(), PendingOpen::Solo);
@@ -7650,8 +7880,7 @@ fn stage_brigade(
                     })
         })
     {
-        state.status =
-            Some("waiting to identify a new Codex pane before staging this brigade".to_string());
+        state.refuse_for_unidentified_codex();
         return Vec::new();
     }
     let director_session_id = members
@@ -8841,6 +9070,7 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
     }
     if state.focus == Focus::Pane
         && let Some(key) = state.stage.focused_key().cloned()
+        && !state.is_held(&key)
     {
         let normalized = normalize_paste_line_endings(&text);
         let bracketed = state
@@ -8869,6 +9099,7 @@ fn update_spawned(
     agent: Option<AgentKind>,
     now: Instant,
 ) -> Vec<Cmd> {
+    state.relaunching.remove(&key);
     state.launch_agents.remove(&key);
     if let Some(agent) = agent {
         state.launch_agents.insert(key.clone(), agent);
@@ -9224,6 +9455,19 @@ fn forget_unopened_worker(state: &mut EmporiumState, brigade_id: BrigadeId, toke
     }
 }
 
+/// The role a held creation's session is opened for, which the notice about its
+/// model names. A Worker's, or a Goinkyo's; an open with no brigade is read as a
+/// Worker's.
+fn held_creation_role(held: &HeldCreation) -> BrigadeRole {
+    match &held.open {
+        Cmd::OpenEmbedded {
+            brigade: Some((_, _, role)),
+            ..
+        } => *role,
+        _ => BrigadeRole::Worker,
+    }
+}
+
 /// The member a held `Cmd::OpenEmbedded` creates, if it is a brigade member's.
 fn held_creation_member(held: &HeldCreation) -> Option<(BrigadeId, &str)> {
     match &held.open {
@@ -9265,6 +9509,12 @@ fn drop_leftovers_of_ended_panes(
         .retain(|(id, _), _| *id != brigade_id);
     state.unreadable_noticed.retain(|(id, _)| *id != brigade_id);
     drop_held_creations_of(state, brigade_id);
+    // A closed brigade keeps its members on the roster, so the release's check of
+    // the member would still pass: a Worker's reopen held through the close would
+    // start a process for a brigade that was shut.
+    state
+        .held_relaunches
+        .retain(|held| held.brigade_id != brigade_id);
 }
 
 /// Drop the creation of one member, `token` of `brigade_id`, that is waiting
@@ -9335,7 +9585,9 @@ fn update_codex_catalog_read(
     if state.codex_opens_awaiting_catalog.is_empty() {
         state.codex_catalog_waiting_since = None;
     }
-    let mut resolved: Vec<(String, crate::codex_model::Resolved)> = Vec::new();
+    // Per word and per role: the notice names the role, so a Worker and a Goinkyo
+    // asking for the same word are two answers and two lines.
+    let mut resolved: Vec<((String, BrigadeRole), crate::codex_model::Resolved)> = Vec::new();
     let mut opens = Vec::with_capacity(waiting.len());
     // One creation per member. [`creation_still_wanted`] does not count the
     // creation's own placeholder key, so two held creations of one member (a
@@ -9361,11 +9613,12 @@ fn update_codex_catalog_read(
         if let Cmd::OpenEmbedded { model, .. } = &mut open
             && let Some(requested) = model.take()
         {
-            let at = match resolved.iter().position(|(word, _)| *word == requested) {
+            let asked = (requested, held_creation_role(&creation));
+            let at = match resolved.iter().position(|(asked_of, _)| *asked_of == asked) {
                 Some(at) => at,
                 None => {
-                    let answer = crate::codex_model::resolve(&requested, &result);
-                    resolved.push((requested, answer));
+                    let answer = crate::codex_model::resolve(&asked.0, &result, asked.1);
+                    resolved.push((asked, answer));
                     resolved.len() - 1
                 }
             };
@@ -9414,12 +9667,15 @@ fn give_up_on_codex_catalog(state: &mut EmporiumState, now: Instant) -> Vec<Cmd>
 
 fn update_spawn_failed(
     state: &mut EmporiumState,
+    app: &App,
     key: SessionKey,
     error: String,
+    refusal: SpawnRefusal,
     now: Instant,
 ) -> Vec<Cmd> {
     state.unresolved_codex.remove(&key);
     state.pending_opens.remove(&key);
+    let was_relaunch = state.relaunching.remove(&key);
     // A Goinkyo's kickoff was queued with the open (`update_goinkyo_awaiting_
     // spawn`): left behind, each tick would ask whether to type into a pane
     // that never existed, and the answer's write would be dropped.
@@ -9428,8 +9684,270 @@ fn update_spawn_failed(
             .pending_goinkyo_kickoffs
             .retain(|pending| pending.key != key);
     }
+    if was_relaunch {
+        return relaunch_failed(state, app, key, error, refusal, now);
+    }
     state.set_status(format!("failed to open: {error}"), now);
     Vec::new()
+}
+
+/// A Worker's relaunch that did not open. Turned away because a Codex pane is
+/// unidentified (the shell knew of one the core did not), it goes back to being
+/// held, to be tried again after an event that can change the shell's trackers.
+/// A process that could not be started (`PtyOpen`) is a Worker that exited and
+/// cannot be reopened, and it is dealt with as one that exited twice: the empty
+/// tile goes and the member leaves its brigade ([`update_pty_exited`]'s `GaveUp`),
+/// with the reason in the line the store's answer writes. Left alone it would be a
+/// frame with no process behind it and a name on the roster that no one can reach.
+/// The other refusals are not that: the banto executable replaced under a running
+/// banto (a rebuild while it runs), an MCP configuration that could not be written,
+/// the session already running in another pane, a wait. They say what happened and
+/// leave the frame and the roster, as any open that fails does, for a restaging to
+/// reopen.
+fn relaunch_failed(
+    state: &mut EmporiumState,
+    app: &App,
+    key: SessionKey,
+    error: String,
+    refusal: SpawnRefusal,
+    now: Instant,
+) -> Vec<Cmd> {
+    let (Some(&brigade_id), Some(token)) = (
+        state.member_brigades.get(&key),
+        state.member_tokens.get(&key).cloned(),
+    ) else {
+        state.set_status(format!("failed to open: {error}"), now);
+        return Vec::new();
+    };
+    if refusal == SpawnRefusal::CodexIdentifying {
+        hold_relaunch(state, &key, brigade_id, token, true);
+        return Vec::new();
+    }
+    if refusal != SpawnRefusal::PtyOpen {
+        state.set_status(format!("failed to open: {error}"), now);
+        return Vec::new();
+    }
+    let leaving = departing_worker(state, &key).filter(|_| !app.should_quit());
+    state.screens.remove(&key);
+    state.launch_agents.remove(&key);
+    state.quiescence.remove(&key);
+    state.unstage(&key);
+    let call = state.member_call(Some(brigade_id), &token);
+    state.set_status(
+        format!("could not restart {call}: {error} \u{2014} left closed"),
+        now,
+    );
+    match leaving {
+        Some((brigade_id, token)) => {
+            state
+                .relaunch_failures
+                .insert((brigade_id, token.clone()), error);
+            state.removing_exited.insert((brigade_id, token.clone()));
+            vec![Cmd::Store(StoreIntent::DismissExitedWorker {
+                brigade_id,
+                token,
+                repeated: true,
+            })]
+        }
+        None => Vec::new(),
+    }
+}
+
+/// The one answer to anything turned away because a Codex pane is still being
+/// identified, run at the end of every update (so every entrance, and a later
+/// caller such as [`relaunch_member`], only raise
+/// [`EmporiumState::identification_refused`]): a Codex resume (the list's Enter,
+/// the filter in [`update`], the shell's guard), the staging of a brigade with a
+/// Codex member that has no pane, `x` on a Codex row with no pane.
+///
+/// The guard itself is not loosened: a second resume of a session whose pane is
+/// merely unnamed would fork its history (invariant 4, `docs/DISCIPLINE.md` §3).
+/// What changes is that the refusal points at what it is waiting for. It names
+/// the pane, brings it to the stage and focuses it when it can be shown, marks its
+/// tile ([`UNIDENTIFIED_MARK`]) until it is identified or gone, and tells the
+/// operator how to get on.
+fn settle_identification_refusal(state: &mut EmporiumState, app: &App, now: Instant) {
+    state
+        .refused_for
+        .retain(|key| state.unresolved_codex.contains(key));
+    if !std::mem::take(&mut state.identification_refused) {
+        return;
+    }
+    let forward = std::mem::take(&mut state.identification_forward);
+    let held = state.identification_held.take();
+    let cause = state.identification_cause();
+    if let Some(key) = &cause {
+        state.refused_for.insert(key.clone());
+        if forward {
+            state.bring_forward(key);
+        }
+    }
+    let mut text = state.identification_wait_text(app, cause.as_ref(), held.as_ref());
+    if std::mem::take(&mut state.identification_saved_brigade) {
+        text.insert_str(0, "Brigade saved \u{2014} ");
+    }
+    state.set_status(text, now);
+}
+
+impl EmporiumState {
+    /// Whether `key`'s tile is a Worker's whose reopen is held, with no process behind it.
+    fn is_held(&self, key: &SessionKey) -> bool {
+        self.held_relaunches.iter().any(|held| held.key == *key) && !self.screens.contains_key(key)
+    }
+
+    /// Turn the operator away because a Codex pane is still being identified.
+    /// Every entrance calls this and nothing else, and the end of the update
+    /// answers ([`settle_identification_refusal`]), so the words and the stage are
+    /// the same for all of them.
+    fn refuse_for_unidentified_codex(&mut self) {
+        self.identification_refused = true;
+        self.identification_forward = true;
+    }
+
+    /// [`Self::refuse_for_unidentified_codex`] for an open that was refused after
+    /// it was emitted (the filter at the end of [`update`], the shell's guard),
+    /// where `refused` is what it was for. A Worker's own relaunch after its exit is
+    /// not answered here: no operator asked for it, and answering it would take the
+    /// stage from the brigade it is on. It goes back to being held instead
+    /// ([`relaunch_failed`]), which tells the operator without moving anything. An
+    /// open of a brigade member that the operator did ask for (staging) is answered
+    /// like any other.
+    fn refuse_reopen_for_unidentified_codex(&mut self, refused: &SessionKey) {
+        if !self.relaunching.contains(refused) {
+            self.refuse_for_unidentified_codex();
+        }
+    }
+
+    /// What the status line says while a Worker's reopen is held. The Worker is
+    /// called as everywhere else; the way on is the same as for a refusal
+    /// ([`Self::identification_wait_text`]), and the line says what happens by
+    /// itself.
+    fn held_relaunch_text(
+        &self,
+        app: &App,
+        cause: Option<&SessionKey>,
+        held: &SessionKey,
+    ) -> String {
+        let call = match self
+            .member_brigades
+            .get(held)
+            .zip(self.member_tokens.get(held))
+        {
+            Some((brigade_id, token)) => self.member_call(Some(*brigade_id), token),
+            None => held.as_str().to_string(),
+        };
+        let member_cause = cause.and_then(|key| {
+            self.member_brigades
+                .get(key)
+                .zip(self.member_tokens.get(key))
+        });
+        match (cause, member_cause) {
+            (_, Some((brigade_id, token))) => format!(
+                "Restart of {call} is held until {} of brigade {} is identified. If that never happens, remove it with {} x on its tile.",
+                self.member_call(Some(*brigade_id), token),
+                self.brigade_name(app, *brigade_id),
+                self.prefix_label(),
+            ),
+            (Some(_), None) => format!(
+                "Restart of {call} is held: a new Codex pane isn't identified yet. Enter on this tile shows it; close it with {} x (or send its first message) and the restart goes ahead.",
+                self.prefix_label(),
+            ),
+            (None, None) => {
+                format!("Restart of {call} is held while a new Codex pane is identified")
+            }
+        }
+    }
+
+    /// The unidentified Codex pane a refusal names. Only a pane with a screen
+    /// qualifies (one whose spawn has not landed has nothing to show). Of those,
+    /// one already on the stage comes first, so a refusal does not move the
+    /// operator away from what they are looking at; otherwise the one that has
+    /// waited longest, which is the one opened before whatever they were doing
+    /// when they were refused. Closing it and asking again names the next.
+    fn identification_cause(&self) -> Option<SessionKey> {
+        let hosted = || {
+            self.unresolved_codex
+                .iter()
+                .filter(|key| self.screens.contains_key(*key))
+        };
+        let staged = |key: &SessionKey| match &self.stage {
+            Stage::Solo(shown) => shown == key,
+            Stage::Brigade { panes, .. } => panes.contains(key),
+            Stage::Empty => false,
+        };
+        hosted()
+            .find(|key| staged(key))
+            .or_else(|| hosted().next())
+            .cloned()
+    }
+
+    /// Show `key`'s pane and give it the keys, when it can be shown: a pane on the
+    /// stage is focused (opened first if its tile is collapsed, as addressing a
+    /// pane by number does); a lone pane takes the stage. A brigade member that is
+    /// not on the stage stays where it is: its brigade comes back from its
+    /// Director's row, and the wait says which, because showing one tile of a
+    /// brigade is not something staging does.
+    fn bring_forward(&mut self, key: &SessionKey) {
+        if let Stage::Brigade { panes, .. } = &self.stage
+            && let Some(index) = panes.iter().position(|pane| pane == key)
+        {
+            if index > 0 && self.pane_collapsed().get(index).copied().unwrap_or(false) {
+                toggle_minimize(self, key);
+            }
+            self.focus = Focus::Pane;
+            if let Stage::Brigade { focused, .. } = &mut self.stage {
+                *focused = index;
+            }
+        } else if matches!(&self.stage, Stage::Solo(shown) if shown == key) {
+            self.focus = Focus::Pane;
+        } else if !self.member_brigades.contains_key(key) {
+            self.stage = Stage::Solo(key.clone());
+            self.focus = Focus::Pane;
+        }
+    }
+
+    /// What the status line says for a refusal, built here for every entrance.
+    /// It cannot say "another session": the pane may be the very one the operator
+    /// asked for, which banto cannot tell yet. For a lone pane the way on is to
+    /// close it (the prefix chord as the hint line writes it) and ask the row
+    /// again, which is always identified because a row's resume carries its id;
+    /// the conversation stays in the list. A brigade member is told to wait first:
+    /// it is identified by its first turn's hook, which nearly always lands within
+    /// seconds. Only then comes the way out for a hook that never lands (an
+    /// untrusted directory, a path with a space, a store that cannot be written):
+    /// `x` on its tile, which removes a Worker from its brigade for good, as a
+    /// Worker is disposable. Said last because it is the costlier choice, and the
+    /// line is short enough that the wait comes first when it is cut.
+    fn identification_wait_text(
+        &self,
+        app: &App,
+        cause: Option<&SessionKey>,
+        held: Option<&SessionKey>,
+    ) -> String {
+        if let Some(held) = held {
+            return self.held_relaunch_text(app, cause, held);
+        }
+        let Some(key) = cause else {
+            return "A new Codex pane is still being identified \u{2014} try that row again in a moment"
+                .to_string();
+        };
+        match self
+            .member_brigades
+            .get(key)
+            .zip(self.member_tokens.get(key))
+        {
+            Some((brigade_id, token)) => format!(
+                "{} of brigade {} isn't identified yet \u{2014} try again in a moment. If it stays that way, remove it with {} x on its tile.",
+                self.member_call(Some(*brigade_id), token),
+                self.brigade_name(app, *brigade_id),
+                self.prefix_label(),
+            ),
+            None => format!(
+                "New Codex pane not identified yet (banto can't tell which session it is). Close it with {} x, then Enter on the row again; or send its first message.",
+                self.prefix_label(),
+            ),
+        }
+    }
 }
 
 /// What [`relaunch_member`] decided about an exit it recognised.
@@ -9442,6 +9960,10 @@ enum ExitHandling {
     /// a moment ago and is evidently not able to stay up. Handled as an
     /// ordinary exit from here, but the operator is told which kind it was.
     GaveUp,
+    /// A Codex Worker that would have been restarted, while a Codex pane is
+    /// unidentified. Its tile stays, with no screen, and the reopen waits
+    /// ([`hold_relaunch`]).
+    Held,
 }
 
 /// A living Worker's pane ended without banto asking, so put it back.
@@ -9452,7 +9974,9 @@ enum ExitHandling {
 /// was lost is only the pane, and re-opening the whole brigade is a heavy way
 /// to get one back. `Some(Relaunch)` means the tile stays where it is and its
 /// screen is rebuilt when the spawn lands (`update_spawned` already tolerates a
-/// key that is still staged). `None` and `Some(GaveUp)` mean it is not coming
+/// key that is still staged). `Some(Held)` is the same restart, waiting: a Codex
+/// resume is not made while a Codex pane is unidentified ([`hold_relaunch`]).
+/// `None` and `Some(GaveUp)` mean it is not coming
 /// back: `update_pty_exited` then un-stages the pane and, for a Worker that left
 /// on its own, removes the member from its brigade (`unrequested_worker_exit`) —
 /// a member with no pane is an invisible one.
@@ -9506,13 +10030,48 @@ fn relaunch_member(
     {
         return Some(ExitHandling::GaveUp);
     }
-    state.last_relaunch.insert(key.clone(), now);
+    // A Codex resume is not made while a Codex pane is unidentified: the pane may
+    // be this very session, and a second process on it forks its history
+    // (invariant 4). The Worker's tile is emptied as for any relaunch and the
+    // reopen waits ([`hold_relaunch`]); the cooldown is stamped when it is made,
+    // not now, since nothing was tried.
+    let held = row.agent == AgentKind::Codex && !state.unresolved_codex.is_empty();
+    if !held {
+        state.last_relaunch.insert(key.clone(), now);
+    }
     state.screens.remove(key);
     state.launch_agents.remove(key);
     state.quiescence.remove(key);
     // The process that held any draft is gone; the restarted one starts with
     // an empty input line.
     state.unsent_operator_input.remove(key);
+    // Nor is the Enter owed to a nudge's line meant for it: the new process is
+    // under the same key and would take the earlier one's `\r` as its own first
+    // input.
+    state.pending_submits.retain(|pending| &pending.key != key);
+    if held {
+        hold_relaunch(state, key, brigade_id, token, false);
+        return Some(ExitHandling::Held);
+    }
+    Some(ExitHandling::Relaunch(Box::new(relaunch_open(
+        state, row, brigade, key, brigade_id, &token, now,
+    ))))
+}
+
+/// The open that puts a Worker's pane back, and the bookkeeping that goes with
+/// making it: the cooldown clock, the pending open, and the mark that tells a
+/// failed spawn of it ([`update_spawn_failed`]) from a failed open of anything else.
+fn relaunch_open(
+    state: &mut EmporiumState,
+    row: &SessionRow,
+    brigade: &BrigadeConfig,
+    key: &SessionKey,
+    brigade_id: BrigadeId,
+    token: &MemberToken,
+    now: Instant,
+) -> Cmd {
+    state.last_relaunch.insert(key.clone(), now);
+    state.relaunching.insert(key.clone());
     let cwd = row.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
     state.pending_opens.insert(
         key.clone(),
@@ -9525,9 +10084,9 @@ fn relaunch_member(
         },
     );
     let launch = RoleLaunch::of(BrigadeRole::Worker, row.agent, brigade);
-    let call = state.member_call(Some(brigade_id), &token);
+    let call = state.member_call(Some(brigade_id), token);
     state.set_status(format!("worker {call} exited — restarting"), now);
-    Some(ExitHandling::Relaunch(Box::new(Cmd::OpenEmbedded {
+    Cmd::OpenEmbedded {
         key: key.clone(),
         target: SessionToOpen {
             id: row.id.clone(),
@@ -9535,14 +10094,108 @@ fn relaunch_member(
             title: row.sentence_name(),
             cwd,
         },
-        brigade: Some((brigade_id, token, BrigadeRole::Worker)),
+        brigade: Some((brigade_id, token.clone(), BrigadeRole::Worker)),
         // A resume (`RoleLaunch`'s doc): the session keeps what it last used.
         model: None,
         effort: None,
         permission_mode: launch.permission_mode,
         disallowed_tools: launch.disallowed_tools,
         autocompact: launch.autocompact,
-    })))
+    }
+}
+
+/// Hold `key`'s reopen until no Codex pane is unidentified, and say so. What banto
+/// did on its own moves nothing on the stage: the line names the Worker and the
+/// pane it waits for, and that pane's tile is marked. (The operator pressing Enter
+/// on the empty tile is the one thing that brings the pane forward, in
+/// [`update_key`].)
+fn hold_relaunch(
+    state: &mut EmporiumState,
+    key: &SessionKey,
+    brigade_id: BrigadeId,
+    token: MemberToken,
+    shell_refused: bool,
+) {
+    state.held_relaunches.push(HeldRelaunch {
+        key: key.clone(),
+        brigade_id,
+        token,
+        shell_refused,
+    });
+    state.identification_refused = true;
+    state.identification_held = Some(key.clone());
+}
+
+/// Whether `ev` can change which panes the shell tracks for identification: a pane
+/// that ended (the shell drops its tracker, `update_event` in the shell) or one
+/// that was identified (the tracker is resolved and goes). Nothing else removes a
+/// tracker. A tick, a resize or a key press never does, so none of them is a reason
+/// to ask the shell the same question again.
+fn changes_shell_trackers(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::PtyExited { .. } | Event::PtyOutputLost { .. } | Event::DiscoveryResult { .. }
+    )
+}
+
+/// Make the reopens that were held, once nothing is unidentified: at the end of an
+/// update, after the loop that notes which opens leave a Codex pane unidentified,
+/// so a pane that this very update opens keeps them waiting. Each is checked
+/// again first, since the wait can be long: the key must have no screen and no open
+/// under way (or asked for by this update), the member must be the same one, and
+/// nobody may be ending it, the brigade or the program. One that fails the check is
+/// dropped, nothing else; a brigade staged again later opens its pane-less members
+/// as it always does. Which brigade is on the stage is not asked: a Worker of one
+/// that is not shown is reopened when nothing waits, so it is when something did.
+///
+/// A hold the shell refused ([`HeldRelaunch::shell_refused`]) stays where it is
+/// unless this event is one that can change the shell's trackers.
+fn release_held_relaunches(
+    state: &mut EmporiumState,
+    app: &App,
+    brigade: &BrigadeConfig,
+    emitted: &[Cmd],
+    tracker_event: bool,
+    now: Instant,
+) -> Vec<Cmd> {
+    let mut opens = Vec::new();
+    for held in std::mem::take(&mut state.held_relaunches) {
+        if held.shell_refused && !tracker_event {
+            state.held_relaunches.push(held);
+            continue;
+        }
+        let HeldRelaunch {
+            key,
+            brigade_id,
+            token,
+            ..
+        } = held;
+        let same_member = state.member_brigades.get(&key) == Some(&brigade_id)
+            && state.member_tokens.get(&key) == Some(&token);
+        let opened_meanwhile = state.screens.contains_key(&key)
+            || state.pending_opens.contains_key(&key)
+            || emitted
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { key: opened, .. } if *opened == key));
+        let ending = state.disbanding.contains(&brigade_id)
+            || state.closing.contains_key(&brigade_id)
+            || state.pending_dismiss.as_ref() == Some(&key)
+            || state
+                .pending_dismiss_member
+                .as_ref()
+                .is_some_and(|(brigade, member)| *brigade == brigade_id && *member == token)
+            || state.removing_exited.contains(&(brigade_id, token.clone()));
+        if app.should_quit() || !same_member || opened_meanwhile || ending {
+            continue;
+        }
+        let Some(row) = app.row_for_id(key.as_str()) else {
+            continue;
+        };
+        opens.push(relaunch_open(
+            state, row, brigade, &key, brigade_id, &token, now,
+        ));
+    }
+    opens
 }
 
 /// `D`: take the selected session back out of banto's archive. No confirm,
@@ -9588,6 +10241,7 @@ fn update_pty_exited(
     let leaving = unrequested_worker_exit(state, app, &key, banto_asked);
     let gave_up = match relaunch_member(state, app, brigade, &key, banto_asked, now) {
         Some(ExitHandling::Relaunch(cmd)) => return vec![*cmd],
+        Some(ExitHandling::Held) => return Vec::new(),
         Some(ExitHandling::GaveUp) => true,
         None => false,
     };
@@ -9762,6 +10416,12 @@ fn unrequested_worker_exit(
     if banto_asked || app.should_quit() || !state.screens.contains_key(key) {
         return None;
     }
+    departing_worker(state, key)
+}
+
+/// The rest of [`unrequested_worker_exit`]: that `key` is a Worker of a brigade
+/// that nobody is ending and whose removal nobody has asked for.
+fn departing_worker(state: &EmporiumState, key: &SessionKey) -> Option<(BrigadeId, MemberToken)> {
     let brigade_id = *state.member_brigades.get(key)?;
     let token = state.member_tokens.get(key)?.clone();
     if token == DIRECTOR_TOKEN
@@ -10090,10 +10750,9 @@ fn update_brigade_formed(
             .row_for_id(&director_row_id)
             .is_none_or(|row| row.agent == AgentKind::Codex)
     {
-        state.set_status(
-            "brigade saved; identify the new Codex pane before staging it".to_string(),
-            now,
-        );
+        // The brigade is saved and stays so, and the line starts by saying it.
+        state.refuse_for_unidentified_codex();
+        state.identification_saved_brigade = true;
         return Vec::new();
     }
     let director_key = SessionKey::from_id(&director_row_id);
@@ -10450,6 +11109,9 @@ fn forget_dismissed_member(state: &mut EmporiumState, brigade_id: BrigadeId, tok
         .interrupt_repairs
         .remove(&(brigade_id, token.to_string()));
     state.stated_names.remove(&(brigade_id, token.to_string()));
+    state
+        .held_relaunches
+        .retain(|held| !(held.brigade_id == brigade_id && held.token == token));
     if let Some(joined) = state.member_order.get_mut(&brigade_id) {
         joined.retain(|listed| listed != token);
     }
@@ -10500,12 +11162,22 @@ fn update_exited_worker_dismissed(
             app.set_directors(directors);
             forget_dismissed_member(state, brigade_id, &token);
             reload = released;
+            let failure = state.relaunch_failures.remove(&(brigade_id, token.clone()));
             if removed {
-                let again = if repeated { " again" } else { "" };
-                state.set_status(
-                    format!("{call} exited{again} \u{2014} removed from the brigade"),
-                    now,
-                );
+                if let Some(error) = failure {
+                    state.set_status(
+                        format!(
+                            "{call} could not be restarted ({error}) \u{2014} removed from the brigade"
+                        ),
+                        now,
+                    );
+                } else {
+                    let again = if repeated { " again" } else { "" };
+                    state.set_status(
+                        format!("{call} exited{again} \u{2014} removed from the brigade"),
+                        now,
+                    );
+                }
             }
         }
         Err(err) => state.set_status(
@@ -12456,6 +13128,9 @@ mod startup_notice_tests;
 
 #[cfg(test)]
 mod quiescence_tests;
+
+#[cfg(test)]
+mod unresolved_codex_tests;
 
 #[cfg(test)]
 mod one_pane_tests;
@@ -33070,6 +33745,81 @@ mod tests {
             "its screen is gone until the spawn lands"
         );
         assert!(state.status.unwrap().contains("restarting"));
+    }
+
+    /// The delayed Enter of a nudge is written to whatever process holds the
+    /// pane's key when it comes due. A Worker that exits on its own inside the
+    /// [`RELAY_SUBMIT_DELAY`] gap and is restarted under the same key must not
+    /// get the earlier process's Enter: the new process has been told nothing.
+    #[test]
+    fn a_delayed_enter_does_not_reach_the_process_that_replaced_its_pane() {
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = brigade_config();
+        let worker = SessionKey::from_id("w1");
+        let now = test_instant();
+        state.pending_submits.push(PendingSubmit {
+            key: worker.clone(),
+            nudged_at: now,
+        });
+
+        worker_exits(&mut state, &mut app, &brigade, now);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: worker.clone(),
+                agent: Some(AgentKind::ClaudeCode),
+            },
+            now + RELAY_SUBMIT_DELAY / 2,
+        );
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
+            now + RELAY_SUBMIT_DELAY,
+        );
+
+        assert!(
+            writes_of(&cmds).is_empty(),
+            "the new process gets no `\r`: {cmds:?}"
+        );
+        assert!(state.pending_submits.is_empty());
+    }
+
+    /// A Worker that is not coming back leaves no pane for the Enter either.
+    #[test]
+    fn a_delayed_enter_of_an_unstaged_pane_is_dropped() {
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = brigade_config();
+        let worker = SessionKey::from_id("w1");
+        let now = test_instant();
+        state.pending_submits.push(PendingSubmit {
+            key: worker.clone(),
+            nudged_at: now,
+        });
+        state.expected_exits.insert(worker.clone(), None);
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: worker.clone(),
+                reason: Some(PtyExitReason::Code(0)),
+            },
+            now,
+        );
+
+        assert!(
+            state.pending_submits.is_empty(),
+            "{:?}",
+            state.pending_submits.len()
+        );
     }
 
     #[test]

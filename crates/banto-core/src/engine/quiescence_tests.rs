@@ -713,13 +713,39 @@ fn a_session_that_took_input_is_named_by_the_input_not_by_what_the_sample_read()
 }
 
 #[test]
-fn a_pane_banto_typed_into_is_named_by_the_input_even_when_idle() {
+fn a_pane_banto_typed_into_is_named_nudged_even_when_idle() {
     let (mut state, mut app, a, b, at) = quit_fixture();
     sample(&mut state, &mut app, &[(&a, Idle), (&b, Idle)], at);
     state.last_prompted.insert(b.clone(), at);
     assert_eq!(
         asked(&mut state, &mut app, at).as_deref(),
-        Some("Esc again to quit \u{2014} 1 not idle: b (input)")
+        Some("Esc again to quit \u{2014} 1 not idle: b (nudged)")
+    );
+}
+
+#[test]
+fn the_operators_input_wins_over_banto_own_write_inside_the_same_window() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    app.replace_rows(vec![titled("a", "both"), titled("b", "banto only")]);
+    sample(&mut state, &mut app, &[(&a, Idle), (&b, Idle)], at);
+    state.last_prompted.insert(a.clone(), at);
+    state.last_given_input.insert(a.clone(), at);
+    state.last_prompted.insert(b.clone(), at);
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some("Esc again to quit \u{2014} 2 not idle: both (input), banto only (nudged)")
+    );
+
+    // An old operator key does not hide a fresh write of banto's: the window is
+    // read per record.
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    sample(&mut state, &mut app, &[(&a, Idle), (&b, Idle)], at);
+    let later = at + QUIT_RECENT_INPUT_WINDOW + SECOND;
+    state.last_given_input.insert(a.clone(), at);
+    state.last_prompted.insert(a.clone(), later);
+    assert_eq!(
+        asked(&mut state, &mut app, later).as_deref(),
+        Some("Esc again to quit \u{2014} 1 not idle: a (nudged)")
     );
 }
 
@@ -866,13 +892,15 @@ fn the_names_are_in_name_order_whichever_order_the_panes_were_hosted() {
 }
 
 #[test]
-fn the_names_are_in_order_of_diagnostic_value_unknown_then_input_then_busy_then_background() {
+fn the_names_are_in_order_of_diagnostic_value_unknown_input_nudged_busy_background() {
     let (mut state, mut app, a, b, at) = quit_fixture();
     let c = host_solo(&mut state, "c");
     let d = host_solo(&mut state, "d");
     let e = host_solo(&mut state, "e");
     let f = host_solo(&mut state, "f");
+    let g = host_solo(&mut state, "g");
     app.replace_rows(vec![
+        titled("g", "g-nudged"),
         titled("a", "a-busy"),
         titled("b", "b-unknown"),
         titled("c", "c-bg"),
@@ -890,17 +918,20 @@ fn the_names_are_in_order_of_diagnostic_value_unknown_then_input_then_busy_then_
             (&d, Idle),
             (&e, Unknown),
             (&f, NotIdle),
+            (&g, Idle),
         ],
         at,
     );
     state.last_given_input.insert(d.clone(), at);
+    state.last_prompted.insert(g.clone(), at);
     // Both counts first, so a clipped line still says how much is at stake; then
     // one list, the least explained first, by name inside a reason.
     assert_eq!(
         asked(&mut state, &mut app, at).as_deref(),
         Some(
-            "Esc again to quit \u{2014} 5 not idle, 1 in background: b-unknown (unknown), \
-             e-unknown (unknown), d-input (input), a-busy (busy), f-busy (busy), c-bg (bg)"
+            "Esc again to quit \u{2014} 6 not idle, 1 in background: b-unknown (unknown), \
+             e-unknown (unknown), d-input (input), g-nudged (nudged), a-busy (busy), \
+             f-busy (busy), c-bg (bg)"
         )
     );
 }
@@ -4728,7 +4759,7 @@ fn a_relay_nudge_just_typed_into_a_pane_counts_it() {
     assert!(!app.should_quit());
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 not idle: worker-1 (input)")
+        Some("Esc again to quit \u{2014} 1 not idle: worker-1 (nudged)")
     );
 }
 
@@ -5001,7 +5032,7 @@ fn the_retry_enter_of_a_kickoff_counts_the_pane_for_the_quit_question() {
     assert!(!app.should_quit());
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 not idle: goinkyo-re… (input)")
+        Some("Esc again to quit \u{2014} 1 not idle: goinkyo-re… (nudged)")
     );
 
     // After the window the sample alone decides again.
@@ -11120,4 +11151,145 @@ fn a_request_that_lands_while_its_brigade_is_being_closed_is_kept_and_makes_no_n
             "closing {closing}: nothing is spent for a brigade on its way out"
         );
     }
+}
+
+// --- the quit question's "input" reason with nothing typed by the operator ---------------
+//
+// From an operator report: the question named a pane "(input)" with nothing typed,
+// the warning went away by itself, and the same quit key a moment later quit at
+// once. banto's own writes are now named "(nudged)"; the operator's are "(input)".
+
+#[test]
+fn an_input_only_question_goes_when_the_stamp_is_three_seconds_old_not_when_its_own_window_is() {
+    // What makes the warning "disappear" and the retry quit: the reason is a
+    // stamp's age, not the question's age. The stamp is 3 s old at `at + 3 s`;
+    // the question was armed at `at + 1 s`, so its own window runs to `at + 4 s`.
+    let (mut state, mut app, _a, _b, at) = typing_fixture();
+    press(&mut state, &mut app, KeyCode::Char('x'), at);
+    back_to_the_list(&mut state, &mut app, at);
+    press(&mut state, &mut app, KeyCode::Esc, at + SECOND);
+    assert!(state.displayed_status().is_some());
+
+    tick(
+        &mut state,
+        &mut app,
+        at + QUIT_RECENT_INPUT_WINDOW - Duration::from_millis(1),
+    );
+    assert!(state.displayed_status().is_some(), "still inside");
+    tick(&mut state, &mut app, at + QUIT_RECENT_INPUT_WINDOW);
+    assert_eq!(
+        state.displayed_status(),
+        None,
+        "gone with its own window (until at + 4 s) still running"
+    );
+
+    press(
+        &mut state,
+        &mut app,
+        KeyCode::Esc,
+        at + QUIT_RECENT_INPUT_WINDOW,
+    );
+    assert!(app.should_quit(), "the retry counts nothing and quits");
+}
+
+#[test]
+fn keys_that_reach_a_child_as_nothing_still_stamp_the_operators_input() {
+    // `F1` and `F5`..`F12` encode to no bytes: the child is told nothing, yet
+    // the stamp the quit question reads is set (see `took_input_recently`).
+    for code in [KeyCode::F(1), KeyCode::F(5), KeyCode::F(12)] {
+        let (mut state, mut app, a, _b, at) = typing_fixture();
+        let cmds = press(&mut state, &mut app, code, at);
+        assert!(!typed_into(&cmds, &a), "{code:?}: wrote {cmds:?}");
+        assert!(state.last_given_input.contains_key(&a), "{code:?}");
+        back_to_the_list(&mut state, &mut app, at);
+        press(&mut state, &mut app, KeyCode::Esc, at + SECOND);
+        assert_eq!(
+            state.displayed_status(),
+            Some("Esc again to quit \u{2014} 1 not idle: a (input)"),
+            "{code:?}"
+        );
+    }
+}
+
+#[test]
+fn leaving_the_pane_does_not_stamp_input_by_any_route_the_operator_has() {
+    // Candidates that were read in the code and do not stamp: F2, the prefix
+    // chord with `s` / Esc / `o` / a number, and the terminal's own focus
+    // reports. (A mouse click is covered by
+    // `the_relay_and_the_quit_question_read_two_different_records_of_pointer_traffic`.)
+    let (mut state, mut app, a, _b, at) = typing_fixture();
+    let ctrl_b = |state: &mut EmporiumState, app: &mut App| {
+        press_with(state, app, KeyCode::Char('b'), Modifiers::CONTROL, at)
+    };
+
+    back_to_the_list(&mut state, &mut app, at);
+    state.focus = Focus::Pane;
+    for follow in [KeyCode::Char('s'), KeyCode::Esc, KeyCode::Char('o')] {
+        ctrl_b(&mut state, &mut app);
+        let cmds = press(&mut state, &mut app, follow, at);
+        assert!(!typed_into(&cmds, &a), "{follow:?}: {cmds:?}");
+        state.focus = Focus::Pane;
+    }
+    for focused in [false, true] {
+        send(
+            &mut state,
+            &mut app,
+            Event::WindowFocusChanged { focused },
+            at,
+        );
+    }
+    assert!(!state.last_given_input.contains_key(&a));
+    assert!(!state.last_prompted.contains_key(&a));
+    assert!(!state.took_input_recently(&a, at));
+}
+
+#[test]
+fn a_nudge_the_operator_never_typed_is_named_nudged_for_the_window_after_its_delayed_enter() {
+    // The only record of banto's own write is `last_prompted`: it is set at the
+    // nudge and again at the delayed Enter 300 ms later, so "(nudged)" is shown up
+    // to 3.3 s after the nudge, for a pane the operator never touched.
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    let mail = || vec![mail_for(1, DIRECTOR_TOKEN, &director)];
+    sample_with_relay(&mut state, &mut app, &[], mail(), at);
+    let nudged_at = at + SECOND;
+    let cmds = sample_with_relay(&mut state, &mut app, &[], mail(), nudged_at);
+    assert!(typed_into(&cmds, &director));
+    tick(&mut state, &mut app, nudged_at + RELAY_SUBMIT_DELAY);
+    assert!(!state.last_given_input.contains_key(&director));
+
+    let late = nudged_at + RELAY_SUBMIT_DELAY + QUIT_RECENT_INPUT_WINDOW;
+    // Both panes read idle, so the only reason left to ask is the stamp.
+    let idle = [(&director, Idle), (&worker, Idle)];
+    sample(&mut state, &mut app, &idle, late - Duration::from_millis(1));
+    press(
+        &mut state,
+        &mut app,
+        KeyCode::Esc,
+        late - Duration::from_millis(1),
+    );
+    assert!(!app.should_quit());
+    let asked = state.displayed_status().expect("it asked").to_string();
+    assert!(asked.contains("(nudged)"), "{asked}");
+    assert!(!asked.contains("(input)"), "{asked}");
+    assert!(
+        late - nudged_at > QUIT_RECENT_INPUT_WINDOW,
+        "asked more than three seconds after the nudge itself"
+    );
+}
+
+#[test]
+fn the_pane_log_facts_cannot_see_banto_own_writes_though_the_quit_question_counts_them() {
+    // `input_ago_ms` of a pane-log line comes from `last_given_input` alone. A
+    // pane counted for banto's own write has `input_ago_ms=none` there, which is
+    // how a log tells that the "(nudged)" was not the operator's.
+    let (mut state, app, a, _b, at) = typing_fixture();
+    state.last_prompted.insert(a.clone(), at);
+    assert!(state.took_input_recently(&a, at + SECOND));
+    assert_eq!(state.pane_facts(&app, &a, at + SECOND).input_ago_ms, None);
+
+    state.last_given_input.insert(a.clone(), at);
+    assert_eq!(
+        state.pane_facts(&app, &a, at + SECOND).input_ago_ms,
+        Some(1000)
+    );
 }

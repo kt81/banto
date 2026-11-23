@@ -2659,8 +2659,12 @@ fn a_codex_goinkyo_with_a_family_word_waits_for_the_catalog_and_opens_on_the_res
     ));
     assert!(state.pending_goinkyo_kickoffs.is_empty());
     assert!(state.codex_opens_awaiting_catalog.is_empty());
-    let status = state.status.as_deref().unwrap();
-    assert!(status.contains("terra → gpt-6.1-terra"), "{status}");
+    // Said as the Goinkyo's, not as a Worker's: the status is the only place the
+    // resolution shows.
+    assert_eq!(
+        state.status.as_deref(),
+        Some("codex goinkyo: terra → gpt-6.1-terra")
+    );
 }
 
 #[test]
