@@ -241,6 +241,38 @@ it triggers a dispatch.
   beat. Either way nothing has to be typed. Not measured: whether the first beat
   is at the same 10 s on a loaded machine.
 
+### With a `/model` or `/permissions` picker open (**measured**, 1 run each)
+
+An in-process pane resumed on a thread that had run turns, left idle for 14 s, then
+`/model` (and Enter) typed through the driver and left open, the cursor on the
+current model. `codex queue` was sent with nothing else typed.
+
+- **`/model`:** the queue was accepted, and the turn started 5.6 s later on the
+  first beat (the queue was made 24 s after the spawn, the turn started at the 30.2
+  s beat, which is the same 10.2 s grid as above). The picker stayed open and
+  unchanged: same list, cursor still on the current model, "enter select, esc
+  back". The queued message and its answer were printed into the transcript above
+  the picker. Watched for 32 s; the picker never closed or moved.
+- **`/permissions`:** the same. The turn started 1.0 s after the queue (it fell
+  on a beat), the picker stayed with its cursor on the current setting, and the
+  message and answer appeared above it.
+- **Nothing changed.** The turn context of the queued turns shows the same model,
+  effort and approval policy as the turns before (read from the rollout), the
+  pickers showed the same "(current)" entry, and `config.toml` is byte-identical
+  to its state before the run (hash compared). The queue's own turn is not a key
+  and does not pick anything.
+- **Esc afterwards:** closed each picker as it does without a queue and left the
+  idle input line, with no further turn and no row left in the queue database.
+  Nothing was selected, so what Enter does after a queued turn started was not
+  tried (it would change the setting).
+- Not measured: a picker opened while a turn is already running; a picker that is
+  open when the queued turn *finishes* a long turn; pickers other than these two
+  (for example a resume-session picker or a plugin list); a draft in the line
+  behind the picker; the daemon-connected pane; whether the queued turn's
+  approval prompts (a tool needing approval) would be answered by a key meant for
+  the picker. The last is the one that matters for a nudge that also types: it was
+  not tried, because the queued message ran no tool.
+
 **A directory with no git repository showed no folder-trust dialog** on a new
 session and on a resume (one run each, no trust section written), in line with
 Codex writing no trust key there.
@@ -352,7 +384,9 @@ The `codex` pane reports its state with OSC 7501. Times are from launch.
 - The queue with a dialog answered "Trust all" or "Review hooks"; the first beat
   on a loaded machine; the same cases with banto's own MCP server and hook in the
   pane.
-- Each of the second-round timings is 1-3 runs; none is a bound.
+- Each of the second-round timings is 1-3 runs; none is a bound. The picker runs
+  (a `/model` and a `/permissions` picker) are one each; see that section for what
+  they leave out.
 - A positional prompt with "Trust all and continue", with MCP servers in `-c` (the
   MCP trust dialog did not appear in a hooks-only configuration), with non-ASCII
   text, on Unix, beyond 20 KB, or through npm's real `.cmd` shim.
