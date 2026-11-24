@@ -290,6 +290,11 @@ const RELAY_NUDGE_LINE: &str =
 const RELAY_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 /// How long a transient status message shows before [`update_tick`] clears it.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How old an unread interrupt must be before the operator is told it sits unread
+/// while its Worker works, counted from when it was sent. The operator's choice,
+/// not a measured pause: long enough for a Worker to reach a tool call and be
+/// refused, short enough to stop it by hand before it has gone far.
+const UNREAD_INTERRUPT_NOTICE_AFTER_MS: i64 = 30_000;
 /// What a Codex resume refused for an unidentified pane carries as its error. Both
 /// refusals, the core's filter at the end of [`update`] and the shell's guard in
 /// `execute_open_embedded`, use it, so the pane log reads the same either way; what
@@ -668,9 +673,9 @@ pub struct BrigadeNameFacts {
     /// existed reads as "none".
     #[serde(default)]
     pub request: Option<RequestFact>,
-    /// The brigade's `interrupt_worker` requests no outcome is recorded for, as
-    /// the store held them when the tick read it, whether or not the Worker has
-    /// read the message. Per brigade, not per member observation: a Worker with no
+    /// The brigade's `interrupt_worker` requests the UI has not decided or their
+    /// Worker has not read, as the store held them when the tick read it, whether
+    /// or not the Worker has read the message of an undecided one. Per brigade, not per member observation: a Worker with no
     /// pane has no observation at all and still has to be answered (`no-pane`).
     /// `None` when the store could not be read this tick, which is not the same
     /// as nothing pending: an unreadable store must not make the run forget what
@@ -679,14 +684,20 @@ pub struct BrigadeNameFacts {
     /// stream recorded before interrupts existed.
     #[serde(default)]
     pub interrupts: Option<Vec<InterruptFact>>,
+    /// Every member of the brigade's roster, named or not, as the store held it
+    /// when the tick read it. What tells an interrupt that was read from one whose
+    /// Worker was dismissed, since both leave the list of unread ones. Empty in a
+    /// stream recorded before it existed, which reads as "nobody is on the roster".
+    #[serde(default)]
+    pub roster: Vec<MemberToken>,
 }
 
-/// One `interrupt_worker` request waiting for the UI's decision. Nothing the
-/// Director wrote travels here (the message is in the store; the notices quote
-/// its first line from the member's glance, as the nudge notice does). Its age is
-/// not here either: a request is decided whenever the UI first sees it, however
-/// old, because what the decision arms is a gate that ends when the Worker reads
-/// the message.
+/// One `interrupt_worker` request the UI has not decided or its Worker has not
+/// read. Nothing the Director wrote travels here (the message is in the store; the
+/// notices quote its first line from the member's glance, as the nudge notice
+/// does). A request is decided whenever the UI first sees it, however old, because
+/// what the decision arms is a gate that ends when the Worker reads the message;
+/// its age matters only to the notice that it sits unread.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterruptFact {
     /// The message row's id: the request's identity, and what an outcome is
@@ -695,6 +706,30 @@ pub struct InterruptFact {
     pub member: MemberToken,
     /// The Worker's read cursor is already past the message.
     pub read: bool,
+    /// The UI has not decided it (no word, or only the gate's). A row listed
+    /// only because it is unread has been, and is not decided again.
+    /// `#[serde(default = "yes")]`: a stream recorded before the notice listed
+    /// only undecided rows.
+    #[serde(default = "yes")]
+    pub undecided: bool,
+    /// The word the row carries, `None` for none and for one this build does not
+    /// know.
+    #[serde(default)]
+    pub word: Option<InterruptOutcome>,
+    /// How long ago the message was sent, as the clock of the process that read
+    /// it says, so that the core never reads a wall clock. Negative is clamped to
+    /// zero where it is used.
+    #[serde(default)]
+    pub age_ms: i64,
+    /// The first line of the interrupt's own message. What the notices quote:
+    /// the member's newest message is not necessarily this one, and the operator
+    /// decides on the line shown. Empty when the store had none.
+    #[serde(default)]
+    pub line: String,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// A Director's open request for a decision as the store holds it: the sequence
@@ -1341,6 +1376,16 @@ pub struct EmporiumState {
     /// (which leaves the request listed for good, and decided once). Forgotten when
     /// a tick that lists the brigade no longer lists the request.
     interrupt_decided: HashMap<i64, BrigadeId>,
+    /// Announces on the status line that an interrupt sits unread while its Worker
+    /// keeps working; see [`update_tick`].
+    unread_interrupt_reminder: StatusReminder,
+    /// The interrupts the unread notice has been shown for at least once, by
+    /// message id. What lets `read` be said for exactly those, once; an id leaves
+    /// when its row leaves a list that was read, whether or not it is said.
+    unread_interrupts_shown: HashMap<i64, ShownInterrupt>,
+    /// `relay: <who> read the interrupt` lines waiting for a free status
+    /// line, oldest first.
+    interrupt_read_notices: VecDeque<String>,
     /// See [`MemberFacts`]. Forgotten when the member is dismissed or the
     /// brigade disbanded, like the layout preferences; a pane exiting or
     /// being relaunched keeps it.
@@ -1937,6 +1982,9 @@ impl EmporiumState {
             relay_states: HashMap::new(),
             codex_wakes: HashMap::new(),
             interrupt_decided: HashMap::new(),
+            unread_interrupt_reminder: StatusReminder::default(),
+            unread_interrupts_shown: HashMap::new(),
+            interrupt_read_notices: VecDeque::new(),
             member_facts: HashMap::new(),
             persisted_layouts: HashMap::new(),
             brigade_names: HashMap::new(),
@@ -10713,6 +10761,7 @@ fn update_brigade_formed(
             member_names: Vec::new(),
             request: None,
             interrupts: None,
+            roster: Vec::new(),
         },
     );
     // A brigade formed in this run had no request when it was formed, so one that
@@ -11252,7 +11301,7 @@ fn decide_interrupts(
 ) -> Vec<Cmd> {
     let mut cmds = Vec::new();
     for (brigade_id, fact) in requests {
-        if state.interrupt_decided.contains_key(&fact.message_id) {
+        if !fact.undecided || state.interrupt_decided.contains_key(&fact.message_id) {
             continue;
         }
         let member = (brigade_id, fact.member.clone());
@@ -11265,15 +11314,11 @@ fn decide_interrupts(
                 relay_state.nudge = NudgeState::default();
             }
             let who = state.members_phrase(app, &[(Some(brigade_id), fact.member.clone())]);
-            let director = state.member_call(Some(brigade_id), DIRECTOR_TOKEN);
-            let prompt = interrupt_prompt(state, brigade_id, &member.1);
-            // "Sent", not "interrupted": nothing is interrupted until the gate has
+            let prompt = interrupt_prompt(state, brigade_id, &fact.line);
+            // "Got", not "was interrupted": nothing is interrupted until the gate has
             // refused a call, and a request seen again after a restart may be past
             // the point where it refuses anything.
-            state.set_status(
-                format!("relay: {director} sent {who} an interrupt{prompt}"),
-                now,
-            );
+            state.set_status(format!("relay: {who} got an interrupt{prompt}"), now);
         }
         state.interrupt_decided.insert(fact.message_id, brigade_id);
         cmds.push(Cmd::Store(StoreIntent::RecordInterruptOutcome {
@@ -11388,15 +11433,173 @@ impl InputVerdicts {
     }
 }
 
-/// ` ← director: first line` for an interrupt notice: the newest message the
-/// member was sent, which is the interrupt's unless another followed it.
-fn interrupt_prompt(state: &EmporiumState, brigade_id: BrigadeId, token: &str) -> String {
-    state
-        .member_facts
-        .get(&(brigade_id, token.to_string()))
-        .and_then(|facts| facts.inbound.as_ref())
-        .map(|inbound| nudge_prompt(state, brigade_id, inbound))
-        .unwrap_or_default()
+/// ` ← director: first line` for an interrupt notice, from the interrupt's own
+/// first line. Not the member's newest message, which a later ordinary message of
+/// the Director's would have replaced.
+fn interrupt_prompt(state: &EmporiumState, brigade_id: BrigadeId, line: &str) -> String {
+    let message = MessageGlance {
+        created_at_ms: 0,
+        line: line.to_string(),
+        from_token: Some(DIRECTOR_TOKEN.to_string()),
+    };
+    nudge_prompt(state, brigade_id, &message)
+}
+
+/// One unread interrupt whose Worker is working, old enough to be told about.
+struct UnreadInterrupt {
+    message_id: i64,
+    brigade_id: BrigadeId,
+    member: MemberToken,
+    age_ms: i64,
+    word: Option<InterruptOutcome>,
+    line: String,
+}
+
+/// What the unread notice remembers of an interrupt it has shown.
+#[derive(Debug, Clone)]
+struct ShownInterrupt {
+    brigade_id: BrigadeId,
+    member: MemberToken,
+    last_shown: Instant,
+}
+
+/// What this tick's lists say about unread interrupts: the ones that the notice
+/// applies to now, and, as a side effect, the `read` line owed for each one that
+/// was shown and has since been read.
+///
+/// An interrupt applies when its Worker's pane was observed this tick as not idle
+/// (`Some(false)`; an unknown reading says nothing) and the message is at least
+/// [`UNREAD_INTERRUPT_NOTICE_AFTER_MS`] old. Whatever its word: the word says
+/// what banto did for it, not whether the Worker is still going. A brigade whose
+/// list could not be read is not in `lists`, and nothing is ended for it.
+///
+/// A shown interrupt that left its list was read when its Worker is still on the
+/// roster; one whose Worker was dismissed is dropped without a word. Either way
+/// the id is forgotten.
+fn track_unread_interrupts(
+    state: &mut EmporiumState,
+    app: &App,
+    relay: &[RelayObservation],
+    lists: &[(BrigadeId, Vec<InterruptFact>, Vec<MemberToken>)],
+) -> Vec<UnreadInterrupt> {
+    let mut applies = Vec::new();
+    for (brigade_id, facts, roster) in lists {
+        let mut left: Vec<i64> = state
+            .unread_interrupts_shown
+            .iter()
+            .filter(|(id, shown)| {
+                shown.brigade_id == *brigade_id
+                    && !facts.iter().any(|f| f.message_id == **id && !f.read)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        left.sort_unstable();
+        for id in left {
+            let Some(shown) = state.unread_interrupts_shown.remove(&id) else {
+                continue;
+            };
+            if roster.contains(&shown.member) {
+                let who = state.members_phrase(app, &[(Some(*brigade_id), shown.member.clone())]);
+                state
+                    .interrupt_read_notices
+                    .push_back(format!("relay: {who} read the interrupt"));
+            }
+        }
+        for fact in facts {
+            let working = relay.iter().any(|obs| {
+                obs.brigade_id == *brigade_id
+                    && obs.token == fact.member
+                    && obs.is_idle_this_tick == Some(false)
+            });
+            if !fact.read && working && fact.age_ms >= UNREAD_INTERRUPT_NOTICE_AFTER_MS {
+                applies.push(UnreadInterrupt {
+                    message_id: fact.message_id,
+                    brigade_id: *brigade_id,
+                    member: fact.member.clone(),
+                    age_ms: fact.age_ms,
+                    word: fact.word,
+                    line: fact.line.clone(),
+                });
+            }
+        }
+    }
+    applies
+}
+
+/// `45s`, `2m`, `1h 5m`: the age as the notice tells it. Truncated, never rounded
+/// up, so it never claims a wait longer than the one measured.
+fn unread_age(ms: i64) -> String {
+    let seconds = ms.max(0) / 1000;
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        _ => match seconds % 3600 / 60 {
+            0 => format!("{}h", seconds / 3600),
+            minutes => format!("{}h {minutes}m", seconds / 3600),
+        },
+    }
+}
+
+/// The notice that an interrupt sits unread while its Worker works, as a status
+/// line: one interrupt per showing, a different one each time while several
+/// apply (the one never shown first, then the one shown longest ago, oldest
+/// message first among equals). The age is as of the tick that shows it, so it
+/// advances with every showing.
+///
+/// The tail says what is true of this word and claims nothing more: `armed` and
+/// no word say the Worker has called no tool, which holds because the gate would
+/// have refused one (and would have written `gated`); a pane that was not there
+/// when the request was decided says nothing about tools. No key is named: the
+/// operator's own keys are their business.
+fn say_unread_interrupt(
+    state: &mut EmporiumState,
+    app: &App,
+    applies: &[UnreadInterrupt],
+    now: Instant,
+) {
+    if !state
+        .unread_interrupt_reminder
+        .due(!applies.is_empty(), state.status.is_none(), now)
+    {
+        return;
+    }
+    let Some(pick) = applies.iter().min_by_key(|unread| {
+        let last_shown = state
+            .unread_interrupts_shown
+            .get(&unread.message_id)
+            .map(|shown| shown.last_shown);
+        (
+            last_shown,
+            std::cmp::Reverse(unread.age_ms),
+            unread.message_id,
+        )
+    }) else {
+        return;
+    };
+    use InterruptOutcome as Out;
+    let tail = match pick.word {
+        None | Some(Out::Armed) => ", no tool call since",
+        Some(Out::Gated) => ", a tool call was refused",
+        Some(Out::Capped) => ", went on past the refusals",
+        Some(Out::Codex) => ", a Codex turn cannot be interrupted",
+        Some(Out::RelayManual) => ", relay is manual",
+        Some(Out::NoPane | Out::Read) => "",
+    };
+    let who = state.members_phrase(app, &[(Some(pick.brigade_id), pick.member.clone())]);
+    let prompt = interrupt_prompt(state, pick.brigade_id, &pick.line);
+    let age = unread_age(pick.age_ms);
+    state.unread_interrupts_shown.insert(
+        pick.message_id,
+        ShownInterrupt {
+            brigade_id: pick.brigade_id,
+            member: pick.member.clone(),
+            last_shown: now,
+        },
+    );
+    state.set_status(
+        format!("relay: {who}: interrupt unread for {age}{tail}{prompt}"),
+        now,
+    );
 }
 
 fn update_tick(
@@ -11431,6 +11634,9 @@ fn update_tick(
     // read. A brigade the tick does not list keeps its last facts (a failed
     // gather reads nothing and must not blank every name).
     let mut interrupt_requests: Vec<(BrigadeId, InterruptFact)> = Vec::new();
+    // The lists that were read, for the unread notice: `None` is a list that could
+    // not be, which says nothing about any interrupt.
+    let mut interrupt_lists: Vec<(BrigadeId, Vec<InterruptFact>, Vec<MemberToken>)> = Vec::new();
     for mut facts in brigades {
         // The member names are the roster's truth as of this read: they replace
         // what events have stated for the brigade and are resolved as a roster
@@ -11447,6 +11653,10 @@ fn update_tick(
             state.interrupt_decided.retain(|id, owner| {
                 *owner != brigade_id || listed.iter().any(|f| f.message_id == *id)
             });
+        }
+        let roster = std::mem::take(&mut facts.roster);
+        if let Some(listed) = &interrupts {
+            interrupt_lists.push((brigade_id, listed.clone(), roster));
         }
         interrupt_requests.extend(
             interrupts
@@ -11529,6 +11739,10 @@ fn update_tick(
         interrupt_requests,
         now,
     ));
+
+    // Before the relay below consumes the observations, and whether or not the
+    // relay is on: what the unread interrupts say comes from what this tick saw.
+    let unread_interrupts = track_unread_interrupts(state, app, &relay, &interrupt_lists);
 
     // Before the relay below consumes the observations: a notice about a member
     // that was never briefed does not depend on the relay being on.
@@ -11673,6 +11887,11 @@ fn update_tick(
     // next one on this very tick; before the reminders below, which wait for a
     // free line, so a one-time notice is not queued behind a recurring one.
     show_next_startup_notice(state, now);
+    if state.status.is_none()
+        && let Some(notice) = state.interrupt_read_notices.pop_front()
+    {
+        state.set_status(notice, now);
+    }
 
     // After the expiry above, so a showing that just ran out can be followed
     // by the cycle's own gap rather than waiting out another tick.
@@ -11686,6 +11905,8 @@ fn update_tick(
             now,
         );
     }
+
+    say_unread_interrupt(state, app, &unread_interrupts, now);
 
     say_codex_holds(state, app, now);
 
@@ -24622,6 +24843,7 @@ mod tests {
             member_names: Vec::new(),
             request: None,
             interrupts: None,
+            roster: Vec::new(),
         }
     }
 

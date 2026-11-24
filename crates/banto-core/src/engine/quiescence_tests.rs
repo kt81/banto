@@ -36,6 +36,7 @@ fn listed(state: &EmporiumState) -> Vec<BrigadeNameFacts> {
             member_names: Vec::new(),
             request: stored_request(brigade_id),
             interrupts: None,
+            roster: Vec::new(),
         })
         .collect()
 }
@@ -3418,6 +3419,7 @@ fn a_brigade_nothing_hosts_yet_shows_its_stored_request_on_its_directors_row_wit
         member_names: Vec::new(),
         request: stored_request(9),
         interrupts: None,
+        roster: Vec::new(),
     };
     let cmds = send(
         &mut state,

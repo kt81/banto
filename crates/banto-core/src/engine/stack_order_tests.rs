@@ -206,6 +206,7 @@ impl Scene {
             member_names: self.names_of(brigade_id),
             request: None,
             interrupts: None,
+            roster: Vec::new(),
         };
         self.feed(Event::Tick {
             relay,

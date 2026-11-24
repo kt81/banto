@@ -221,6 +221,7 @@ fn a_stream_recorded_before_names_existed_still_parses() {
         member_names: vec![("worker-1".to_string(), "impl".to_string())],
         request: None,
         interrupts: None,
+        roster: Vec::new(),
     };
     let json = serde_json::to_string(&named).unwrap();
     assert_eq!(
@@ -471,6 +472,7 @@ fn tick_stating(scene: &mut Scene, named: &[(&str, &str)]) {
                 .collect(),
             request: None,
             interrupts: None,
+            roster: Vec::new(),
         }],
     });
 }
@@ -606,6 +608,7 @@ fn a_brigade_listed_with_no_names_clears_and_one_not_listed_keeps_what_it_had() 
             member_names: Vec::new(),
             request: None,
             interrupts: None,
+            roster: Vec::new(),
         }],
     });
     assert_eq!(shown(&scene, "worker-1").as_deref(), Some("impl"));

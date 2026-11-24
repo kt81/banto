@@ -42,8 +42,8 @@ use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
 /// pane).
 pub const REQUEST_OPEN: &str = "open";
 
-/// An `interrupt_worker` request no outcome has been recorded for, as the UI
-/// reads it each tick.
+/// An `interrupt_worker` request the UI has not decided or its Worker has not read,
+/// as the UI reads it each tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingInterrupt {
     /// The message row the request belongs to.
@@ -54,6 +54,16 @@ pub struct PendingInterrupt {
     /// message before the UI looked, which the cursor says whatever the screen
     /// does.
     pub read: bool,
+    /// The word the row carries: `None` for no word, and for one this build does
+    /// not know.
+    pub outcome: Option<InterruptOutcome>,
+    /// The UI has not decided this request: the row has no word, or only the
+    /// Worker's own `_mcp` has written one (`gated`, `capped`). A row with any
+    /// other word was decided, and is listed only because it is unread.
+    pub undecided: bool,
+    /// The first line of the interrupt's own message, which is what the operator is
+    /// shown of it: the member's newest message is not necessarily this one.
+    pub line: String,
 }
 
 /// The statement behind [`Store::pending_interrupts`], a function of its own so
@@ -62,15 +72,17 @@ pub struct PendingInterrupt {
 /// the inner select where the planner can match it.
 fn pending_interrupts_sql() -> String {
     format!(
-        "SELECT id, to_member, created_at_ms, read FROM (
+        "SELECT id, to_member, created_at_ms, read, word,
+                word IS NULL OR word IN ('{0}', '{1}'), line FROM (
              SELECT m.id AS id, m.to_member AS to_member, m.created_at_ms AS created_at_ms,
                     m.interrupt_outcome AS word,
+                    substr(m.body, 1, instr(m.body || char(10), char(10)) - 1) AS line,
                     m.id <= COALESCE((SELECT c.last_seen_id FROM brigade_cursors c
                                       WHERE c.brigade_id = m.brigade_id
                                         AND c.member_token = m.to_member), 0) AS read
              FROM brigade_messages m
              WHERE m.brigade_id = ?1 AND m.interrupt = 1 AND m.to_member IS NOT NULL)
-         WHERE word IS NULL OR (NOT read AND word IN ('{}', '{}'))
+         WHERE word IS NULL OR NOT read
          ORDER BY id",
         InterruptOutcome::Gated.as_token(),
         InterruptOutcome::Capped.as_token()
@@ -1266,13 +1278,15 @@ impl Store {
         Ok(Some(id))
     }
 
-    /// The brigade's interrupt requests the UI has not decided, oldest first: those
-    /// no outcome is recorded for, and those only the Worker's own `_mcp` has
-    /// written (`gated`, `capped`) and its Worker has not read. The gate can refuse
-    /// a call before the UI's first tick sees the request, and a row it got to
-    /// first is still the UI's to decide: the relay nudge state is reset and the
+    /// The brigade's interrupt requests the UI has not decided or their Worker has
+    /// not read, oldest first, with the word each carries. Two lists in one query,
+    /// told apart by the row: `undecided` (no word, or only the Worker's own `_mcp`
+    /// has written one, `gated` or `capped`) is what the UI still has to decide,
+    /// and not `read` is what the operator may need to hear about. The gate can
+    /// refuse a call before the UI's first tick sees the request, and a row it got
+    /// to first is still the UI's to decide: the relay nudge state is reset and the
     /// status line shown once per request, and the UI's own word goes over no word
-    /// only, so the gate's stays. A row with any other word was decided by the UI.
+    /// only, so the gate's stays.
     ///
     /// Rows with no word are not bounded by the read cursor, on purpose: a Worker
     /// can pull the message before the UI looks, and the request still has to be
@@ -1288,6 +1302,11 @@ impl Store {
                 member: row.get(1)?,
                 created_at_ms: row.get(2)?,
                 read: row.get(3)?,
+                outcome: row
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|token| InterruptOutcome::from_token(&token)),
+                undecided: row.get(5)?,
+                line: row.get::<_, String>(6)?.trim_end_matches('\r').to_string(),
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1746,6 +1765,7 @@ mod tests {
         assert_eq!(pending[0].member, worker);
         assert!(!pending[0].read);
         assert!(pending[0].created_at_ms > 0);
+        assert_eq!(pending[0].line, "m");
 
         // The Worker pulls before the UI looked: still listed (it has to be
         // answered), and now says so.
@@ -1770,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_the_gate_reached_first_is_still_pending_until_it_is_read() {
+    fn a_request_the_gate_reached_first_is_still_undecided_and_every_unread_one_is_listed() {
         let mut store = Store::open_in_memory().unwrap();
         let (br, worker) = with_a_worker(&mut store);
         let mut ids = Vec::new();
@@ -1787,19 +1807,66 @@ mod tests {
             assert!(store.record_interrupt_outcome(id, outcome).unwrap());
             ids.push(id);
         }
-        let pending: Vec<i64> = store
-            .pending_interrupts(br)
-            .unwrap()
-            .iter()
-            .map(|p| p.message_id)
-            .collect();
-        assert_eq!(pending, ids[..2], "the gate's words, not the UI's");
+        let listed = store.pending_interrupts(br).unwrap();
+        assert_eq!(
+            listed.iter().map(|p| p.message_id).collect::<Vec<_>>(),
+            ids,
+            "unread, whatever the word"
+        );
+        assert_eq!(
+            listed.iter().map(|p| p.undecided).collect::<Vec<_>>(),
+            [true, true, false, false],
+            "the gate's words are still the UI's to decide, the UI's are not"
+        );
+        assert_eq!(
+            listed.iter().map(|p| p.outcome).collect::<Vec<_>>(),
+            [
+                Some(InterruptOutcome::Gated),
+                Some(InterruptOutcome::Capped),
+                Some(InterruptOutcome::Armed),
+                Some(InterruptOutcome::NoPane)
+            ]
+        );
 
         // Read, they are the Worker's no longer.
         store
             .fetch_brigade_messages(br, &worker, BrigadeRole::Worker)
             .unwrap();
         assert!(store.pending_interrupts(br).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pending_interrupt_carries_the_first_line_of_its_own_message() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (br, worker) = with_a_worker(&mut store);
+        store
+            .enqueue_interrupt_message(
+                br,
+                "director",
+                &worker,
+                "stop the migration\r\nit drops a table",
+            )
+            .unwrap();
+        // A later ordinary message to the same Worker is not what is quoted.
+        store
+            .enqueue_brigade_message(
+                br,
+                "director",
+                BrigadeRole::Worker,
+                Some(&worker),
+                "carry on",
+            )
+            .unwrap();
+        store
+            .enqueue_interrupt_message(br, "director", &worker, "")
+            .unwrap();
+        let lines: Vec<String> = store
+            .pending_interrupts(br)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.line)
+            .collect();
+        assert_eq!(lines, ["stop the migration", ""]);
     }
 
     #[test]
@@ -1832,8 +1899,12 @@ mod tests {
             store.interrupt_state(id).unwrap(),
             InterruptState::Decided(Armed)
         );
-        // Taken: no longer listed for the UI to decide, whatever the cursor says.
-        assert!(store.pending_interrupts(br).unwrap().is_empty());
+        // Taken: nothing left for the UI to decide, but it is listed while unread,
+        // for the notice that it sits unread.
+        let listed = store.pending_interrupts(br).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].undecided);
+        assert_eq!(listed[0].outcome, Some(Armed));
         // A second first-decision does not overwrite the first, whatever it says.
         for again in [Read, Codex, RelayManual, NoPane, Armed] {
             assert!(

@@ -2136,15 +2136,15 @@ fn interrupt_result(who: &str, outcome: InterruptOutcome) -> String {
     match outcome {
         Armed => format!(
             "banto will refuse {who}'s next tool calls, up to {GATE_REFUSALS}, with a note to \
-             read its mail; the calls it refuses never run. A turn that calls no tool runs to \
-             its end and a call already running is not cut, so your message also waits as \
-             ordinary mail, and banto nudges {who} to read it once it is idle. brigade_status \
-             shows what followed for as long as the message is unread."
+             read your message now; the calls it refuses never run. A turn that calls no tool \
+             runs to its end and a call already running is not cut: if {who} calls no tool, \
+             banto nudges it to read the message once its turn ends. brigade_status shows \
+             what followed for as long as the message is unread."
         ),
         Gated => format!(
-            "banto has already refused a tool call of {who}'s, and it never ran. {who} has not \
-             read your message yet; it is queued as ordinary mail and banto nudges {who} to read \
-             it once it is idle."
+            "banto has already refused a tool call of {who}'s, and it never ran; the refusal \
+             tells {who} to read your message now. If it calls no tool, banto nudges it to read \
+             the message once its turn ends."
         ),
         Capped => format!(
             "banto refused {who}'s tool calls up to the cap of {GATE_REFUSALS} and then let them \
@@ -3652,6 +3652,30 @@ mod tests {
             "{armed}"
         );
         assert!(armed.contains("runs to its end"), "{armed}");
+        // The refusal is what makes the Worker read, not its going idle; the nudge is
+        // for a turn that calls no tool.
+        assert!(armed.contains("read your message now"), "{armed}");
+        assert!(armed.contains("once its turn ends"), "{armed}");
+        assert!(!armed.contains("idle"), "{armed}");
+        let gated = interrupt_result("worker-1", Gated);
+        assert!(
+            gated.contains("tells worker-1 to read your message now"),
+            "{gated}"
+        );
+        assert!(
+            gated.contains("If it calls no tool, banto nudges it"),
+            "{gated}"
+        );
+        assert!(gated.contains("once its turn ends"), "{gated}");
+        assert!(
+            !gated.contains("idle") && !gated.contains("ordinary mail"),
+            "{gated}"
+        );
+        // No gate, no refusal to rely on: those stay ordinary mail.
+        for outcome in [Codex, RelayManual, NoPane] {
+            let text = interrupt_result("worker-1", outcome);
+            assert!(text.contains("ordinary mail"), "{outcome:?}: {text}");
+        }
     }
 
     // --- the gate --------------------------------------------------------------------

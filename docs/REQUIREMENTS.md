@@ -4611,8 +4611,8 @@ mail, and a turn that calls no tool is never gated. The things the Esc needed ar
 with it: the 300 ms quiet time after a key, the Enter-only repair of a restored nudge line,
 and the reading of the input line for an interrupt.
 
-*What the operator sees.* The status line says on the tick that arms it: `relay: <director>
-sent <worker> an interrupt`, followed by the first line of the message reduced as the nudge
+*What the operator sees.* The status line says on the tick that arms it: `relay: <worker>
+got an interrupt`, followed by the first line of the message reduced as the nudge
 notice's is. It does not say the Worker is being refused: that is only true once the gate
 has refused a call, and a request seen again after a restart may be past the cap. Nothing is read
 from the pane for this, so no notice and no log line quotes a screen.
@@ -4645,9 +4645,39 @@ was sent ("not decided yet" until the UI writes one) and nothing once the messag
 the witness of delivery is the unread flag, never the input line. A request that stays
 unread stops refusing once the main agent has been refused the cap and its calls go through
 (`capped`); until then it keeps refusing. The Director sees it in `brigade_status` and can
-end it by sending the Worker something it reads. A notice to the
-operator for an interrupt that sits unread is decided but not built yet; it will come as a
-commit of its own.
+end it by sending the Worker something it reads.
+
+The operator is told when an interrupt sits unread while its Worker keeps working, as the
+cue to stop it by hand: each tick, for each unread interrupt whose member's hosted pane was
+observed not idle (an unknown reading says nothing, and an idle Worker has nothing to stop)
+and which was sent at least 30 s ago, the status line says so, whatever the word. Only the
+status line: no tile mark, no bell, nothing stored, and no key named. It is shown as any
+reminder is (5 s, again after 25 s of ordinary line, never over another message), one
+interrupt per showing, never-shown first and oldest first, with its age as of that showing
+and the first line of the message after `←`:
+
+- `relay: <who>: interrupt unread for <age><tail> ← <first line>`. `<who>` is the member
+  and its brigade (`worker-7 of "name"`), so the line identifies the brigade even off
+  stage. The Director is not named: only a Director sends interrupts.
+  `<age>` is `45s`, `2m` or `1h 5m`, truncated, never rounded up. The first line comes
+  last so that a line too long for the window loses only that. `<tail>` by word: `armed` or
+  no word `, no tool call since` ("no tool since" is what the gate being there amounts to: a
+  call would have been refused and the word would be `gated`); `gated` `, a tool call was
+  refused`; `capped` `, went on past the refusals`; `codex` `, a Codex turn cannot be
+  interrupted`; `relay-manual` `, relay is manual`; `no-pane` nothing, because that word
+  says nothing about tools. No line says what to do: the notice is the cue the operator
+  asked for.
+
+When it ends is when the condition does: the Worker reads it, goes idle, or loses its pane,
+and the showings stop. Once, for an interrupt that was shown at least once and then read
+while its member is still on the roster, the line is `relay: <who> read the
+interrupt`; nothing for one that was never shown or whose Worker was dismissed. The ids
+shown are kept in memory only, dropped when the row leaves a list that was read (a list that
+could not be read says nothing and ends nothing), and after a restart the age is still in
+the store, so the notice resumes by itself. The one query behind the UI's decision and this
+notice is `pending_interrupts`, which lists every unread request with its word and whether
+the UI still has to decide it. `brigade_status` says nothing of whether the operator was
+told: it reports the store's facts, and what was shown is not one.
 
 *Measured.* The gate is measured in `docs/notes/claude-wake-spike-2026-11-23.md` (Claude
 Code, 2026-11-23): an empty answer lets a call run and a deny object refuses it; a refused

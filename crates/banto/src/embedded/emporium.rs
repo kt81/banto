@@ -2667,7 +2667,8 @@ fn gather_relay_observations_from(
                 .filter_map(|member| Some((member.token.clone(), member.display_name.clone()?)))
                 .collect(),
             request,
-            interrupts: interrupt_facts(&store.borrow(), brigade.id),
+            interrupts: interrupt_facts(&store.borrow(), brigade.id, unix_ms(SystemTime::now())),
+            roster: members.iter().map(|member| member.token.clone()).collect(),
         });
         for member in members {
             let Some(session_id) = member.session_id.as_ref() else {
@@ -5158,10 +5159,11 @@ fn window_focus_event(raw: &crossterm::event::Event) -> Option<Event> {
     }
 }
 
-/// The brigade's `interrupt_worker` requests no outcome is recorded for. `None`
-/// when the store could not be read, which the core must tell apart from an empty
-/// list: nothing is decided on a tick that could not read and nothing already
-/// decided is forgotten, and the request is still there for the next.
+/// The brigade's `interrupt_worker` requests the UI has not decided or their Worker
+/// has not read. `None` when the store could not be read, which the core must tell
+/// apart from an empty list: nothing is decided or ended on a tick that could not
+/// read and nothing already decided is forgotten, and the request is still there
+/// for the next.
 ///
 /// `read` is as the store had it a moment ago. A Worker can pull the message
 /// between this read and the decision that follows; the decision is then `armed`
@@ -5170,6 +5172,7 @@ fn window_focus_event(raw: &crossterm::event::Event) -> Option<Event> {
 fn interrupt_facts(
     store: &Store,
     brigade_id: BrigadeId,
+    now_ms: i64,
 ) -> Option<Vec<banto_core::engine::InterruptFact>> {
     let Ok(pending) = store.pending_interrupts(brigade_id) else {
         return None;
@@ -5181,9 +5184,23 @@ fn interrupt_facts(
                 message_id: request.message_id,
                 member: request.member,
                 read: request.read,
+                undecided: request.undecided,
+                word: request.outcome,
+                // The store stamps the message with the same wall clock; a clock
+                // that has gone backwards makes an age of zero, not a negative one.
+                age_ms: (now_ms - request.created_at_ms).max(0),
+                line: request.line,
             })
             .collect(),
     )
+}
+
+/// Unix milliseconds, 0 for a clock before the epoch: what the store stamps
+/// messages in, so that a message's age is one subtraction.
+fn unix_ms(at: SystemTime) -> i64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// What the thread that runs `codex queue` finished since the last pass: events
@@ -7162,6 +7179,7 @@ mod tests {
                     member_names: vec![("worker-1".to_string(), name.to_string())],
                     request: None,
                     interrupts: None,
+                    roster: Vec::new(),
                 }],
             },
             now,
@@ -8648,6 +8666,7 @@ mod tests {
                 member_names: Vec::new(),
                 request: None,
                 interrupts: Some(Vec::new()),
+                roster: vec!["director".to_string(), "worker-1".to_string()],
             })
         );
         assert_eq!(
@@ -8659,6 +8678,7 @@ mod tests {
                 member_names: Vec::new(),
                 request: None,
                 interrupts: Some(Vec::new()),
+                roster: vec!["director".to_string()],
             })
         );
         assert_eq!(by_id(3).map(|f| f.director_session), Some(None));
@@ -8732,6 +8752,7 @@ mod tests {
                     member_names: Vec::new(),
                     request: open.then_some(banto_core::engine::RequestFact { seq: 1 }),
                     interrupts: None,
+                    roster: Vec::new(),
                 }],
             },
             now,
@@ -10932,22 +10953,32 @@ mod tests {
         store
             .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
             .unwrap();
-        assert!(interrupt_facts(&store, 1).unwrap().is_empty());
+        let now = unix_ms(SystemTime::now());
+        assert!(interrupt_facts(&store, 1, now).unwrap().is_empty());
         let id = store
             .enqueue_interrupt_message(1, "director", "worker-1", "m")
             .unwrap()
             .unwrap();
-        let facts = interrupt_facts(&store, 1).unwrap();
+        let facts = interrupt_facts(&store, 1, now).unwrap();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].message_id, id);
         assert_eq!(facts[0].member, "worker-1");
         assert!(!facts[0].read);
+        assert!(facts[0].undecided);
+        assert_eq!(facts[0].word, None);
+        // Its age is the clock it is read by minus the stamp the store gave it: a
+        // minute on, a minute old; a clock behind the stamp, zero.
+        assert!(
+            (59_000..=60_000)
+                .contains(&interrupt_facts(&store, 1, now + 60_000).unwrap()[0].age_ms)
+        );
+        assert_eq!(interrupt_facts(&store, 1, 0).unwrap()[0].age_ms, 0);
 
         store
             .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
             .unwrap();
         assert!(
-            interrupt_facts(&store, 1).unwrap()[0].read,
+            interrupt_facts(&store, 1, now).unwrap()[0].read,
             "pulled before anyone looked"
         );
 
@@ -10955,11 +10986,11 @@ mod tests {
             .record_interrupt_outcome(id, banto_core::model::InterruptOutcome::Read)
             .unwrap();
         assert!(
-            interrupt_facts(&store, 1).unwrap().is_empty(),
-            "decided: not listed again"
+            interrupt_facts(&store, 1, now).unwrap().is_empty(),
+            "decided and read: not listed again"
         );
         assert!(
-            interrupt_facts(&store, 2).unwrap().is_empty(),
+            interrupt_facts(&store, 2, now).unwrap().is_empty(),
             "another brigade's is not this one's"
         );
     }
@@ -17414,15 +17445,45 @@ mod tests {
             );
             id
         };
-        let facts = interrupt_facts(&rig.fixture.store.borrow(), rig.brigade_id).unwrap();
+        let facts = interrupt_facts(&rig.fixture.store.borrow(), rig.brigade_id, 0).unwrap();
         assert_eq!(
             facts,
             [banto_core::engine::InterruptFact {
                 message_id: id,
                 member: "worker-1".to_string(),
                 read: false,
+                undecided: true,
+                word: Some(banto_core::model::InterruptOutcome::Gated),
+                age_ms: 0,
+                line: "stop".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn an_interrupt_the_ui_decided_is_listed_while_unread_and_is_not_the_uis_to_decide() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .add_brigade_member(1, "director", BrigadeRole::Director, None)
+            .unwrap();
+        store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let id = store
+            .enqueue_interrupt_message(1, "director", "worker-1", "stop\nnow")
+            .unwrap()
+            .unwrap();
+        store
+            .record_interrupt_outcome(id, banto_core::model::InterruptOutcome::Armed)
+            .unwrap();
+        let facts = interrupt_facts(&store, 1, 0).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(!facts[0].undecided);
+        assert_eq!(
+            facts[0].word,
+            Some(banto_core::model::InterruptOutcome::Armed)
+        );
+        assert_eq!(facts[0].line, "stop");
     }
 
     /// What a launch hands the agent as its gate settings: the path after
