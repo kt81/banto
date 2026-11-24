@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use banto_core::config::Config;
+use banto_core::model::AgentKind;
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
 use banto_io::config as io_config;
@@ -95,6 +96,35 @@ impl Env {
                 .map(|home| absolute(home, cwd).join(dot_dir)),
         }
     }
+
+    /// The home an agent started in a pane settles on, from this environment
+    /// alone: the rule of [`Self::default_home`], except that the variable is
+    /// kept as written (see [`AgentHome::Variable`]).
+    fn agent_home(&self, variable: &str, dot_dir: &str, cwd: Option<&Path>) -> Option<AgentHome> {
+        let from_env = match variable {
+            "CLAUDE_CONFIG_DIR" => &self.claude_config_dir,
+            _ => &self.codex_home,
+        };
+        match from_env.as_deref().filter(|value| !value.is_empty()) {
+            Some(value) => Some(AgentHome::Variable(value.to_string())),
+            None => self
+                .home
+                .as_deref()
+                .map(|home| AgentHome::Default(absolute(home, cwd).join(dot_dir))),
+        }
+    }
+}
+
+/// Where an agent in a pane keeps its home. banto sets neither agent's variable
+/// and passes no flag, so the pane's agent has only these two to go by.
+#[derive(Debug, PartialEq, Eq)]
+enum AgentHome {
+    /// The product's variable as written. A relative one is not made absolute
+    /// here: banto would read it against its own working directory, and the
+    /// agent against the pane's, which is the session's and not banto's.
+    Variable(String),
+    /// `<home>/<dot dir>`, the platform default.
+    Default(PathBuf),
 }
 
 /// What a resolution starts from.
@@ -582,12 +612,104 @@ pub fn split_database_notice(
     })
 }
 
+/// One product's side of [`agent_home_notices`].
+struct HomeKind {
+    /// How the notice names the product.
+    label: &'static str,
+    /// The environment variable the product's own home follows.
+    variable: &'static str,
+    /// The directory under the user's home when the variable is not set.
+    dot_dir: &'static str,
+}
+
+const CLAUDE_HOME: HomeKind = HomeKind {
+    label: "Claude",
+    variable: "CLAUDE_CONFIG_DIR",
+    dot_dir: ".claude",
+};
+
+const CODEX_HOME: HomeKind = HomeKind {
+    label: "Codex",
+    variable: "CODEX_HOME",
+    dot_dir: ".codex",
+};
+
+/// The status-line notices for a home banto lists that is not the home the agent
+/// it opens will use: one per enabled product at most.
+///
+/// banto resolves a home as flag, then config key, then the variable, then the
+/// default; an agent in a pane is started from banto's environment and told none
+/// of that (`docs/REQUIREMENTS.md`: the agents' own variables are not banto's to
+/// set), so it has the variable or the default. They part when a flag or a config
+/// key names another place, and nothing fails until a pane opens: banto lists one
+/// home's sessions and resumes them in an agent reading another.
+///
+/// A relative variable is reported whatever it resolves to for banto, which makes
+/// it absolute against its own working directory ([`AgentHome::Variable`]).
+pub fn agent_home_notices(inputs: &Inputs, config: &Config, resolved: &Resolved) -> Vec<String> {
+    let enabled = banto_core::config::resolve_agents(&config.agents).enabled;
+    [
+        (AgentKind::ClaudeCode, CLAUDE_HOME, &resolved.claude_home),
+        (AgentKind::Codex, CODEX_HOME, &resolved.codex_home),
+    ]
+    .into_iter()
+    .filter(|(product, _, _)| enabled.contains(product))
+    .filter_map(|(_, kind, listed)| {
+        let listed = listed.as_deref()?;
+        let agent = inputs
+            .env
+            .agent_home(kind.variable, kind.dot_dir, inputs.cwd.as_deref())?;
+        agent_home_notice(&kind, listed, &agent)
+    })
+    .collect()
+}
+
+fn agent_home_notice(kind: &HomeKind, listed: &Path, agent: &AgentHome) -> Option<String> {
+    let HomeKind {
+        label, variable, ..
+    } = kind;
+    let (used, from) = match agent {
+        AgentHome::Variable(value) if !Path::new(value).is_absolute() => {
+            return Some(format!(
+                "{label} home: banto lists {label} sessions under {}, but {variable} is the \
+                 relative path {value}, which each pane's working directory can resolve differently",
+                listed.display()
+            ));
+        }
+        AgentHome::Variable(value) => (PathBuf::from(value), format!("from {variable}")),
+        AgentHome::Default(path) => (path.clone(), "the default".to_string()),
+    };
+    (!same_place(listed, &used)).then(|| {
+        format!(
+            "{label} home: banto lists {label} sessions under {}, but a {label} opened here \
+             uses {} ({from})",
+            listed.display(),
+            used.display()
+        )
+    })
+}
+
+/// Whether two paths are one directory: the same place by spelling once
+/// [`resolved_place`] has asked the filesystem, or the very same directory under
+/// two names (`banto_io::file_identity`). The two questions
+/// [`inside_an_agent_home`] asks, for equality rather than containment.
+fn same_place(a: &Path, b: &Path) -> bool {
+    let rules = Rules::of_this_platform();
+    let (place_a, place_b) = (resolved_place(a), resolved_place(b));
+    (is_within(&place_a, &place_b, rules) && is_within(&place_b, &place_a, rules))
+        || directory_identity(a)
+            .ok()
+            .zip(directory_identity(b).ok())
+            .is_some_and(|(one, other)| one == other)
+}
+
 /// What startup has to say to the operator before the first frame, in the order
 /// the status line carries it: the database that is not where the data directory
-/// is ([`split_database_notice`]), then `instance_notice` (`single_instance`'s,
-/// about the check for another banto on the database), then the config's legacy
-/// `[brigade]` keys. Pulled out of `main` so that a notice dropped from the line
-/// is a failing test.
+/// is ([`split_database_notice`]), the homes banto lists that an agent opened in
+/// a pane will not use ([`agent_home_notices`]), then `instance_notice`
+/// (`single_instance`'s, about the check for another banto on the database), then
+/// the config's legacy `[brigade]` keys. Pulled out of `main` so that a notice
+/// dropped from the line is a failing test.
 pub fn boot_notices(
     inputs: &Inputs,
     config: &Config,
@@ -596,6 +718,7 @@ pub fn boot_notices(
 ) -> Vec<String> {
     split_database_notice(inputs, config, resolved)
         .into_iter()
+        .chain(agent_home_notices(inputs, config, resolved))
         .chain(instance_notice)
         .chain(config.brigade.legacy_key_notice())
         .collect()
@@ -846,6 +969,8 @@ fn resolve_config(inputs: &Inputs, strictness: Strictness) -> Result<(Config, Co
     })
 }
 
+#[cfg(test)]
+mod agent_home_tests;
 #[cfg(test)]
 mod agreement_tests;
 

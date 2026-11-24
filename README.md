@@ -423,6 +423,8 @@ goinkyo_effort = ""              # a Codex Goinkyo's -c model_reasoning_effort; 
 prefix = "C-b"      # pane prefix chord
 ```
 
+`--claude-home`/`--codex-home` and the `claude_home`/`codex_home` keys change which home banto lists and resumes from. They do not change what the agent in a pane reads, because banto never sets `CLAUDE_CONFIG_DIR` or `CODEX_HOME`: that agent uses the variable, or `~/.claude` / `~/.codex`. When the two differ, or the variable is a relative path, banto says so once at startup on the status line, naming both locations.
+
 ## Further reading
 
 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) holds the design and requirements,

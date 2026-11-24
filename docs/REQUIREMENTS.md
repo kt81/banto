@@ -3806,7 +3806,16 @@ one exception: every Claude Code pane (not a Codex one) also gets
 `CLAUDE_CODE_NATIVE_CURSOR=1`, which fixes how Claude draws its caret so that the
 input line stays readable (the relay draft guard's account of reading the input
 line has why). `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the like are never touched —
-where an agent keeps its home is not banto's to decide. A member that is already running keeps
+where an agent keeps its home is not banto's to decide. The cost is that a home
+banto lists by `--claude-home`/`--codex-home` or the config's `claude_home`/`codex_home`
+can differ from the one the agent in a pane reads, which is only its variable or its
+default, and nothing fails until a session is opened. So the UI says so once at startup
+(`startup::agent_home_notices`, carried by `boot_notices` after the split-database
+notice): per enabled product, when the home banto resolved is not the home the
+environment alone gives (the same directory under two spellings is not a difference),
+it names both. A relative variable is always reported, since banto makes it absolute
+against its own working directory and the agent reads it in the pane's. It is a notice,
+not a refusal and not a change to the environment. A member that is already running keeps
 the server it was launched with; the next time its pane is opened (re-staging the
 brigade, a relaunch, a new member) the MCP config file is rewritten and the
 launch argv rebuilt with the hand-off.

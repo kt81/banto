@@ -258,6 +258,8 @@ goinkyo_effort = ""              # Codex の Goinkyo の -c model_reasoning_effo
 prefix = "C-b"      # ペインのプレフィックスのキー
 ```
 
+`--claude-home` と `--codex-home`、および設定の `claude_home` と `codex_home` は、banto が一覧にして再開するホームを変えます。ペインの中のエージェントが読むホームは変えません。banto は `CLAUDE_CONFIG_DIR` と `CODEX_HOME` を設定しないので、そのエージェントは環境変数か、`~/.claude` / `~/.codex` を使います。両者が違うとき、または環境変数が相対パスのときは、banto が起動時にステータスラインで一度だけ、両方の場所を挙げて知らせます。
+
 ## 参考資料
 
 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) に設計と要件、[docs/DISCIPLINE.md](docs/DISCIPLINE.md) にアーキテクチャの規律（純粋なコアと、端に寄せた I/O）、[docs/notes/](docs/notes/) に実機での検証ノートがあります。[tools/measure/](tools/measure/README.md) には、エージェントのチームがどれだけ使い、その変更がレビューでどうなるかを測る Python スクリプトがあります（ビルドには含まれません）。
