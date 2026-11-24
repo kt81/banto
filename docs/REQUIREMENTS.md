@@ -1502,7 +1502,8 @@ dismissal's transaction copies the title before it deletes the row ("Ending a
 consultation"). v21 added `brigade_messages.interrupt` (INTEGER NOT NULL DEFAULT 0;
 a Director's `interrupt_worker` request, 0 for every message before v21) and
 `brigade_messages.interrupt_outcome` (nullable TEXT; NULL until the UI decides, and
-non-NULL also means taken; "Interrupting a Worker's turn" under "Auto-relay"), with a
+non-NULL also means taken; the Worker's `_mcp` later writes over it what its gate
+did; "Interrupting a Worker's turn" under "Auto-relay"), with a
 partial index on the undecided requests, which the UI looks up every tick. v18 added
 `brigade_members.joined_after_id`, the highest message id that existed when the
 member joined (0 for a member that joined before v18, which means no bound; it lives
@@ -1618,8 +1619,7 @@ or a solo pane's own process now reports another session id; `held_by_row=yes|no
 `WorkerDismissed`, `ExitedWorkerDismissed`, `Disbanded`; and the Cmds `OpenEmbedded`
 (with `replaced=yes` when it displaced a live handle under its key), `OpenCodexTrustPane`
 (the same, with `pid`), `HangUpPty`, `KillPty` and
-`RekeyPty` (with `handle=yes|no`), `InterruptPty` (with `key=` and `handle=`; the
-interrupt Esc, see "Interrupting a Worker's turn"), and the store intents that set,
+`RekeyPty` (with `handle=yes|no`), and the store intents that set,
 clear or remove a member's session or row, or record an interrupt's outcome
 (`Store intent=RecordInterruptOutcome`, with `outcome=`, and `why=` only on the folded
 outcomes). Every Cmd line carries `by=<the Event that produced it>`.
@@ -3651,7 +3651,8 @@ its Workers via `send_to_peer` and keep genuinely sequential work itself, that i
 can name a Worker with `name_member` when it gives it a standing role, to send a Worker
 only work, a correction to work in flight, and a stop whenever its work may still be
 running (since 2026-11-22 with the clause that, for a Claude Worker, `interrupt_worker`
-delivers such a correction or stop at once instead of after the turn), and (since
+has banto refuse its next tool calls until it reads such a correction or stop;
+reworded when the Esc was dropped), and (since
 2026-11-15) three points about reaching the operator: banto itself tells him when
 the brigade has gone quiet, so do not announce completion; when he alone can decide
 and work stops on it, write the question in your own output and then call
@@ -4099,7 +4100,7 @@ eight tools. `send_to_peer` and `check_messages`, and no other, carry
 them: in the 2026-11-22 demo the Claude Workers never loaded either, called
 `check_messages {}` blind, and never read its description. `send_to_peer` is every
 member's first real call and the `message` misnaming came from members without its
-schema; `check_messages` carries the interrupted-turn sentence. Measured on Claude
+schema; `check_messages` carries the sentence about an interrupt. Measured on Claude
 Code 2.1.330 (Windows, 2026-11-22, from the transcripts): a session created after the
 change sent both tools with no `defer_loading` key and called `send_to_peer` with
 `text` on its first try, without ToolSearch; four sessions started before it and
@@ -4192,8 +4193,10 @@ same `tools/list`:
   `request_attention` is on or off; a second call while one is open is a new
   request. See "Decision (2026-11-15)".
 - `interrupt_worker(member, text)` — Director-only (by the store's live membership,
-  checked again in the write's transaction): stops a Claude Worker's running turn
-  and delivers `text` to it as an ordinary message. Both arguments are required;
+  checked again in the write's transaction): delivers `text` to a Worker as an
+  ordinary message and, for a Claude Worker whose relay is on, has banto refuse that
+  Worker's next tool calls (up to 3) until it reads it. It cannot stop a turn: see
+  "Interrupting a Worker's turn" under "Auto-relay". Both arguments are required;
   `member` is one Worker token of the caller's own brigade (no broadcast; the
   Goinkyo and the Director are refused). A wrong type is an error and an unknown key
   is refused, because the server otherwise reads arguments by name and ignores keys it
@@ -4202,8 +4205,12 @@ same `tools/list`:
   reason as in `send_to_peer`, and an error about it names `text`. The result says
   what banto decided, waiting up to about 2 s for it, or that the request is queued
   and `brigade_status` shows what followed, or that the member is gone. The tool's
-  description carries the price (below). See "Interrupting a Worker's turn" under
+  description says what it does not do (below). See "Interrupting a Worker's turn" under
   "Auto-relay".
+- `interrupt_gate(tool_name, agent_id)` — not for a model: the answer to the
+  `PreToolUse` hook of a Claude Worker whose relay is on, from the Worker's own
+  `_mcp` (below). It is listed in `tools/list`, since the hook can only call a tool
+  the server lists, and a Codex briefing does not name it.
 
 What the other tools show of a name, looked up live on every call and never
 cached in the server process (so a rename is visible to the very next call):
@@ -4218,9 +4225,9 @@ banto is the sole writer to a child's stdin, injecting a peer's message there wo
 forge operator input mid-turn; a tool result respects turn boundaries and carries
 the firewall framing for free (`crates/banto/src/mcp.rs` module doc). What banto
 does type into an idle member's stdin is the fixed nudge line under "Auto-relay"
-below, and that starts a turn, so a message can cost its recipient a turn. The one
-thing it writes into a *busy* member's pane is the Esc of `interrupt_worker`: a key,
-not a message, and the message itself still travels by pull.
+below, and that starts a turn, so a message can cost its recipient a turn. It writes
+nothing into a *busy* member's pane: `interrupt_worker` refuses the Worker's tool
+calls from a hook instead, and the message itself still travels by pull.
 
 **Verified end to end against real Claude Code** (`docs/notes/mcp-spike.md`,
 2026-07-23, follow-up 2026-07-25): `claude --strict-mcp-config --mcp-config
@@ -4270,9 +4277,8 @@ and the idle reading would be from before the line. A delayed Enter still queued
 when its pane exits and is opened again (a relaunch), or is taken off the stage, is
 dropped, not written to what comes next: the pane's queue goes with its key.
 Everything above is about a
-member that is idle; the one key banto writes into a busy pane, the Director's
-interrupt, and the Enter-only form of the nudge it brings, are under "Interrupting
-a Worker's turn" at the end of this section.
+member that is idle; what the Director's interrupt does to a busy one is under
+"Interrupting a Worker's turn" at the end of this section.
 
 A time window cannot protect a draft, so the operator's unsent text is
 tracked as a fact instead (`EmporiumState::has_unsent_operator_input`): a
@@ -4387,9 +4393,7 @@ by then the line holds banto's own
 nudge sentence. A Claude pane that stays idle yet `Unrecognized` for
 `INPUT_LINE_UNREADABLE_AFTER` (60s) is reported once on the status line, since
 Claude's layout can change without notice and a reader that stopped recognising it
-would look like one that works; waiting (a permission dialog) is not counted. The
-same reading lets the Enter-only repair (below) tell a line holding exactly the
-nudge sentence from the operator's own text.
+would look like one that works; waiting (a permission dialog) is not counted.
 
 *Incident (2026-11-15): a renamed session's label in its input-box border.* The
 operator kept seeing `relay: cannot read the input line of director of "<brigade>" —
@@ -4497,222 +4501,164 @@ never reaches a new process.
 off (`Manual`) for an operator who would rather prompt `check_messages`
 themselves.
 
-**Interrupting a Worker's turn — `interrupt_worker` (settled 2026-11-22).** A message is
-pulled with `check_messages`, which a Worker calls only when its current turn ends, so a
-task the Director had cancelled, or one the operator's new information changed, ran to
-its end and cost tokens and time. The operator's rulings: the Director does the
-stopping, as an MCP tool; he stops a Worker himself with Ctrl+C in its pane; and banto
-adds no mechanism to keep his input out of this. The shape was then settled in a Goinkyo
-design consultation and against measurements on this machine (below). The tool is
-listed under "MCP mediation server". What it does: stops the Worker's running turn with
-one Esc written into its pane and delivers `text` as an ordinary message, pulled and
-framed like any other; the text never goes through the pane. It does this for a hosted
-Claude Worker only. **A Codex Worker receives the message as an ordinary one and is not
-interrupted yet** (outcome `codex`; its mid-turn behaviour is unmeasured, see the end).
+**Interrupting a Worker's turn — `interrupt_worker` (the gate replaced the Esc 2026-11-24).** A
+message is pulled with `check_messages`, which a Worker calls only when its current turn
+ends, so a task the Director had cancelled, or one the operator's new information changed,
+ran to its end and cost tokens and time. The operator's rulings: the Director does the
+stopping, as an MCP tool; he stops a Worker himself with Ctrl+C in its pane; banto adds no
+mechanism to keep his input out of this; and banto types no keystroke into a pane for it.
+banto first pressed Esc into the pane (settled 2026-11-22). It was removed because a typed
+key is operator input forged on the operator's behalf (DISCIPLINE §3) and the cut call read
+in the Worker's transcript as refused by the user. What replaced it is a refusal of the
+Worker's next tool calls by a Claude Code `PreToolUse` hook (measured in
+`docs/notes/claude-wake-spike-2026-11-23.md`). The tool is listed under "MCP mediation
+server". It delivers `text` as an ordinary message, pulled and framed like any other; the
+text never goes through the pane.
 
-*The price, which the tool's description states.* The cut tool call is left where it
-stands, and in the Worker's own transcript it reads as refused by the user (see the
-measurements); only the header of banto's message says otherwise. If the stop is the
+*What it can and cannot do.* It cannot stop a turn. A turn that calls no tool runs to its
+end, and a call already running is not cut. What it does is refuse the Worker's *next*
+tool calls: each is answered with a note to read its mail, and the refused call never
+runs. The tool's description says all of this, so the Director weighs it before using it:
+use it when the next steps of a turn cost more than refusing them. If the stop is the
 operator's wish, the Director's text should say so: the inbox framing ranks text relayed
 by another AI below a direct prompt.
+
+*The gate.* One file per hosted Claude Worker whose relay is on (`gated_member` in
+`crates/banto/src/embedded/emporium.rs`), written at every launch beside its MCP config
+under the same name family (`<brigade>-<token>.settings.json`, swept with the member), and
+passed as `--settings` before `--mcp-config`. It holds one `PreToolUse` hook, with no
+matcher so that it sees every tool and a subagent's calls too. The hook is of type
+`mcp_tool`: it calls `interrupt_gate` of the server named `banto`, which is the Worker's
+own `_mcp`, with `tool_name` and `agent_id` (empty for the main agent, set for a
+subagent); it is listed in `tools/list` like any tool of the server, and its description says
+it is not for a model to call, so none does. The Director, the Goinkyo, a Codex
+member and a Worker under a manual relay get no file, so no hook that could slow or fail
+them. The hook has a short timeout, because its default is ten minutes and one wedged
+`_mcp` would hold every call of a Worker for that long; every failure of the gate (an
+error, a timeout, a server that has exited) lets the call through. It sets no
+`onFailure: block`, and no tool is disabled, so a broken gate can never stop a Worker.
+
+*What the gate decides* (`gate_decision` in `crates/banto/src/mcp.rs`; each rule is pinned
+by a test), in this order:
+1. A caller that is not a Worker of its brigade is let through.
+2. With no unread interrupt for this Worker, everything is let through and every count is
+   forgotten, except a subagent's `check_messages`, which is refused (with or without an
+   unread interrupt): the mail is the main agent's, and a subagent that pulled it would
+   advance the cursor and leave its parent nothing to read. A newer unread interrupt than
+   the one being watched starts every count again.
+3. With one unread, a subagent's `check_messages` is refused with the subagent's reason,
+   outside the count: it uses up none of that subagent's refusals and writes no word,
+   before and after the cap opens.
+4. banto's own tools (`mcp__banto__*`) are always let through: reading the mail is how
+   the refusals end, and nothing else is on an allowlist.
+5. Any other call is refused until it has been refused 3 times for that `agent_id`; the
+   cap is the same for the main agent and for a subagent, and a hand-back
+   (`SubagentHandback`) or a tool search counts like any call. After that the agent's calls
+   go through. 3 is what was measured: a Worker that has to search for a deferred
+   `check_messages` spends one refusal on the search.
+A failure to read the store lets every call through, a subagent's `check_messages` too.
+The counts live in the memory of the Worker's `_mcp` and nowhere else. A restarted `_mcp`
+forgets them, at worst three more refusals, and never a wrong one. Reading the message is
+what ends the refusals at once, whatever the counts say.
 
 *Storage.* The message and the interrupt request are written in one transaction: the
 request is a property of the message row, which needed schema migration v21 on
 `brigade_messages`: `interrupt` (INTEGER NOT NULL DEFAULT 0) is the request, and
-`interrupt_outcome` (TEXT) stays NULL until the UI decides; a non-NULL value also means
-the request is taken. It is filled in only by the UI process, because the `_mcp` process
-cannot know the screen, the unsent mark or what was written (the rule `request_decision`
-already states). The outcome tokens below are stored as text and printed by the tool in
-the same words. The
-tool waits up to about 2 s for the decision; without one it answers "queued, not
+`interrupt_outcome` (TEXT) stays NULL until a decision is written; a non-NULL value also
+means the request is taken. Two processes write it, and the table of which word may be
+written over which is one `match` on the enum (`InterruptOutcome::replaceable`, pinned by a
+test). The UI decides first, over NULL only (and it still decides a request the gate wrote
+first: the tick lists the rows with no word, and those with only `gated` or `capped`
+that are unread, once per request), with `read`, `no-pane`, `relay-manual`,
+`codex` or `armed`; it can see what is hosted and the configuration, which the Worker's
+`_mcp` cannot. The Worker's `_mcp` writes `gated` (over NULL or `armed`, at a refusal) and
+`capped` (over NULL, `armed` or `gated`, when the cap lets the *main agent's* call
+through; a subagent that reaches the cap leaves the word at `gated`, because the Worker
+itself has not been let through). The gate never reads the word. A row an older banto wrote
+(`pressed`, `stopped` and the like) reads as no word; no row was migrated. The tool
+waits up to about 2 s for the UI's first decision; without one it answers "queued, not
 decided yet; `brigade_status` shows what followed", and if the row is gone because the
 member was dismissed, or its brigade disbanded, meanwhile it says the member is gone.
 
-*When banto decides.* In the UI process, once, on the first tick that sees the request,
-and never again. A request already older than `INTERRUPT_STALE_AFTER` (10 s) when first
-seen is `expired` (a banto restart is the case this covers). Writing the outcome is what
-marks the request taken (`interrupt_outcome` is no longer NULL), and the gather reports
-untaken requests whatever the member's read cursor says, because a Worker can pull the
-message before the UI looks. One tick writes at most
-one Esc to a pane, even with two requests for it. A tick on which the store cannot be
-read decides nothing and forgets nothing it decided before (the failed write may have
-been the outcome's, and the request would then be read again, undecided, and pressed
-a second time); only a successful read that lists a request no longer is what lets
-banto forget it.
-
-*When banto presses, and when it does not.* It presses only when the target is a hosted
-Claude Worker whose live file says **`busy` in its own words**. That needs a reader of
-its own: the shared activity reading counts `shell` (the turn ended with a background
-command still running) as busy, and "not idle this tick" includes `waiting`. It does
-**not** hold the Esc for an unsent draft in the pane, and it asks nothing about whether
-the operator has touched the pane (he ruled that out); an Esc leaves a draft untouched
-(measured), and the draft fence goes on holding the *nudge*, as it always did. Neither
-the Esc nor the Enter-only carriage return below touches the operator's unsent-draft
-mark; it ends exactly as it did before (see above). The outcome, written once:
-- `pressed` — one Esc was written.
-- `not-mid-turn` — there is no running turn to stop: the pane is idle (`idle`), or its
-  turn ended with a background command (`background-command`), or a line banto itself
-  typed is just going in (`own-line`; the relay already declines to act across its own
-  write).
-- `waiting` — the pane shows a prompt only the operator can answer.
+*When banto decides.* In the UI process, once, on the first tick that sees the request.
+Writing the word marks the request taken, and the gather reports untaken requests
+whatever the member's read cursor says, because a Worker can pull the message before the
+UI looks. A tick on which the store cannot be read decides nothing and forgets nothing it
+decided before. The same tick resets the member's nudge cooldown and attempts, so that the
+nudge which delivers the message is not held back by the 60 s cooldown. The first rule
+that applies decides (`judge_interrupt` in `crates/banto-core/src/engine.rs`; the order is
+pinned by a test):
 - `read` — the Worker had already read the message.
-- `codex` — see above.
-- `relay-manual` — the relay is `manual`, so banto writes nothing into panes by itself;
-  the message is delivered when the Worker next pulls.
-- `no-pane` — no hosted pane that can be pressed: its brigade is closing (`closing`), no
-  pane is hosted for the member (`not-running`), a hang-up is already queued for the pane
-  (`ending`), or the pane is not ready to be judged (`starting`: an open pane with no
-  session id yet, a product not resolved yet, or a Claude pane with a session id but no
-  live file yet).
-- `expired` — see above.
+- `no-pane` — no hosted pane to arm: its brigade is closing (`closing`), no pane is
+  hosted for the member (`not-running`), a hang-up is already queued (`ending`), or the
+  pane is not ready to be judged (`starting`: an open pane with no session id yet, or a
+  product not resolved yet). A pane that is still starting may well carry the hook, so the
+  gate can refuse a call while the word says `no-pane`: the word is the UI's judgement at
+  one moment, never the gate's input.
+- `relay-manual` — the relay is `manual`, so the Worker has no gate; the message is
+  delivered when it next pulls.
+- `codex` — a Codex Worker has no gate; the message is ordinary mail.
+- `armed` — a hosted Claude Worker with the relay on: its next tool calls are refused.
+  It is a promise made at launch, not something observed: if the operator's settings
+  disable hooks (`disableAllHooks`, say), the gate refuses nothing and nothing says so.
+  Unmeasured.
+The reason of a `no-pane` goes on the pane-log line of the outcome's store intent (`why=`)
+as that one fixed word, never into the column.
 
-`not-mid-turn` and `no-pane` each fold several reasons (the words in parentheses). The
-reason goes on the pane-log line of the outcome's store intent (`why=`; the refinement
-after a press has none) as that one fixed word, never into the column. **The first rule that applies decides**
-(`judge_interrupt` in `crates/banto-core/src/engine.rs`; the order is pinned by a test):
-`read`; `expired`; `no-pane` for a closing brigade, an unhosted member or a queued
-hang-up; `relay-manual`; `codex`; `no-pane` again for a product not yet resolved or a
-Claude pane with no live file yet (this part can only be judged once the product is
-known, which is why `no-pane` appears twice); `waiting`; `not-mid-turn` for one of
-banto's own lines in flight, a background command (`shell`) or an idle pane; and last
-`pressed`, when the live file says literally `busy`. Pressing resets that member's nudge
-cooldown and attempts, so the delivery nudge is not held back by the 60 s cooldown.
+*Nothing is typed.* The nudge line banto types into an idle pane is the ordinary one and
+is not affected: it is how a Worker that has no tool call left in its turn learns of its
+mail, and a turn that calls no tool is never gated. The things the Esc needed are gone
+with it: the 300 ms quiet time after a key, the Enter-only repair of a restored nudge line,
+and the reading of the input line for an interrupt.
 
-*After a press.* One more word replaces `pressed` in the same column, once, on the
-first tick that observes the member idle (the relay's own reading), or, if none has by
-the third tick that observed it (`INTERRUPT_SETTLE_TICKS`; the press's own tick does not
-count, and a tick that did not observe the member counts for nothing), as `still-busy`.
-A pane that ends before then leaves the word at `pressed`, by decision, and
-`brigade_status` keeps saying that what followed is not seen yet for as long as the
-message is unread:
-- `stopped` — the pane came to rest and nothing holds the nudge; the relay is
-  delivering. A restored nudge line that banto resubmits and one the operator clears
-  are both `stopped`.
-- `other-text` — it came to rest and the unsent-draft fence holds the nudge on a line
-  that is not exactly the nudge sentence: text on the input line, or the operator's
-  unsent mark still standing on a line banto cannot read as empty (the relay's own
-  verdict, taken once per pane per tick and shared with it; DISCIPLINE §3). The notices
-  say "the pane holds unsent input banto did not type", which covers both. Delivery
-  waits on the operator.
-- `still-busy` — it did not come to rest (busy, or at a prompt). banto does not
-  interrupt again; the message is read when that turn ends. This covers two cases it
-  cannot tell apart: the Esc did nothing, and the Esc cut the turn and a queued prompt
-  started at once.
+*What the operator sees.* The status line says on the tick that arms it: `relay: <director>
+sent <worker> an interrupt`, followed by the first line of the message reduced as the nudge
+notice's is. It does not say the Worker is being refused: that is only true once the gate
+has refused a call, and a request seen again after a restart may be past the cap. Nothing is read
+from the pane for this, so no notice and no log line quotes a screen.
 
-*The Enter-only repair.* An Esc before the model has produced any output puts the
-submitted prompt back into the input box, and the prompt the relay submitted is the
-nudge line, so the next nudge would find text it did not expect and the fence would hold
-it. From the press until that member has no unread mail, or its pane ends, a
-tick on which a nudge is otherwise due reads the line: text that, with its whitespace
-removed, equals the nudge line with its whitespace removed gets a carriage return alone; an `Empty` line gets the ordinary nudge; anything
-else leaves the fence holding. It stays under the ordinary cooldown and attempt cap, and
-it does not end when the Enter is sent: if the Enter is lost the rule must fire again.
-That the Enter went out alone shows on the relay's status notice (`relay: nudged …
-(Enter only) ← …`); a nudge has no pane-log line of its own (its write is among the
-bytes the pane log never keeps).
+*What the Worker and the Director see.* When the gate refused a call for the message (the
+word is `gated` or `capped`) and the word was in the store by the time the Worker pulled,
+the Worker's inbox header for that message says so, after `to you`; a Worker that pulls
+before any refusal is told nothing, and `armed` and every other word get no suffix. For
+`gated`: ` — banto refused tool calls in your session so that you would read this; those
+calls never ran, and the refusal was banto's, not the user's`. For `capped`: ` — banto
+refused tool calls in your session so that you would read this, then let the work go on
+unread; the refused calls never ran, and what ran after them ran past this message`. "In your
+session" is deliberate: a row can be `gated` by a subagent's refusals alone. The refusal
+reasons are in `crates/banto/src/mcp.rs`, in three forms (the main agent's, a subagent's,
+and a subagent's `check_messages` while nothing is unread); none holds the number of
+refusals. One more sentence about it lives in the `check_messages` tool description, not in
+the Worker briefing, because an operator's own `worker_prompt` would have lost a sentence
+placed in the briefing: "A message whose header says banto refused tool calls for it is an
+interrupt from your Director: the refused calls never ran, and it was banto refusing, not the
+user, so decide from the message whether to make them again." Whether the description
+is read depends on the product. Claude Code defers MCP tools and shows names only until a
+member loads them, so `check_messages` carries `_meta: {"anthropic/alwaysLoad": true}`
+("MCP mediation server"); the key takes effect for a session Claude Code starts with it,
+and a session started earlier and resumed keeps its earlier deferral (observed on four
+sessions, 2.1.330, 2026-11-22; cause unverified), so a member created before this build
+reads the description only once it is a new session. Codex defers MCP tools too, and only a
+Claude Worker has a gate, so only a Claude member is ever told by that header.
+`brigade_status` shows, for each unread interrupt of a Worker, its word and how long ago it
+was sent ("not decided yet" until the UI writes one) and nothing once the message is read:
+the witness of delivery is the unread flag, never the input line. A request that stays
+unread stops refusing once the main agent has been refused the cap and its calls go through
+(`capped`); until then it keeps refusing. The Director sees it in `brigade_status` and can
+end it by sending the Worker something it reads. A notice to the
+operator for an interrupt that sits unread is decided but not built yet; it will come as a
+commit of its own.
 
-*The quiet time after the Esc.* After the executor writes the interrupt Esc into a pane
-it holds every other write to that pane for 300 ms (`QUIET_AFTER_INTERRUPT`, in
-`crates/banto/src/embedded/quiet_writes.rs`; it is its own constant, not
-`RELAY_SUBMIT_DELAY`, whose value it happens to share), then
-flushes them in order. Every other write means the operator's keys, pastes, mouse reports
-and focus reports (these begin with ESC too) and banto's own lines. Nothing is dropped
-or reordered, the stop itself is not delayed (one Esc per pane per tick means a second
-one inside the quiet time does not arise in practice; if it did, it would be held like
-any other write, since written at once it would merge with the first), and the queue
-lives with the pane's handle, so it survives a rekey and is dropped when the pane is
-hung up. Why: ESC followed by another byte within 50 ms or less is
-read as Alt plus that byte, so the turn does not stop and the byte is lost; from 52 ms
-it is an ordinary Esc. The 300 ms is a margin over that cutoff. The spacing logic sits
-in no `cfg` (the logic is shared and only I/O is gated, repo invariant 5), although
-every number below came through ConPTY.
+*Measured.* The gate is measured in `docs/notes/claude-wake-spike-2026-11-23.md` (Claude
+Code, 2026-11-23): an empty answer lets a call run and a deny object refuses it; a refused
+call is recorded as a hook error and not as a refusal by the user; every failure of the
+gate lets the call through; the hook fires for a subagent's calls with its `agent_id`;
+the cap of 3. The Esc that this replaced was measured on Claude Code 2.1.330 on 2026-11-22
+(a lone `0x1b` stops a turn in about 120 ms; mid-tool it reads as refused by the user; two
+Escs at idle open the Rewind selector) and those figures stay true of a user's own Esc.
 
-*What the operator sees.* Every press and its ending go on the status line, in the shape
-of the nudge notice. `stopped`: `relay: director interrupted worker-2 of "…" ← <first
-line of the message>` (the line reduced and cut as the nudge notice's is). `still-busy`
-says "still busy", not "did not stop". `other-text` says that the pane holds unsent
-input banto did not type and that the Director's message waits, and names both ways out:
-clear the line and the message is delivered; or press Enter there, which sends that
-input, and the Worker restarts without having read why it was stopped. The Director's
-tool result and the `brigade_status` note use the same words. That is said once; the
-held-nudge reminder every 30 s carries on as it does today. `waiting` is said once. **No notice and no log line quotes
-the input line's text**: the pane log is content-free and keeps only the result of the
-comparison.
-
-*What the Worker and the Director see.* When an Esc was written for the message (the
-outcome is `pressed` or one of its refinements, `stopped`, `other-text` or `still-busy`),
-and the outcome was in the store by the time the Worker pulled, the Worker's inbox header
-for that message says so; a Worker that pulls first is told nothing, and the outcome is
-`read`. For example `[from director — to you — banto interrupted
-your turn for this message; the tool call it cut was stopped, not refused]`. One more
-sentence lives in the `check_messages` tool description, not in the Worker briefing,
-because an operator's own `worker_prompt` would have lost a sentence placed in the
-briefing. Whether the description is read depends on the product. Claude Code defers
-MCP tools and shows names only until a member loads them, so `check_messages` carries
-`_meta: {"anthropic/alwaysLoad": true}` ("MCP mediation server"); the key takes effect
-for a session Claude Code starts with it, and a session started earlier and resumed
-keeps its earlier deferral (observed on four sessions, 2.1.330, 2026-11-22; cause
-unverified), so a member created before this build reads the description only once it
-is a new session. Codex defers MCP tools too: on
-codex-cli 0.145.0 the description was not in the model's context and was reachable
-only by searching `ALL_TOOLS` inside the `exec` sandbox
-(`docs/notes/codex-briefing-spike.md`, "Result"), and whether the `_meta` key changes
-that was not measured. That costs nothing here, because `interrupt_worker` only
-stops a Claude Worker's turn, so only a Claude member is ever told by that header. The
-sentence:
-"A message whose header says banto interrupted your turn stopped you mid-work: the tool
-call it cut was stopped, not refused by the user, so look at what it left half-done
-before you go on." The nudge line is the ordinary one; there is no second wake sentence.
-The tool answers with the first decision, so for a press it says `pressed` and not how the
-turn ended; `brigade_status` shows the interrupt outcome (the refinement too, once there
-is one, or "not decided yet") only while its message is unread: the witness of delivery
-is the unread flag, never the input line, and once the message is read nothing is shown.
-
-*Measured* (worker-8, 2026-11-22; Claude Code 2.1.330 with Haiku, on Windows; banto's own
-PTY path at 120 columns by 40 rows through ConPTY; one write and flush of a lone `0x1b`;
-the real input-line reader). Each rule above rests on one of these:
-- A lone `0x1b` is delivered as Esc: ConPTY does not hold it, even with `?9001` on. The
-  turn stops about 120 ms after the write, and the live file's `status` goes `busy` →
-  `idle` at that moment. (One byte, no pair; the live file is the witness of the stop.)
-- Esc before any output, while the model is thinking: the turn stops and the submitted
-  prompt is put back into the input box. If it was the nudge line the reader says
-  `HasText` and the text, whitespace removed, equals the sentence, at 60 columns (wrapped
-  to two rows) and at 120. A lone `\r` then submits it as one prompt; text typed instead
-  is joined onto it with no separator and sent as one prompt. (The repair, and why a
-  restored nudge must not hold the fence.)
-- Esc mid-generation: the turn stops, the box is empty, the next prompt is clean, and the
-  transcript records `[Request interrupted by user]`.
-- Esc mid-tool: the turn stops; the tool result becomes "The user doesn't want to proceed
-  with this tool use…" followed by `[Request interrupted by user for tool use]`, so the
-  model reads the call as refused. (The price.)
-- A draft in the box during the turn (thinking, streaming or mid-tool): the turn stops,
-  the draft is untouched and nothing is restored on top of it, and the reader says
-  `HasText` with the draft's text. (A draft is no reason to hold the Esc.)
-- A queued prompt during the turn: the turn stops and the queued prompt is sent at once
-  as the next turn, and the status stays, or goes back to, `busy`. (Why `still-busy`
-  cannot tell the two cases apart.)
-- Esc at idle: with an empty box nothing happens; with a draft the draft is kept. Two Escs
-  about 300 ms apart at idle with an empty box open the Rewind selector, and while it is
-  open the live file reads `status="waiting"`, `waitingFor="dialog open"` and the reader
-  says `Unrecognized`. (Why banto presses only on `busy`, and never presses again on
-  `still-busy`.)
-- Esc with the restored nudge line in the box: a second Esc within about 1 s shows "esc
-  again to clear" and a third inside that window clears the line, which then reads
-  `Empty`. (So an `Empty` read never proves delivery; the unread flag does.)
-- Claude sometimes draws a dim suggestion in an empty box (such as "try check_messages
-  again"); the reader says `Empty`, so a suggestion is not a draft.
-- The Alt-chord cutoff: ESC followed by another byte within 50 ms or less on the writer's
-  side is read as Alt plus that byte, the turn does not stop and the byte is lost; at 52 ms
-  or more it is an ordinary Esc. Three runs at each gap from 30 to 155 ms, no mixed
-  results, at 30–50 % CPU load. (The quiet time.)
-- Codex 0.171.0: mid-turn **not measured** (the quota ran out). At idle one Esc shows "esc
-  again to edit previous message", a second would start backtrack, and a draft is kept.
-
-*Not measured.* A Codex Worker's mid-turn interrupt stays off. When it comes, the Codex
-pane's own OSC 7501 `working` report also covers background terminals, an active goal
-and MCP start-up, so its gate must also require the rollout's turn-in-progress. Nothing
-here was measured on macOS or Linux, nor on an idle machine or a heavily loaded one (the
-cutoff above was taken at 30–50 % CPU load).
+*Not measured.* A Codex Worker's calls are not gated: Codex has no such hook. Nothing
+here was measured on macOS or Linux.
 
 ## Activity indicator
 

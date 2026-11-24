@@ -85,7 +85,7 @@ impl DataDir {
         self.0.is_absolute() && db.is_absolute() && db == self.db_path()
     }
 
-    /// `<root>/mcp`: the per-member MCP config files.
+    /// `<root>/mcp`: the per-member MCP config files and settings files.
     pub fn mcp_dir(&self) -> PathBuf {
         self.0.join("mcp")
     }
@@ -95,6 +95,13 @@ impl DataDir {
     /// is ever written under a name the sweep would not recognise.
     pub fn member_config_path(&self, brigade: BrigadeId, token: &str) -> Option<PathBuf> {
         Some(self.mcp_dir().join(config_name(brigade, token)?))
+    }
+
+    /// `<root>/mcp/<brigade>-<token>.settings.json`, the member's `--settings` file
+    /// (the interrupt gate's hook), beside its MCP config and under the same rule:
+    /// `None` for a member banto cannot have issued.
+    pub fn member_settings_path(&self, brigade: BrigadeId, token: &str) -> Option<PathBuf> {
+        Some(self.mcp_dir().join(settings_name(brigade, token)?))
     }
 
     /// `<root>/mcp/goinkyo`: the Goinkyo's consultation requests.
@@ -154,6 +161,13 @@ fn config_name(brigade: BrigadeId, token: &str) -> Option<String> {
         .then(|| format!("{brigade}-{token}.json"))
 }
 
+/// The settings file's name is the config's with `.settings` before the
+/// extension, so the one parser tells them apart by that suffix alone.
+fn settings_name(brigade: BrigadeId, token: &str) -> Option<String> {
+    (is_issued_brigade(brigade) && is_issued_token(token))
+        .then(|| format!("{brigade}-{token}.settings.json"))
+}
+
 fn request_name(brigade: BrigadeId) -> Option<String> {
     is_issued_brigade(brigade).then(|| format!("{brigade}.txt"))
 }
@@ -163,6 +177,8 @@ fn request_name(brigade: BrigadeId) -> Option<String> {
 pub enum OwnedFile {
     /// `mcp/<brigade>-<token>.json`.
     MemberConfig { brigade: BrigadeId, token: String },
+    /// `mcp/<brigade>-<token>.settings.json`.
+    MemberSettings { brigade: BrigadeId, token: String },
     /// `mcp/goinkyo/<brigade>.txt`.
     GoinkyoRequest { brigade: BrigadeId },
 }
@@ -179,13 +195,22 @@ pub enum Where {
 /// banto does not issue — is not.
 pub fn parse_name(place: Where, name: &str) -> Option<OwnedFile> {
     let parsed = match place {
-        Where::Mcp => {
-            let (brigade, token) = name.strip_suffix(".json")?.split_once('-')?;
-            OwnedFile::MemberConfig {
-                brigade: brigade.parse().ok()?,
-                token: token.to_string(),
+        Where::Mcp => match name.strip_suffix(".settings.json") {
+            Some(stem) => {
+                let (brigade, token) = stem.split_once('-')?;
+                OwnedFile::MemberSettings {
+                    brigade: brigade.parse().ok()?,
+                    token: token.to_string(),
+                }
             }
-        }
+            None => {
+                let (brigade, token) = name.strip_suffix(".json")?.split_once('-')?;
+                OwnedFile::MemberConfig {
+                    brigade: brigade.parse().ok()?,
+                    token: token.to_string(),
+                }
+            }
+        },
         Where::Goinkyo => OwnedFile::GoinkyoRequest {
             brigade: name.strip_suffix(".txt")?.parse().ok()?,
         },
@@ -193,6 +218,7 @@ pub fn parse_name(place: Where, name: &str) -> Option<OwnedFile> {
     // The writer decides: `+7`, `007` and `Worker-1` parse above and are refused here.
     let written = match &parsed {
         OwnedFile::MemberConfig { brigade, token } => config_name(*brigade, token)?,
+        OwnedFile::MemberSettings { brigade, token } => settings_name(*brigade, token)?,
         OwnedFile::GoinkyoRequest { brigade } => request_name(*brigade)?,
     };
     (written == name).then_some(parsed)
@@ -217,10 +243,11 @@ impl Facts {
     }
 
     /// Whether the store has a member that needs `file`: the member itself for its
-    /// config, the brigade's Goinkyo for a consultation request.
+    /// config or settings, the brigade's Goinkyo for a consultation request.
     fn owns(&self, file: &OwnedFile) -> bool {
         let (brigade, token) = match file {
-            OwnedFile::MemberConfig { brigade, token } => (*brigade, token.as_str()),
+            OwnedFile::MemberConfig { brigade, token }
+            | OwnedFile::MemberSettings { brigade, token } => (*brigade, token.as_str()),
             OwnedFile::GoinkyoRequest { brigade } => (*brigade, GOINKYO_TOKEN),
         };
         self.members.contains(&(brigade, token.to_string()))
@@ -363,6 +390,13 @@ mod tests {
         }
     }
 
+    fn settings(brigade: BrigadeId, token: &str) -> OwnedFile {
+        OwnedFile::MemberSettings {
+            brigade,
+            token: token.to_string(),
+        }
+    }
+
     #[test]
     fn every_path_hangs_off_the_one_directory() {
         let dir = DataDir::new(PathBuf::from("/data/banto"));
@@ -371,6 +405,10 @@ mod tests {
         assert_eq!(
             dir.member_config_path(7, "worker-1"),
             Some(PathBuf::from("/data/banto/mcp/7-worker-1.json"))
+        );
+        assert_eq!(
+            dir.member_settings_path(7, "worker-1"),
+            Some(PathBuf::from("/data/banto/mcp/7-worker-1.settings.json"))
         );
         assert_eq!(
             dir.goinkyo_request_path(7),
@@ -409,6 +447,13 @@ mod tests {
             assert_eq!(
                 parse_name(Where::Mcp, name),
                 Some(config(brigade, token)),
+                "{name}"
+            );
+            let path = dir.member_settings_path(brigade, token).unwrap();
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert_eq!(
+                parse_name(Where::Mcp, name),
+                Some(settings(brigade, token)),
                 "{name}"
             );
         }
@@ -475,6 +520,15 @@ mod tests {
             ".json",
             "7-worker-1",
             "7-worker-1000000000.json",
+            "7-worker-1.settings",
+            "7-worker-1.settings.json.bak",
+            "7-worker-1.Settings.json",
+            "07-worker-1.settings.json",
+            "7-worker-01.settings.json",
+            "7-evil.settings.json",
+            "7-.settings.json",
+            "7.settings.json",
+            ".settings.json",
             "99999999999999999999999-worker-1.json",
         ] {
             assert_eq!(parse_name(Where::Mcp, name), None, "{name}");
@@ -508,6 +562,14 @@ mod tests {
     }
 
     #[test]
+    fn a_settings_file_is_owned_by_exactly_its_member_row_like_the_config_beside_it() {
+        let facts = facts(&[(7, "director"), (7, "worker-2")]);
+        assert!(!is_garbage(&settings(7, "worker-2"), OLD, &facts));
+        assert!(is_garbage(&settings(7, "worker-1"), OLD, &facts));
+        assert!(is_garbage(&settings(8, "director"), OLD, &facts));
+    }
+
+    #[test]
     fn a_request_is_owned_by_its_brigades_goinkyo_whatever_that_rows_role_says() {
         let request = OwnedFile::GoinkyoRequest { brigade: 7 };
         assert!(!is_garbage(&request, OLD, &facts(&[(7, "goinkyo")])));
@@ -521,6 +583,7 @@ mod tests {
         let nobody = facts(&[]);
         for file in [
             config(7, "worker-1"),
+            settings(7, "worker-1"),
             OwnedFile::GoinkyoRequest { brigade: 7 },
         ] {
             assert!(!is_garbage(&file, Some(Duration::ZERO), &nobody));
@@ -625,6 +688,28 @@ mod tests {
         assert_eq!(names(&dir.goinkyo_dir()), ["7.txt", "9.txt.old", "keep.me"]);
         assert_eq!(names(&dir.logs_dir()), ["brigade-3.log"]);
         assert!(dir.db_path().exists());
+    }
+
+    #[test]
+    fn a_sweep_collects_the_settings_of_a_dismissed_member_and_keeps_a_living_ones() {
+        let (_tmp, dir) = world();
+        let settings_of = |brigade, token| dir.member_settings_path(brigade, token).unwrap();
+        touch(&settings_of(7, "worker-2"), A_DAY);
+        touch(&settings_of(7, "worker-1"), A_DAY);
+        touch(&settings_of(3, "worker-1"), GRACE - Duration::from_secs(60));
+        touch(&dir.mcp_dir().join("7-evil.settings.json"), A_DAY);
+
+        let report = sweep(&dir, SystemTime::now(), || Some(facts(&[(7, "worker-2")])));
+
+        assert_eq!(report.deleted.len(), 1, "{report:?}");
+        assert_eq!(
+            names(&dir.mcp_dir()),
+            [
+                "3-worker-1.settings.json",
+                "7-evil.settings.json",
+                "7-worker-2.settings.json"
+            ]
+        );
     }
 
     #[test]

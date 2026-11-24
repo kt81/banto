@@ -45,7 +45,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::app::{App, Mode};
-use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
+use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, RelayMode, ResolvedAgents};
 use banto_core::engine::{
     self, Axis, BellCause, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
     GoinkyoLook, GoinkyoRow, GroupJoinTargetData, LiveStatus, PrefixKey, RelayObservation,
@@ -1209,17 +1209,6 @@ fn execute_cmd(
                 vec![Event::PtyWriteDropped { key }]
             }
         }
-        Cmd::InterruptPty { key } => {
-            if let Some(handle) = handles.get_mut(&key) {
-                handle.interrupt();
-                Vec::new()
-            } else {
-                // The pane ended between the decision and this write: the same
-                // backstop as for a dropped line, and nothing else to undo (the
-                // outcome is already on its way to the store as `pressed`).
-                vec![Event::PtyWriteDropped { key }]
-            }
-        }
         Cmd::ResizePty { key, rows, cols } => {
             if let Some(handle) = handles.get_mut(&key) {
                 handle.resize(rows, cols);
@@ -1534,7 +1523,7 @@ fn execute_open_codex_trust_pane(
 ///
 /// Pulled out of [`execute_open_embedded`] so this decision logic is
 /// unit-testable without spawning a real PTY; the returned launch's
-/// `mcp_config` (Claude) and `brigade` (Codex) are left `None` here and
+/// `mcp_config` and `settings` (Claude) and `brigade` (Codex) are left `None` here and
 /// filled in by the caller, since both need real I/O this doesn't — a config
 /// file write and the running executable's own path.
 fn build_open_launch(
@@ -1567,6 +1556,7 @@ fn build_open_launch(
             disallowed_tools: flags.disallowed_tools.map(str::to_string),
             autocompact: flags.autocompact.map(str::to_string),
             append_system_prompt: briefing.map(str::to_string),
+            settings: None,
             mcp_config: None,
             first_prompt: first_prompt.map(str::to_string),
         },
@@ -1729,10 +1719,14 @@ fn execute_open_embedded(
             .map(|child| child.child_args())
             .unwrap_or_default();
         let wiring = match &mut launch {
-            launch::AgentLaunch::Claude { mcp_config, .. } => data_dir_of(deps)
+            launch::AgentLaunch::Claude {
+                mcp_config,
+                settings,
+                ..
+            } => data_dir_of(deps)
                 .ok_or_else(|| anyhow::anyhow!("could not determine banto's data directory"))
                 .and_then(|data_dir| {
-                    write_mcp_config(
+                    let config = write_mcp_config(
                         &data_dir,
                         exe,
                         *brigade_id,
@@ -1740,10 +1734,17 @@ fn execute_open_embedded(
                         *role,
                         known_id,
                         &child_args,
-                    )
+                    )?;
+                    let gate = if gated_member(*role, deps.brigade.relay) {
+                        Some(write_gate_settings(&data_dir, *brigade_id, token)?)
+                    } else {
+                        None
+                    };
+                    Ok((config, gate))
                 })
-                .map(|path| {
-                    *mcp_config = Some(path);
+                .map(|(config, gate)| {
+                    *mcp_config = Some(config);
+                    *settings = gate;
                 }),
             launch::AgentLaunch::Codex { brigade: slot, .. } => {
                 *slot = Some(launch::CodexBrigade {
@@ -1969,11 +1970,13 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             let _ = store.borrow_mut().clear_request(brigade_id, seq);
             Vec::new()
         }
-        // The one writer of the outcome column (the `_mcp` process cannot see a
-        // screen). A write that changes nothing is a repeated or late one and is
-        // meant to; a failed write leaves the request undecided in the store, and
-        // the tool answers "queued, not decided yet" and `brigade_status` shows
-        // nothing for it.
+        // The writer of the UI's first word in the outcome column (the `_mcp`
+        // process cannot see a screen or the hosted panes). A write that changes
+        // nothing is a repeated or late one and is meant to; a failed write leaves
+        // the request undecided in the store, and the tool answers "queued, not
+        // decided yet" and `brigade_status` shows no word for it. The gate that
+        // `armed` promises does not wait for this write: it reads the unread
+        // interrupts, never the word.
         StoreIntent::RecordInterruptOutcome {
             message_id,
             outcome,
@@ -2731,10 +2734,9 @@ fn gather_relay_observations_from(
             // What the same live file says the member is doing, classified as the
             // session list classifies it, for the tile of a member that has no
             // row yet (no transcript before its first turn). Its `status_busy`
-            // is also read by two decisions in the core, neither of which can
-            // use the two functions above: the interrupt (is a turn running, so
-            // that an Esc cuts something) and a Claude Goinkyo's first-turn
-            // watch (has the first prompt started one).
+            // is also read by a Claude Goinkyo's first-turn watch in the core (has
+            // the first prompt started one), which neither of the two functions
+            // above can answer.
             let live_status = match agent {
                 Some(AgentKind::ClaudeCode) => live_activity(live, &session_id.0, alive_claude)
                     .map(|activity| LiveStatus {
@@ -3921,10 +3923,73 @@ pub(crate) fn mcp_config_json(
     }
     serde_json::json!({
         "mcpServers": {
-            "banto": {
+            (crate::mcp::SERVER_NAME): {
                 "command": exe.to_string_lossy(),
                 "args": args,
             }
+        }
+    })
+}
+
+/// Whether a member's tool calls are gated while an interrupt to it is unread: a
+/// Worker, with the relay on. Only the relay makes a refusal useful, because the
+/// refusal tells the Worker to read its mail and the relay is what wakes a
+/// Worker that has none of its own to read; the Director and the Goinkyo are
+/// never interrupted, so they carry no hook to be slowed by or to fail.
+///
+/// Claude only, by where this is called: a Codex member has no hook of this kind.
+fn gated_member(role: BrigadeRole, relay: RelayMode) -> bool {
+    role == BrigadeRole::Worker && relay == RelayMode::Auto
+}
+
+/// The hook's timeout in seconds. The hook runs before every tool call the Worker
+/// makes, and what answers it is the Worker's own `_mcp` process, which reads
+/// the store (a busy wait of up to 5 s) and may write the outcome (up to 5 s
+/// more). A hook that never answers holds the call for the whole timeout, and the
+/// default is 600 s: one wedged `_mcp` would freeze every tool call of the Worker
+/// for ten minutes. A timeout, like every other failure of the gate, lets the
+/// call through (docs/notes/claude-wake-spike-2026-11-23.md, "When the gate
+/// fails"), so cutting it short costs a late answer and nothing else.
+const GATE_HOOK_TIMEOUT_SECS: u64 = 15;
+
+/// Write the member's `--settings` file, the hook that gates its tool calls, and
+/// return its path. Beside its MCP config and named in the same family, so the
+/// sweep collects it with the member ([`DataDir::member_settings_path`]).
+fn write_gate_settings(data_dir: &DataDir, brigade_id: BrigadeId, token: &str) -> Result<PathBuf> {
+    let path = data_dir
+        .member_settings_path(brigade_id, token)
+        .ok_or_else(|| {
+            anyhow::anyhow!("no settings file name for member {token:?} of brigade {brigade_id}")
+        })?;
+    std::fs::create_dir_all(data_dir.mcp_dir())?;
+    std::fs::write(&path, serde_json::to_vec_pretty(&gate_settings_json())?)?;
+    Ok(path)
+}
+
+/// The `--settings` file's content: one `PreToolUse` hook, no matcher so that it
+/// sees every tool, calling the `banto` MCP server's gate tool. The server is the
+/// member's own `_mcp` (the `--mcp-config` beside this file), which knows who is
+/// asking from its own arguments, so the input carries only what the hook alone
+/// can see: the tool being called and, for a subagent, its id (empty for the
+/// main agent).
+///
+/// No `onFailure`: the default lets the call through when the gate fails, which is
+/// the property that keeps a broken gate from stopping a Worker.
+pub(crate) fn gate_settings_json() -> serde_json::Value {
+    serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "hooks": [{
+                    "type": "mcp_tool",
+                    "server": crate::mcp::SERVER_NAME,
+                    "tool": crate::mcp::GATE_TOOL,
+                    "input": {
+                        "tool_name": "${tool_name}",
+                        "agent_id": "${agent_id}",
+                    },
+                    "timeout": GATE_HOOK_TIMEOUT_SECS,
+                }]
+            }]
         }
     })
 }
@@ -5093,16 +5158,15 @@ fn window_focus_event(raw: &crossterm::event::Event) -> Option<Event> {
     }
 }
 
-/// The brigade's `interrupt_worker` requests no outcome is recorded for, with
-/// their age by the wall clock (the core has none, and an `Instant` would not
-/// survive a restart, which is the very case the age exists for). `None` when the
-/// store could not be read, which the core must tell apart from an empty list:
-/// nothing is decided on a tick that could not read and nothing already decided
-/// is forgotten, and the request is still there for the next.
+/// The brigade's `interrupt_worker` requests no outcome is recorded for. `None`
+/// when the store could not be read, which the core must tell apart from an empty
+/// list: nothing is decided on a tick that could not read and nothing already
+/// decided is forgotten, and the request is still there for the next.
 ///
 /// `read` is as the store had it a moment ago. A Worker can pull the message
-/// between this read and the press that follows; that window is accepted, and the
-/// price is one Esc that was not needed.
+/// between this read and the decision that follows; the decision is then `armed`
+/// for a message already read, which refuses nothing, because the gate ends when
+/// the message is read.
 fn interrupt_facts(
     store: &Store,
     brigade_id: BrigadeId,
@@ -5110,17 +5174,12 @@ fn interrupt_facts(
     let Ok(pending) = store.pending_interrupts(brigade_id) else {
         return None;
     };
-    let now_ms = std::time::UNIX_EPOCH
-        .elapsed()
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0);
     Some(
         pending
             .into_iter()
             .map(|request| banto_core::engine::InterruptFact {
                 message_id: request.message_id,
                 member: request.member,
-                age_ms: u64::try_from(now_ms.saturating_sub(request.created_at_ms)).unwrap_or(0),
                 read: request.read,
             })
             .collect(),
@@ -5138,9 +5197,6 @@ fn collect_codex_answers(deps: &Deps, events: &mut VecDeque<Event>) {
 
 fn pump_pty_handles(handles: &mut HashMap<SessionKey, PtyHandle>, events: &mut VecDeque<Event>) {
     for (key, handle) in handles {
-        // Whatever an interrupting Esc held back leaves on the first turn of the
-        // loop after its quiet time, not on the next unrelated write.
-        handle.flush_quiet();
         loop {
             match handle.poll() {
                 PtyPoll::Chunk(chunk) => events.push_back(Event::PtyOutput {
@@ -10827,182 +10883,6 @@ mod tests {
         );
     }
 
-    /// `execute_cmd` for one command against `handles`, with the dependencies a
-    /// command that touches only the handles and the store needs.
-    fn run_cmd(
-        store: Store,
-        cmd: Cmd,
-        handles: &mut HashMap<SessionKey, PtyHandle>,
-    ) -> (Vec<Event>, RefCell<Store>) {
-        let store = RefCell::new(store);
-        let mut discovery = Vec::new();
-        let meta_cache = MetaCache::new();
-        let pty_host = MockPtyHost::default();
-        let input_reader = MockInputReader::default();
-        let thresholds = AgeThresholds::default();
-        let brigade = BrigadeConfig::default();
-        let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
-        let agent_binaries = AgentBinaries::default();
-        let enabled_agents = all_agents();
-        let events = {
-            let deps = Deps {
-                claude_home: &claude_home,
-                codex_home: None,
-                thresholds: &thresholds,
-                store: &store,
-                meta_cache: &meta_cache,
-                pty_host: &pty_host,
-                input_reader: &input_reader,
-                brigade: &brigade,
-                agent_binaries: &agent_binaries,
-                enabled_agents: &enabled_agents,
-                codex_catalog: &NoCatalog,
-                codex_queue: &NoQueue,
-                child: None,
-                exe: crate::exe::test_support::current(),
-            };
-            execute_cmd(cmd, &deps, handles, &mut discovery)
-        };
-        (events, store)
-    }
-
-    #[test]
-    fn interrupt_pty_writes_one_esc_to_the_live_child_and_holds_the_next_write() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let host = MockPtyHost {
-            captured: captured.clone(),
-            ..Default::default()
-        };
-        let key = SessionKey::from_id("sess-1");
-        let mut handles = HashMap::new();
-        handles.insert(key.clone(), open(&host));
-
-        let (events, _) = run_cmd(
-            Store::open_in_memory().unwrap(),
-            Cmd::InterruptPty { key: key.clone() },
-            &mut handles,
-        );
-        assert!(events.is_empty());
-        assert_eq!(&*captured.lock().unwrap(), b"\x1b");
-
-        // The next write through the same command path is held, not merged.
-        let (events, _) = run_cmd(
-            Store::open_in_memory().unwrap(),
-            Cmd::WritePty {
-                key,
-                bytes: b"hello".to_vec(),
-            },
-            &mut handles,
-        );
-        assert!(events.is_empty(), "held is not dropped");
-        assert_eq!(&*captured.lock().unwrap(), b"\x1b", "still only the Esc");
-    }
-
-    #[test]
-    fn what_an_interrupt_held_back_survives_a_rekey_and_flushes_in_order() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let host = MockPtyHost {
-            captured: captured.clone(),
-            ..Default::default()
-        };
-        let pending = pending_key("worker-1");
-        let discovered = SessionKey::from_id("w1");
-        let mut handles = HashMap::new();
-        handles.insert(pending.clone(), open(&host));
-
-        run_cmd(
-            Store::open_in_memory().unwrap(),
-            Cmd::InterruptPty {
-                key: pending.clone(),
-            },
-            &mut handles,
-        );
-        for bytes in [b"one".as_slice(), b"two".as_slice()] {
-            run_cmd(
-                Store::open_in_memory().unwrap(),
-                Cmd::WritePty {
-                    key: pending.clone(),
-                    bytes: bytes.to_vec(),
-                },
-                &mut handles,
-            );
-        }
-        run_cmd(
-            Store::open_in_memory().unwrap(),
-            Cmd::RekeyPty {
-                from: pending.clone(),
-                to: discovered.clone(),
-            },
-            &mut handles,
-        );
-        assert!(!handles.contains_key(&pending));
-        assert_eq!(&*captured.lock().unwrap(), b"\x1b", "still held");
-
-        std::thread::sleep(
-            crate::embedded::quiet_writes::QUIET_AFTER_INTERRUPT
-                + std::time::Duration::from_millis(30),
-        );
-        handles.get_mut(&discovered).unwrap().flush_quiet();
-        assert_eq!(
-            &*captured.lock().unwrap(),
-            b"\x1bonetwo",
-            "the held bytes moved with the handle and left in order"
-        );
-    }
-
-    #[test]
-    fn what_an_interrupt_held_back_goes_with_the_handle_when_the_pane_ends() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let host = MockPtyHost {
-            captured: captured.clone(),
-            ..Default::default()
-        };
-        let key = SessionKey::from_id("sess-1");
-        let mut handles = HashMap::new();
-        handles.insert(key.clone(), open(&host));
-        run_cmd(
-            Store::open_in_memory().unwrap(),
-            Cmd::InterruptPty { key: key.clone() },
-            &mut handles,
-        );
-        run_cmd(
-            Store::open_in_memory().unwrap(),
-            Cmd::WritePty {
-                key: key.clone(),
-                bytes: b"never".to_vec(),
-            },
-            &mut handles,
-        );
-        // The pane ends by a kill and the loop drops the handle once it reports its
-        // exit, as it does for a natural exit too.
-        run_cmd(
-            Store::open_in_memory().unwrap(),
-            Cmd::KillPty { key: key.clone() },
-            &mut handles,
-        );
-        drop(handles.remove(&key));
-        std::thread::sleep(
-            crate::embedded::quiet_writes::QUIET_AFTER_INTERRUPT
-                + std::time::Duration::from_millis(30),
-        );
-        assert_eq!(
-            &*captured.lock().unwrap(),
-            b"\x1b",
-            "nothing is written after the handle is gone"
-        );
-    }
-
-    #[test]
-    fn interrupt_pty_against_a_key_with_no_live_handle_reports_it() {
-        let key = SessionKey::from_id("gone");
-        let (events, _) = run_cmd(
-            Store::open_in_memory().unwrap(),
-            Cmd::InterruptPty { key: key.clone() },
-            &mut HashMap::new(),
-        );
-        assert_eq!(events, vec![Event::PtyWriteDropped { key }]);
-    }
-
     #[test]
     fn recording_an_interrupt_outcome_reaches_the_store_once() {
         use banto_core::model::{InterruptOutcome, InterruptWhy};
@@ -11026,25 +10906,25 @@ mod tests {
             why,
         };
         let store = RefCell::new(store);
-        assert!(execute_store_intent(record(InterruptOutcome::Pressed, None), &store).is_empty());
+        assert!(execute_store_intent(record(InterruptOutcome::Armed, None), &store).is_empty());
         assert_eq!(
             store.borrow().interrupt_state(id).unwrap(),
-            InterruptState::Decided(InterruptOutcome::Pressed)
+            InterruptState::Decided(InterruptOutcome::Armed)
         );
         // `why` is for the pane log; the store keeps the outcome alone, and a second
         // decision does not overwrite the first.
         execute_store_intent(
-            record(InterruptOutcome::NotMidTurn, Some(InterruptWhy::Idle)),
+            record(InterruptOutcome::NoPane, Some(InterruptWhy::Starting)),
             &store,
         );
         assert_eq!(
             store.borrow().interrupt_state(id).unwrap(),
-            InterruptState::Decided(InterruptOutcome::Pressed)
+            InterruptState::Decided(InterruptOutcome::Armed)
         );
     }
 
     #[test]
-    fn the_tick_is_given_each_undecided_interrupt_with_its_age_and_whether_it_was_read() {
+    fn the_tick_is_given_each_undecided_interrupt_and_whether_it_was_read() {
         let mut store = Store::open_in_memory().unwrap();
         store
             .add_brigade_member(1, "director", BrigadeRole::Director, None)
@@ -11062,7 +10942,6 @@ mod tests {
         assert_eq!(facts[0].message_id, id);
         assert_eq!(facts[0].member, "worker-1");
         assert!(!facts[0].read);
-        assert!(facts[0].age_ms < 5_000, "just written: {}", facts[0].age_ms);
 
         store
             .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
@@ -14096,7 +13975,7 @@ mod tests {
         // its file says is classified as the list does (shell is busy, a dialog
         // is still Waiting but told apart), and only for a Claude member. Only a
         // literal `busy` is also a running turn: `shell` classifies as busy and
-        // is not one, which is what an interrupt must not press on.
+        // is not one, which is what the first-turn watch must not read as a turn.
         use banto_core::model::Activity::{Alive, Busy, Waiting};
         for (status, reason, expected) in [
             ("busy", None, Some((Busy, false, true))),
@@ -14893,7 +14772,14 @@ mod tests {
         )
         .unwrap();
         match launch {
-            launch::AgentLaunch::Claude { mcp_config, .. } => assert_eq!(mcp_config, None),
+            launch::AgentLaunch::Claude {
+                mcp_config,
+                settings,
+                ..
+            } => {
+                assert_eq!(mcp_config, None);
+                assert_eq!(settings, None);
+            }
             launch::AgentLaunch::Codex { .. } => panic!("expected a Claude launch"),
         }
     }
@@ -17169,9 +17055,22 @@ mod tests {
             token: &str,
             role: BrigadeRole,
         ) -> Vec<String> {
+            self.launch_under(agent, id, token, role, &self.fixture.brigade)
+        }
+
+        /// The same under `brigade`'s configuration (the relay mode, say).
+        fn launch_under(
+            &self,
+            agent: AgentKind,
+            id: &str,
+            token: &str,
+            role: BrigadeRole,
+            brigade: &BrigadeConfig,
+        ) -> Vec<String> {
             let resolved = self.resolved();
             let deps = Deps {
                 child: Some(&resolved),
+                brigade,
                 ..self.fixture.deps()
             };
             let Cmd::OpenEmbedded {
@@ -17484,9 +17383,107 @@ mod tests {
                 .position(|arg| arg == "--system-prompt-snapshot")
                 .unwrap_or_else(|| panic!("{token}: {argv:?}"));
             assert_eq!(argv[at + 1], "off", "{token}");
-            // Right after the briefing it is about, before the brigade channel.
+            // Right after the briefing it is about, before the brigade channel (and
+            // before the gate's settings file, which comes right before that).
             assert_eq!(argv[at - 2], "--append-system-prompt", "{token}: {argv:?}");
-            assert_eq!(argv[at + 2], "--mcp-config", "{token}: {argv:?}");
+            let after = if argv[at + 2] == "--settings" {
+                at + 4
+            } else {
+                at + 2
+            };
+            assert_eq!(argv[after], "--mcp-config", "{token}: {argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_request_the_gate_refused_for_before_any_tick_is_still_handed_to_the_core() {
+        // The gate writes `gated` over no word. The core still has to see the
+        // request once: that is where the nudge cooldown is reset and the status
+        // line is shown.
+        let rig = BriefingRig::new();
+        let id = {
+            let mut store = rig.fixture.store.borrow_mut();
+            let id = store
+                .enqueue_interrupt_message(rig.brigade_id, "director", "worker-1", "stop")
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .record_interrupt_outcome(id, banto_core::model::InterruptOutcome::Gated)
+                    .unwrap()
+            );
+            id
+        };
+        let facts = interrupt_facts(&rig.fixture.store.borrow(), rig.brigade_id).unwrap();
+        assert_eq!(
+            facts,
+            [banto_core::engine::InterruptFact {
+                message_id: id,
+                member: "worker-1".to_string(),
+                read: false,
+            }]
+        );
+    }
+
+    /// What a launch hands the agent as its gate settings: the path after
+    /// `--settings`, or `None` without the flag.
+    fn settings_arg(argv: &[String]) -> Option<&String> {
+        argv.iter()
+            .position(|arg| arg == "--settings")
+            .map(|at| &argv[at + 1])
+    }
+
+    #[test]
+    fn a_claude_worker_under_an_automatic_relay_is_launched_with_the_gate_settings() {
+        let rig = BriefingRig::new();
+        let argv = rig.launch(AgentKind::ClaudeCode, "", "worker-1", BrigadeRole::Worker);
+        let expected = DataDir::new(rig.data_dir.path().to_path_buf())
+            .member_settings_path(rig.brigade_id, "worker-1")
+            .unwrap();
+        let at = argv.iter().position(|arg| arg == "--settings").unwrap();
+        assert_eq!(PathBuf::from(&argv[at + 1]), expected, "{argv:?}");
+        assert_eq!(argv[at + 2], "--mcp-config", "{argv:?}");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&expected).unwrap()).unwrap();
+        assert_eq!(written, gate_settings_json());
+    }
+
+    #[test]
+    fn every_other_launch_has_neither_the_settings_argument_nor_the_file() {
+        let manual = BrigadeConfig {
+            relay: RelayMode::Manual,
+            ..BrigadeConfig::default()
+        };
+        let auto = BrigadeConfig::default();
+        let cases = [
+            (
+                AgentKind::ClaudeCode,
+                "director",
+                BrigadeRole::Director,
+                &auto,
+            ),
+            (
+                AgentKind::ClaudeCode,
+                "goinkyo",
+                BrigadeRole::Goinkyo,
+                &auto,
+            ),
+            (
+                AgentKind::ClaudeCode,
+                "worker-1",
+                BrigadeRole::Worker,
+                &manual,
+            ),
+            (AgentKind::Codex, "worker-1", BrigadeRole::Worker, &auto),
+        ];
+        for (agent, token, role, brigade) in cases {
+            let rig = BriefingRig::new();
+            let argv = rig.launch_under(agent, "", token, role, brigade);
+            assert_eq!(settings_arg(&argv), None, "{agent:?} {token}: {argv:?}");
+            let path = DataDir::new(rig.data_dir.path().to_path_buf())
+                .member_settings_path(rig.brigade_id, token)
+                .unwrap();
+            assert!(!path.exists(), "{agent:?} {token}: {}", path.display());
         }
     }
 
@@ -18211,6 +18208,75 @@ second line"
         let store = RefCell::new(Store::open_in_memory().unwrap());
         sweep_data_dir_with(&data_dir, &store, std::time::SystemTime::now());
         assert!(!data_dir.root().exists());
+    }
+
+    #[test]
+    fn only_a_worker_under_an_automatic_relay_is_gated() {
+        for (role, relay, gated) in [
+            (BrigadeRole::Worker, RelayMode::Auto, true),
+            (BrigadeRole::Worker, RelayMode::Manual, false),
+            (BrigadeRole::Director, RelayMode::Auto, false),
+            (BrigadeRole::Director, RelayMode::Manual, false),
+            (BrigadeRole::Goinkyo, RelayMode::Auto, false),
+            (BrigadeRole::Goinkyo, RelayMode::Manual, false),
+        ] {
+            assert_eq!(gated_member(role, relay), gated, "{role:?} {relay:?}");
+        }
+    }
+
+    #[test]
+    fn the_gate_hook_calls_the_members_own_server_for_every_tool_and_has_a_short_timeout() {
+        let settings = gate_settings_json();
+        let groups = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        // No matcher: the gate must see every tool, including a subagent's.
+        assert!(groups[0].get("matcher").is_none());
+        let hooks = groups[0]["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1);
+        let hook = &hooks[0];
+        assert_eq!(hook["type"], "mcp_tool");
+        assert_eq!(hook["tool"], crate::mcp::GATE_TOOL);
+        assert_eq!(hook["input"]["tool_name"], "${tool_name}");
+        assert_eq!(hook["input"]["agent_id"], "${agent_id}");
+        // The gate must fail open, which is the default: a block would stop a
+        // Worker whenever the gate could not answer.
+        assert!(hook.get("onFailure").is_none());
+        let timeout = hook["timeout"].as_u64().unwrap();
+        assert!((1..=60).contains(&timeout), "{timeout}");
+        // The server the hook names is the one the config beside it defines.
+        let config = mcp_config_json(
+            Path::new("banto"),
+            &[],
+            1,
+            "worker-1",
+            BrigadeRole::Worker,
+            None,
+        );
+        assert!(
+            config["mcpServers"]
+                .get(hook["server"].as_str().unwrap())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_gate_settings_file_is_written_beside_the_config_under_the_sweepable_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = DataDir::new(dir.path().join("banto"));
+        let path = write_gate_settings(&data_dir, 4, "worker-2").unwrap();
+        assert_eq!(
+            Some(path.clone()),
+            data_dir.member_settings_path(4, "worker-2")
+        );
+        assert_eq!(path.parent(), Some(data_dir.mcp_dir().as_path()));
+        let read: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read, gate_settings_json());
+        // A member banto did not issue gets no file, like its config.
+        let err = write_gate_settings(&data_dir, 4, "evil")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("evil"), "{err}");
     }
 
     #[test]

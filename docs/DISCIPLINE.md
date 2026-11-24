@@ -114,34 +114,27 @@ reader (`banto_core::input_line`) is one instance: it reads Claude's line for
 text. Its only caller is the relay, which reads a Claude member's line on every
 tick it runs (relay `auto`, the member's brigade not closing: the line is judged
 for a draft whether or not a nudge is due), through one verdict per pane per tick
-that the interrupt refinement shares (below). A Codex member is not read at all:
+(below). A Codex member is not read at all:
 it is woken through `codex queue`, not typed into (`docs/REQUIREMENTS.md`,
 "Waking a Codex member").
 Reading sends nothing; the operator approved the principle on 2026-11-10. The
 next shortcut that wants the screen cites this paragraph's conditions, not the
 instance.
 
-**One reading per Claude pane per tick for the relay and the interrupt.** The
-relay's verdict on a Claude pane (what the line reads, whether the unsent-draft
-fence holds a nudge, whether the reading releases the operator's mark) is taken the
-first time anyone asks in a tick and handed back unchanged to every later asker in
-that tick. The map holding it is built at the start of the tick's relay work and
-dropped at its end, so a reading is never kept: it is a reading, not state. Two
-decisions ask it for different purposes. The interrupt refinement (an Esc banto
-wrote for the Director's `interrupt_worker`; "Auto-relay" in `docs/REQUIREMENTS.md`)
-asks on a tick when a member with an unresolved press is seen idle, to say whether
-it came to rest with nothing holding the nudge (`stopped`) or with text on the line
-that is not the nudge sentence (`other-text`: the fence's own verdict, holding the
-nudge, on a line that is not exactly the nudge sentence, whether that is text or the
-operator's mark still standing on a line that does not read `Empty`); it runs before the relay loop in the same tick,
-so it is the one that reads and the relay gets the same value. The Enter-only
-repair, which sends a lone Enter when the line holds exactly the nudge sentence an
-Esc restored, uses the relay loop's verdict. Both compare the line with the nudge
-sentence (`restored_nudge_line`) only after a read of `HasText`, and only the
-comparison's result is used or recorded. What crosses ticks is a watch
-(message ids and a tick count) and a set of members: no screen content. "The relay
-is the one reader" is therefore true of the relay and the interrupt, not of the
-whole engine: Codex reads the line on its own.
+**One reading per Claude pane per tick.** The relay's verdict on a Claude pane (what
+the line reads, whether the unsent-draft fence holds a nudge, whether the reading
+releases the operator's mark) is taken the first time anyone asks in a tick and handed
+back unchanged to every later asker in that tick. The map holding it is built at the
+start of the tick's relay work and dropped at its end, so a reading is never kept: it
+is a reading, not state. The relay loop is its one asker today. It used to have a
+second, the interrupt refinement that followed an Esc banto wrote for the Director's
+`interrupt_worker`; that Esc is gone (a keystroke typed for the operator is the thing
+this section forbids, and `interrupt_worker` now refuses the Worker's next tool calls
+from a hook instead; "Auto-relay" in `docs/REQUIREMENTS.md`), and with it the second
+asker. The verdict is still taken once per pane per tick, so a second asker added later
+gets the same value. What crosses ticks is a set of members: no screen content. "The
+relay is the one reader" is true of the relay, not of the whole engine: Codex reads the
+line on its own.
 
 Reading a program's own state report out of its output stream is not a read of
 the painted screen: it is the child's explicit announcement (OSC 7501, for a
@@ -168,13 +161,12 @@ fn update(&mut self, ev: Event, now: Instant) -> Vec<Cmd>
   there is no second mechanism.
 
 Because *all* writes to a hosted session's stdin (key forwarding, mouse
-reports, paste, the relay nudge and its delayed Enter, an Enter alone when a
-restored nudge line is already in the box, and the Director's interrupt Esc)
-become `Cmd`-shaped data executed in one place (`Cmd::WritePty`, and for the
-interrupt Esc a `Cmd` of its own, `Cmd::InterruptPty`, so the executor knows
-which write it is and can hold every other write to that pane for a quiet time
-after it), the single-writer invariant stops being a convention and becomes
-structure. Type-level
+reports, paste, and the relay nudge and its delayed Enter) become `Cmd`-shaped
+data executed in one place (`Cmd::WritePty`), the single-writer invariant stops
+being a convention and becomes structure. The Director's interrupt is not among
+them: it writes nothing to a pane, and the refusal of a Worker's tool calls
+that replaced the Esc is answered by that Worker's own `_mcp` process from a
+hook, outside the core and outside the UI process's writers. Type-level
 enforcement (guard types with private constructors) remains the tool of
 choice only for what `Cmd`s cannot express.
 

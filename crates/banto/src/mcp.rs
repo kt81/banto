@@ -25,21 +25,22 @@
 //!   the operator's decision, shown as a short fixed tag until they answer in the
 //!   Director's pane. It takes no text: the question is in the Director's own
 //!   output. It never blocks;
-//! - `interrupt_worker(member, text)` (Director only) stops a Worker's running
-//!   Claude turn by writing one Esc into its pane, and delivers `text` to it as an
-//!   ordinary message. The tool only records the request, in the same transaction
-//!   as the message; the decision to press, and the press, are the UI process's,
-//!   made once, against the screen and the live file, and written back as an
-//!   outcome the tool waits about two seconds for. A turn cut this way leaves its
-//!   running tool call recorded in the Worker's transcript as refused by the user,
-//!   which no header banto adds undoes, so the tool's description prices it.
+//! - `interrupt_worker(member, text)` (Director only) delivers `text` to a Worker
+//!   as an ordinary message and has banto refuse the Worker's next tool calls
+//!   until it reads it. The tool only records the request, in the same
+//!   transaction as the message; the UI process decides once whether the Worker
+//!   has a gate at all and writes that back as an outcome the tool waits about two
+//!   seconds for. The gate is the next tool;
+//! - `interrupt_gate(tool_name, agent_id)` is answered to a hook and never called
+//!   by a model: see [`tool_interrupt_gate`].
 //!
 //! The text of a message is a *pull*, never a stdin injection: even though the
 //! embedded banto is the sole writer to a child's stdin, injecting a peer's
 //! message there would forge operator input mid-turn. A tool result respects
 //! turn boundaries and carries the firewall framing for free. An interrupt keeps
-//! to that: what banto types into the pane is the Esc key and nothing else, and
-//! the reason travels as the message.
+//! to that: banto types nothing into a pane for it, the reason travels as the
+//! message, and what makes the Worker read it is a hook's refusal of its next tool
+//! calls.
 //!
 //! What banto does type into an idle member's pane is a fixed line that says to
 //! call `check_messages` (the relay in `banto_core::engine`), and that starts a
@@ -53,7 +54,7 @@
 //! notifications (no `id`) get none. Nothing but valid MCP messages may go to
 //! stdout, so diagnostics would go to stderr.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -79,7 +80,7 @@ use banto_io::status::{
     LIVE_STATUS_BUSY, LIVE_STATUS_SHELL, LIVE_STATUS_WAITING, LiveSession, ProcessProbe,
     SysinfoProbe, entry_is_alive, read_live_sessions,
 };
-use banto_io::store::{InterruptState, MemberNaming, Store, StoreError};
+use banto_io::store::{InterruptState, MemberNaming, Store, StoreError, UnreadInterrupt};
 
 /// Who banto launched this server for — passed in via the `_mcp` args at
 /// launch (the "register the pair at launch" hook). `brigade` + `member`
@@ -101,6 +102,19 @@ pub struct Identity {
     pub role: Option<BrigadeRole>,
 }
 
+/// The name banto's server goes by in a member's MCP config: the `server` a hook
+/// addresses and the `mcp__banto__` prefix of every tool the model sees.
+pub(crate) const SERVER_NAME: &str = "banto";
+
+/// The hook-only tool [`tool_interrupt_gate`] answers.
+pub(crate) const GATE_TOOL: &str = "interrupt_gate";
+
+/// What a tool of this server is called in a hook's `tool_name`.
+const OWN_TOOL_PREFIX: &str = "mcp__banto__";
+
+/// `check_messages` as a hook names it.
+const CHECK_MESSAGES_HOOK_NAME: &str = "mcp__banto__check_messages";
+
 /// Per-connection state: the caller's identity, the shared store, and
 /// `claude_home` and (when available) `codex_home` — [`tool_brigade_status`]
 /// checks each product's separate source: Claude's live-state files, and for
@@ -118,6 +132,27 @@ struct ServerContext {
     goinkyo_dir: Option<PathBuf>,
     goinkyo_policy: GoinkyoPolicy,
     message_log: Option<MessageLog>,
+    gate: GateState,
+}
+
+/// What the interrupt gate remembers between calls. It lives here, in this
+/// process's memory, and never in the store: the store says what became of an
+/// interrupt (`armed`, `gated`, `capped`), but nothing in it is read to decide a
+/// call, so a restarted `_mcp` costs at most a few more refusals and never a
+/// wrong one.
+#[derive(Debug, Default)]
+struct GateState {
+    /// Refusals counted so far for the interrupt being watched, by `agent_id`
+    /// (empty for the main agent). Each agent has its own count, because a
+    /// subagent that spends its three refusals must not open the gate for its
+    /// parent, nor the other way round.
+    refused: HashMap<String, u32>,
+    /// The newest unread interrupt the counts belong to. A different one is a new
+    /// interrupt, and starts every count again.
+    watching: Option<i64>,
+    /// Whether `capped` has been written for the interrupts being watched, so that
+    /// the calls the cap lets through do not each write it again.
+    capped_written: bool,
 }
 
 /// The settings `consult_goinkyo` resolves the Goinkyo's product from, as the
@@ -201,6 +236,7 @@ pub fn run_stdio_server(
         goinkyo_dir,
         goinkyo_policy,
         message_log: message_log.map(|log| MessageLog { log, warned: false }),
+        gate: GateState::default(),
     };
     serve_stdio(|line| handle_line(line, &mut ctx))
 }
@@ -302,9 +338,56 @@ fn initialize_result(msg: &Value) -> Value {
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
-        "serverInfo": { "name": "banto", "version": env!("CARGO_PKG_VERSION") },
+        "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
     })
 }
+
+// What the gate says to a model and to a Worker reading its mail. The words are the
+// Goinkyo's. The leading sentences of the two refusal reasons (everything before
+// "This is not an error") are the ones measured in
+// `docs/notes/claude-wake-spike-2026-11-23.md`: the main agent's read its mail in
+// 6/6 runs, and the subagent's returned in the K-refusal runs. The clause after
+// them, saying the refusal is not an error and not the user's, has not been
+// measured. The third reason has no measurement behind any of it.
+//
+// None of these strings holds the number of refusals: the cap is the gate's, and a
+// model that read it would count on it.
+
+/// What a refused call of the main agent is told, while an interrupt is unread.
+const GATE_REASON_MAIN: &str = "[banto] The Director interrupted you. Call check_messages now \
+    and follow the message. This is not an error and not the user refusing the call: banto \
+    held it back for that message, and the call did not run.";
+
+/// What a refused call of a subagent is told, while an interrupt is unread: also
+/// its own `check_messages`, which is refused outside the count.
+const GATE_REASON_SUBAGENT: &str = "[banto] The Director interrupted this work. Return to the \
+    parent agent at once with a one-line status, and say in it that the parent should call \
+    check_messages. Do not call check_messages yourself. This is not an error and not the \
+    user refusing the call: banto held it back, and the call did not run.";
+
+/// What a subagent's `check_messages` is told when no interrupt is unread. The
+/// mail is the main agent's, and a subagent that pulled it would advance the cursor
+/// and leave its parent nothing to read.
+const GATE_REASON_SUBAGENT_MAIL: &str = "[banto] A subagent cannot read brigade mail: a \
+    message read here would be used up before the parent agent saw it. Go on with your task, \
+    and if you think the parent should check its mail, say so in your status. This is not an \
+    error and not the user refusing the call.";
+
+/// The suffix `format_inbox` puts after `to you` in the header of a message the
+/// gate refused calls for. "In your session" is deliberate: a row can be `gated`
+/// by a subagent's refusals alone.
+const INTERRUPT_HEADER_GATED: &str = " \u{2014} banto refused tool calls in your session so that \
+    you would read this; those calls never ran, and the refusal was banto's, not the user's";
+
+/// The same, once the cap let the work go on before the message was read.
+const INTERRUPT_HEADER_CAPPED: &str = " \u{2014} banto refused tool calls in your session so that \
+    you would read this, then let the work go on unread; the refused calls never ran, and what \
+    ran after them ran past this message";
+
+/// The sentence of `check_messages`'s description that says what that header means.
+const CHECK_MESSAGES_INTERRUPT_SENTENCE: &str = "A message whose header says banto refused tool \
+    calls for it is an interrupt from your Director: the refused calls never ran, and it was \
+    banto refusing, not the user, so decide from the message whether to make them again.";
 
 /// A tool's `_meta` that keeps Claude Code from deferring it. Claude Code defers
 /// MCP tools: a member sees their names only until it calls ToolSearch, so a
@@ -370,11 +453,10 @@ fn tools_list_result() -> Value {
             {
                 "name": "check_messages",
                 "_meta": always_loaded(),
-                "description": "Pull any new messages your brigade peer has sent you via banto \
-                                (since you last checked). Call it at natural checkpoints. A \
-                                message whose header says banto interrupted your turn stopped \
-                                you mid-work: the tool call it cut was stopped, not refused by \
-                                the user, so look at what it left half-done before you go on.",
+                "description": format!(
+                    "Pull any new messages your brigade peer has sent you via banto (since \
+                     you last checked). Call it at natural checkpoints. {CHECK_MESSAGES_INTERRUPT_SENTENCE}"
+                ),
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             },
             {
@@ -550,27 +632,24 @@ fn tools_list_result() -> Value {
             },
             {
                 "name": "interrupt_worker",
-                "description": "Director only. Stop a Worker's running turn, then deliver \
-                                `text` to it as an ordinary message. banto writes one Esc \
-                                into the Worker's pane, but only when it is a Claude Worker \
-                                in a running turn right now, and then types its usual \
-                                one-line nudge to read mail once the pane is at rest. Use it \
-                                when work in flight has become wrong or wasted and letting \
-                                the turn finish costs more than cutting it. The price: the \
-                                tool call the Worker was in the middle of is cut, and its \
-                                own transcript records that as refused by the user. banto's \
-                                inbox header on your message says it was an interrupt and \
-                                that the call was stopped, not refused, but the Worker may \
-                                weigh the transcript line first. If the stop is the \
-                                operator's wish, say so in `text`. Not for an idle Worker \
-                                (send_to_peer reaches it), and not for a Codex Worker: its \
-                                turn is not interrupted, and the message goes as ordinary \
-                                mail. One Worker per call: there is no broadcast, and the \
-                                Goinkyo and the Director cannot be interrupted. The call \
-                                waits about 2 seconds for banto's decision and reports it; \
-                                if it says the request is queued and not decided, \
-                                brigade_status shows what followed for as long as the \
-                                message is unread.",
+                "description": "Director only. Deliver `text` to a Worker as a message and have \
+                                banto refuse the Worker's next tool calls (up to 3, for a \
+                                Claude Worker whose relay is on) with a note telling it to read \
+                                its mail. banto cannot stop a turn: a turn that calls no tool \
+                                runs to its end, and a call already running is not cut, so what \
+                                the Worker is doing right now finishes. The refused calls never \
+                                run, and the header on your message tells the Worker that the \
+                                refusal was banto's. Use it when work in flight has become wrong \
+                                or wasted and the next steps of the turn cost more than \
+                                refusing them. If the stop is the operator's wish, say so in \
+                                `text`. Under a manual relay, and for a Codex Worker, nothing \
+                                is refused: the message goes as ordinary mail. Not for an idle \
+                                Worker (send_to_peer reaches it). One Worker per call: there is \
+                                no broadcast, and the Goinkyo and the Director cannot be \
+                                interrupted. The call waits about 2 seconds for banto's \
+                                decision and reports it; if it says the request is queued and \
+                                not decided, brigade_status shows what followed for as long as \
+                                the message is unread.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -586,6 +665,21 @@ fn tools_list_result() -> Value {
                         }
                     },
                     "required": ["member", "text"],
+                    "additionalProperties": false,
+                },
+            },
+            {
+                "name": GATE_TOOL,
+                "description": "Not for you to call. banto's own hook calls this before each of \
+                                your tool calls, to learn whether banto is refusing the call \
+                                because your Director interrupted you. Calling it yourself does \
+                                nothing useful.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tool_name": { "type": "string" },
+                        "agent_id": { "type": "string" }
+                    },
                     "additionalProperties": false,
                 },
             },
@@ -607,6 +701,7 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
         "name_member" => tool_name_member(ctx, msg),
         "request_decision" => tool_request_decision(ctx),
         "interrupt_worker" => interrupt_worker(ctx, msg, INTERRUPT_WAIT),
+        GATE_TOOL => tool_interrupt_gate(ctx, msg),
         other => tool_error(&format!("unknown tool: {other}")),
     }
 }
@@ -656,6 +751,7 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
     // only those: once the Worker has read its message the cursor says it was
     // delivered, and nothing about the pane is left worth saying.
     let unread_interrupts = ctx.store.unread_interrupts(brigade).unwrap_or_default();
+    let now_ms = unix_ms(SystemTime::now());
 
     let peers: Vec<&BrigadeMember> = members.iter().filter(|m| role.can_reach(m.role)).collect();
     if peers.is_empty() {
@@ -696,7 +792,7 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
                 } else {
                     ""
                 },
-                interrupt_note(&unread_interrupts, &peer.token),
+                interrupt_note(&unread_interrupts, &peer.token, now_ms),
                 if peer.role == BrigadeRole::Goinkyo {
                     consultation_age(ctx, brigade, &peer.token)
                 } else {
@@ -1702,12 +1798,13 @@ fn format_inbox(messages: &[BrigadeMessage], members: &[BrigadeMember]) -> Strin
             .iter()
             .find(|member| member.token == message.from_token)
             .and_then(|member| member.display_name.as_deref());
-        // Said in the header because the transcript says the opposite: the call an
-        // interrupt cut is recorded there as refused by the user.
-        let interrupted = if message.interrupted {
-            INTERRUPT_HEADER
-        } else {
-            ""
+        // Said in the header because the transcript does not: a call the gate
+        // refused is recorded there as an error of a hook, and nothing in it says
+        // whose decision it was.
+        let interrupted = match message.interrupted {
+            Some(InterruptOutcome::Gated) => INTERRUPT_HEADER_GATED,
+            Some(InterruptOutcome::Capped) => INTERRUPT_HEADER_CAPPED,
+            _ => "",
         };
         out.push_str(&format!(
             "\n[from {} — {addressing}{interrupted}]\n{}\n",
@@ -1841,13 +1938,10 @@ fn tool_name_member(ctx: &mut ServerContext, msg: &Value) -> Value {
 /// How long `interrupt_worker` waits for the UI's decision. The UI decides on
 /// its once-a-second tick, so two seconds covers one tick and its write with a
 /// margin; a longer wait would hold the Director's turn for a thing that is
-/// better looked at afterwards.
+/// better looked at afterwards. The gate does not wait for the decision: it needs
+/// only the message, which is in the store when the tool returns.
 const INTERRUPT_WAIT: Duration = Duration::from_secs(2);
 const INTERRUPT_POLL: Duration = Duration::from_millis(50);
-
-/// The suffix `format_inbox` puts in the header of a message whose request had an
-/// Esc written for it.
-const INTERRUPT_HEADER: &str = " — banto interrupted your turn for this message; the tool call it cut was stopped, not refused";
 
 /// The argument that carries the message text of `send_to_peer` and
 /// `interrupt_worker`: `text`, or `message` when only that one is sent. `text`
@@ -1909,7 +2003,7 @@ fn only_arguments(msg: &Value, allowed: &[&str], tolerated: &[&str]) -> Result<(
 /// Director only, by the store's live membership; the write checks again, in its
 /// own transaction, that the caller is the brigade's Director and the target one
 /// of its Workers. Nothing here looks at a pane, a live file or a screen: those are
-/// the UI process's, and whether anything is pressed is decided there, once.
+/// the UI process's, and whether the Worker has a gate to arm is decided there, once.
 /// `wait` is a parameter so a test need not sit through the real two seconds.
 fn interrupt_worker(ctx: &mut ServerContext, msg: &Value, wait: Duration) -> Value {
     let (brigade, token, role) = match live_membership(ctx) {
@@ -2035,54 +2129,44 @@ fn interrupt_worker(ctx: &mut ServerContext, msg: &Value, wait: Duration) -> Val
 }
 
 /// What the Director is told of a decided interrupt. The message is delivered in
-/// every case; what differs is whether an Esc was written for it and what to
-/// expect of the Worker.
+/// every case; what differs is whether the Worker has a gate that refuses its
+/// calls, and what to expect of it.
 fn interrupt_result(who: &str, outcome: InterruptOutcome) -> String {
     use InterruptOutcome::*;
     match outcome {
-        Pressed => format!(
-            "Esc written into {who}'s pane; your message is queued as ordinary mail, and \
-             banto will nudge it to read once the pane is at rest. brigade_status shows \
-             whether the turn stopped for as long as the message is unread."
+        Armed => format!(
+            "banto will refuse {who}'s next tool calls, up to {GATE_REFUSALS}, with a note to \
+             read its mail; the calls it refuses never run. A turn that calls no tool runs to \
+             its end and a call already running is not cut, so your message also waits as \
+             ordinary mail, and banto nudges {who} to read it once it is idle. brigade_status \
+             shows what followed for as long as the message is unread."
         ),
-        Stopped => format!(
-            "{who}'s turn was stopped and your message is queued; banto will nudge it to \
-             read it."
+        Gated => format!(
+            "banto has already refused a tool call of {who}'s, and it never ran. {who} has not \
+             read your message yet; it is queued as ordinary mail and banto nudges {who} to read \
+             it once it is idle."
         ),
-        OtherText => format!(
-            "Esc written into {who}'s pane and its turn stopped, but the pane holds unsent \
-             input banto did not type, so your message waits: the operator has to clear the \
-             line (or send that input) before the nudge can be typed."
-        ),
-        StillBusy => format!(
-            "Esc written into {who}'s pane, but it was still busy afterwards; your message \
-             is queued as ordinary mail and it reads it at its next pull."
-        ),
-        NotMidTurn => format!(
-            "No Esc written: {who} is not in a running turn. Your message is queued as \
-             ordinary mail."
-        ),
-        Waiting => format!(
-            "No Esc written: {who} is waiting on a prompt only the operator can answer, and \
-             an Esc would answer it for them. Your message is queued as ordinary mail."
+        Capped => format!(
+            "banto refused {who}'s tool calls up to the cap of {GATE_REFUSALS} and then let them \
+             through; {who} has not read your message, which is queued as ordinary mail."
         ),
         Read => {
-            format!("No Esc written: {who} had already read your message by the time banto looked.")
+            format!(
+                "Nothing is refused: {who} had already read your message by the time banto looked."
+            )
         }
         Codex => format!(
-            "No Esc written: {who} runs Codex, whose turns banto does not interrupt. Your \
-             message is queued as ordinary mail."
+            "Nothing is refused: {who} runs Codex, which has no gate. Your message is queued as \
+             ordinary mail."
         ),
-        RelayManual => "No Esc written: this brigade's relay is manual, so banto writes nothing \
-                        into panes. Your message is queued as ordinary mail."
+        RelayManual => "Nothing is refused: this brigade's relay is manual, so a Worker has no \
+                        gate. Your message is queued as ordinary mail."
             .to_string(),
         NoPane => format!(
-            "No Esc written: banto has no pane for {who} right now. Your message is queued \
-             as ordinary mail."
+            "banto armed nothing: it found no running pane for {who}, or one that was still \
+             starting, and a pane that was already starting may refuse tool calls anyway. \
+             Your message is queued as ordinary mail."
         ),
-        Expired => "No Esc written: the request was too old when banto got to it. Your message is \
-                    queued as ordinary mail."
-            .to_string(),
     }
 }
 
@@ -2091,37 +2175,192 @@ fn interrupt_result(who: &str, outcome: InterruptOutcome) -> String {
 fn interrupt_phrase(outcome: Option<InterruptOutcome>) -> &'static str {
     use InterruptOutcome::*;
     match outcome {
-        None => "interrupt not decided yet",
-        Some(Pressed) => "interrupt: Esc pressed, what followed is not seen yet",
-        Some(Stopped) => "interrupt: its turn was stopped",
-        Some(OtherText) => {
-            "interrupt: Esc pressed, but the pane holds unsent input banto did not type, so your \
-             message waits for the operator"
+        None => "not decided yet",
+        Some(Armed) => "armed: its next tool calls are refused until it reads your message",
+        Some(Gated) => "gated: banto refused a tool call of it, and it has not read your message",
+        Some(Capped) => {
+            "capped: banto refused its calls up to the cap and then let them through; it has \
+             not read your message"
         }
-        Some(StillBusy) => "interrupt: Esc pressed, it was still busy afterwards",
-        Some(NotMidTurn) => "interrupt: not pressed, it was not in a running turn",
-        Some(Waiting) => "interrupt: not pressed, it waits on a prompt for the operator",
-        Some(Read) => "interrupt: not pressed, it had already read the message",
-        Some(Codex) => "interrupt: not pressed, a Codex turn is not interrupted",
-        Some(RelayManual) => "interrupt: not pressed, the relay is manual",
-        Some(NoPane) => "interrupt: not pressed, it had no pane",
-        Some(Expired) => "interrupt: not pressed, the request had expired",
+        Some(Read) => "read: it had already read the message",
+        Some(Codex) => "codex: no gate for a Codex Worker, the message is ordinary mail",
+        Some(RelayManual) => {
+            "relay-manual: no gate under a manual relay, the message is ordinary mail"
+        }
+        Some(NoPane) => {
+            "no-pane: it had no running pane, or one still starting that may refuse calls \
+             anyway; the message is ordinary mail"
+        }
     }
 }
 
-/// ` (interrupt: …)` for a member with unread interrupts, in the order they were
-/// sent, or nothing.
-fn interrupt_note(unread: &[(MemberToken, Option<InterruptOutcome>)], token: &str) -> String {
-    let phrases: Vec<&str> = unread
+/// ` (interrupt sent 3m ago: …)` for a member with unread interrupts, in the order
+/// they were sent, or nothing. The age is how long the message has gone unread,
+/// from the clock of the process that asks.
+fn interrupt_note(unread: &[UnreadInterrupt], token: &str, now_ms: i64) -> String {
+    let phrases: Vec<String> = unread
         .iter()
-        .filter(|(member, _)| member == token)
-        .map(|(_, outcome)| interrupt_phrase(*outcome))
+        .filter(|interrupt| interrupt.member == token)
+        .map(|interrupt| {
+            format!(
+                "interrupt sent {} ago, {}",
+                elapsed_label(now_ms - interrupt.created_at_ms),
+                interrupt_phrase(interrupt.outcome)
+            )
+        })
         .collect();
     if phrases.is_empty() {
         String::new()
     } else {
         format!(" ({})", phrases.join("; "))
     }
+}
+
+/// How many calls of one agent the gate refuses for an unread interrupt before it
+/// lets that agent's calls through. Three is what was measured
+/// (docs/notes/claude-wake-spike-2026-11-23.md, "A cap on refusals"): a Worker
+/// that must search for a deferred `check_messages` first spends one refusal on the
+/// search, and a subagent that tries to hand back before it has understood spends
+/// one or two there. The cap is what bounds a model that ignores the refusal, so it
+/// is not made larger to wait for a slower reader.
+const GATE_REFUSALS: u32 = 3;
+
+/// What the gate answers a hook.
+enum GateDecision {
+    Allow,
+    Refuse(&'static str),
+}
+
+/// `interrupt_gate`: the answer to a `PreToolUse` hook, not a tool a model calls.
+/// The hook passes `tool_name` and `agent_id` (empty for the main agent, set for a
+/// subagent) and this member's own server answers, so who is asking is not an
+/// argument anyone could get wrong. An empty text lets the call run; a deny object
+/// refuses it with a reason the model reads.
+///
+/// Every failure here is an error result, which the hook reads as "let the call
+/// through": a broken gate must never stop a Worker, so nothing is made to refuse
+/// on doubt.
+fn tool_interrupt_gate(ctx: &mut ServerContext, msg: &Value) -> Value {
+    let argument = |name: &str| {
+        msg.pointer(&format!("/params/arguments/{name}"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    match gate_decision(ctx, &argument("tool_name"), &argument("agent_id")) {
+        Ok(GateDecision::Allow) => tool_text(String::new(), false),
+        Ok(GateDecision::Refuse(reason)) => tool_text(
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            })
+            .to_string(),
+            false,
+        ),
+        Err(message) => tool_error(&message),
+    }
+}
+
+/// The gate's rules, in the order they apply:
+///
+/// 1. A caller that is not a Worker, or no longer anything, is allowed. Only a
+///    Worker's launch carries the hook, and a caller the store does not know is not
+///    one to refuse on a guess.
+/// 2. With no unread interrupt for this Worker, everything is allowed, and every
+///    count is forgotten, except a subagent's `check_messages`: the mail is the
+///    main agent's, and a subagent that pulled it would advance the cursor and
+///    leave the parent nothing to read. A different newest unread interrupt than
+///    the one watched forgets the counts too, so that a second interrupt gets its
+///    own refusals.
+/// 3. With one unread, a subagent's `check_messages` is refused with the subagent's
+///    reason, outside the count: it spends none of the subagent's refusals and
+///    writes nothing, before and after the cap opens.
+/// 4. banto's own tools are allowed, so that the one way to end the refusals is
+///    never itself refused.
+/// 5. Any other call is refused until this `agent_id` has been refused
+///    [`GATE_REFUSALS`] times; every refusal writes `gated` over what the UI wrote.
+///    After that the agent's calls are allowed, and when it is the main agent's
+///    that the cap lets through, `capped` is written once. A subagent that reaches
+///    the cap leaves the word at `gated`: the Worker has not been let through, only
+///    one of its helpers.
+///
+/// The words are written over the unread interrupts of this Worker, all of them,
+/// because one pull reads them all and the header is per message.
+///
+/// A failure to read the store allows the call, like every failure of the gate: a
+/// subagent's `check_messages` is then let through too, because what it would be
+/// refused for cannot be told.
+fn gate_decision(
+    ctx: &mut ServerContext,
+    tool_name: &str,
+    agent_id: &str,
+) -> Result<GateDecision, String> {
+    let is_subagent = !agent_id.is_empty();
+    let reads_mail = is_subagent && tool_name == CHECK_MESSAGES_HOOK_NAME;
+    let (brigade, token, role) = match live_membership(ctx) {
+        Ok(Some(membership)) => membership,
+        Ok(None) => return Ok(GateDecision::Allow),
+        Err(err) => return Err(format!("failed to resolve brigade membership: {err}")),
+    };
+    if role != BrigadeRole::Worker {
+        return Ok(GateDecision::Allow);
+    }
+    let unread = ctx
+        .store
+        .unread_interrupt_ids(brigade, &token)
+        .map_err(|err| format!("failed to read the unread interrupts: {err}"))?;
+    let Some(&newest) = unread.last() else {
+        ctx.gate = GateState::default();
+        return Ok(if reads_mail {
+            GateDecision::Refuse(GATE_REASON_SUBAGENT_MAIL)
+        } else {
+            GateDecision::Allow
+        });
+    };
+    if ctx.gate.watching != Some(newest) {
+        ctx.gate = GateState {
+            watching: Some(newest),
+            ..GateState::default()
+        };
+    }
+    if reads_mail {
+        return Ok(GateDecision::Refuse(GATE_REASON_SUBAGENT));
+    }
+    if tool_name.starts_with(OWN_TOOL_PREFIX) {
+        return Ok(GateDecision::Allow);
+    }
+    let refused = ctx.gate.refused.entry(agent_id.to_string()).or_insert(0);
+    if *refused < GATE_REFUSALS {
+        *refused += 1;
+        // Best effort: a write that fails still leaves the call refused, and the
+        // next refusal writes it again.
+        write_gate_outcome(ctx, &unread, InterruptOutcome::Gated);
+        return Ok(GateDecision::Refuse(if is_subagent {
+            GATE_REASON_SUBAGENT
+        } else {
+            GATE_REASON_MAIN
+        }));
+    }
+    if !is_subagent
+        && !ctx.gate.capped_written
+        && write_gate_outcome(ctx, &unread, InterruptOutcome::Capped)
+    {
+        ctx.gate.capped_written = true;
+    }
+    Ok(GateDecision::Allow)
+}
+
+/// Write `outcome` over every unread interrupt in `ids`; the store's overwrite
+/// table decides which of them take it. `true` when no write failed.
+fn write_gate_outcome(ctx: &mut ServerContext, ids: &[i64], outcome: InterruptOutcome) -> bool {
+    let mut all_written = true;
+    for id in ids {
+        all_written &= ctx.store.record_interrupt_outcome(*id, outcome).is_ok();
+    }
+    all_written
 }
 
 /// `request_decision`: record that this Director is waiting on the operator's
@@ -2464,6 +2703,7 @@ mod tests {
             goinkyo_dir: None,
             goinkyo_policy: GoinkyoPolicy::default(),
             message_log: None,
+            gate: GateState::default(),
         }
     }
 
@@ -2723,6 +2963,11 @@ mod tests {
         let tools = tools_list_result();
         for tool in tools["tools"].as_array().unwrap() {
             let name = tool["name"].as_str().unwrap();
+            // The gate is a hook's, and a Codex member has no such hook: no model
+            // is meant to call it, so no briefing names it.
+            if name == GATE_TOOL {
+                continue;
+            }
             let director_only = tool["description"]
                 .as_str()
                 .unwrap()
@@ -3046,7 +3291,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_worker_is_advertised_with_its_price_and_a_closed_schema() {
+    fn interrupt_worker_is_advertised_with_what_it_does_and_does_not_do_and_a_closed_schema() {
         let tools = tools_list_result();
         let tool = tools["tools"]
             .as_array()
@@ -3056,11 +3301,23 @@ mod tests {
             .expect("advertised");
         let description = tool["description"].as_str().unwrap();
         assert!(description.starts_with("Director only."), "{description}");
-        // The price, in the words the Director will read it by.
         let flat = description.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(flat.contains("refused by the user"), "{flat}");
-        assert!(flat.contains("stopped, not refused"), "{flat}");
+        // What it is: a refusal of the next calls, not a stop.
+        assert!(
+            flat.contains("refuse the Worker's next tool calls"),
+            "{flat}"
+        );
+        assert!(flat.contains("up to 3"), "{flat}");
+        // What it is not, in the words the Director will weigh it by.
+        assert!(flat.contains("banto cannot stop a turn"), "{flat}");
+        assert!(flat.contains("a call already running is not cut"), "{flat}");
+        assert!(flat.contains("runs to its end"), "{flat}");
         assert!(flat.contains("operator's wish"), "{flat}");
+        assert!(flat.contains("manual relay"), "{flat}");
+        assert!(flat.contains("Codex Worker"), "{flat}");
+        // Nothing of the Esc is left to promise.
+        assert!(!flat.contains("Esc"), "{flat}");
+        assert!(!flat.contains("refused by the user"), "{flat}");
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         assert_eq!(
             tool["inputSchema"]["required"],
@@ -3070,25 +3327,65 @@ mod tests {
     }
 
     #[test]
-    fn check_messages_tells_what_an_interrupted_turn_means() {
+    fn check_messages_carries_the_sentence_about_an_interrupt_in_its_description() {
         // The sentence lives in the tool description, not the Worker briefing, so
         // an operator's own `worker_prompt` cannot lose it. A new Claude session
         // reads the description only because the tool is always loaded (see
-        // `always_loaded`, which says a resumed one keeps deferring it); a Codex
-        // member's tools are deferred, and only a Claude Worker's turn is ever
-        // stopped.
+        // `always_loaded`, which says a resumed one keeps deferring it).
         let tools = tools_list_result();
-        let description = tools["tools"]
+        let tool = tools["tools"]
             .as_array()
             .unwrap()
             .iter()
             .find(|tool| tool["name"] == "check_messages")
-            .and_then(|tool| tool["description"].as_str())
             .expect("advertised");
-        let flat = description.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(flat.contains("banto interrupted your turn"), "{flat}");
-        assert!(flat.contains("stopped, not refused by the user"), "{flat}");
-        assert!(flat.contains("half-done"), "{flat}");
+        assert_eq!(tool["_meta"], always_loaded());
+        let description = tool["description"].as_str().unwrap();
+        assert!(
+            description.contains(CHECK_MESSAGES_INTERRUPT_SENTENCE),
+            "{description}"
+        );
+        // The sentence that went false with the Esc.
+        for gone in ["half-done", "stopped, not refused", "mid-work"] {
+            assert!(!description.contains(gone), "{gone}: {description}");
+        }
+    }
+
+    #[test]
+    fn the_gate_is_advertised_as_not_for_a_model_to_call_and_takes_the_two_hook_inputs() {
+        let tools = tools_list_result();
+        let tool = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == GATE_TOOL)
+            .expect("the hook's tool is listed");
+        assert!(
+            tool["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("Not for you to call."),
+        );
+        assert!(tool.get("_meta").is_none(), "it must stay deferred");
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+        assert_eq!(
+            properties.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["agent_id", "tool_name"]
+        );
+    }
+
+    #[test]
+    fn the_names_a_hook_sees_are_the_servers_name_with_the_tool_after_it() {
+        assert_eq!(OWN_TOOL_PREFIX, format!("mcp__{SERVER_NAME}__"));
+        assert_eq!(
+            CHECK_MESSAGES_HOOK_NAME,
+            format!("{OWN_TOOL_PREFIX}check_messages")
+        );
+        assert_eq!(
+            initialize_result(&json!({}))["serverInfo"]["name"],
+            SERVER_NAME
+        );
     }
 
     #[test]
@@ -3201,8 +3498,8 @@ mod tests {
         let pending = ctx.store.pending_interrupts(1).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].member, "worker-1");
-        // The Worker's own pull is the ordinary one, no header about an interrupt
-        // until banto has written an Esc for it.
+        // The Worker's own pull is the ordinary one: no header about an interrupt
+        // until the gate has refused a call for it.
         let mut worker = worker_ctx_of(ctx, "worker-1");
         let pulled = pull(&mut worker);
         assert!(pulled.contains("switch to the other file"), "{pulled}");
@@ -3214,61 +3511,74 @@ mod tests {
     }
 
     #[test]
-    fn the_worker_is_told_in_the_header_only_when_an_esc_was_written_for_its_message() {
+    fn the_worker_is_told_in_the_header_only_when_the_gate_refused_a_call_for_its_message() {
+        use InterruptOutcome::*;
         for (outcome, header) in [
-            (InterruptOutcome::Pressed, true),
-            (InterruptOutcome::Stopped, true),
-            (InterruptOutcome::StillBusy, true),
-            (InterruptOutcome::NotMidTurn, false),
-            (InterruptOutcome::Codex, false),
+            (Armed, None),
+            (Gated, Some(INTERRUPT_HEADER_GATED)),
+            (Capped, Some(INTERRUPT_HEADER_CAPPED)),
+            (Codex, None),
+            (RelayManual, None),
+            (NoPane, None),
+            (Read, None),
         ] {
             let mut ctx = named_ctx();
             interrupt_now(&mut ctx, json!({"member": "worker-1", "text": "stop"}));
             let id = ctx.store.pending_interrupts(1).unwrap()[0].message_id;
-            // A refinement is only ever written over a press.
-            if outcome.is_refinement() {
-                ctx.store
-                    .record_interrupt_outcome(id, InterruptOutcome::Pressed)
-                    .unwrap();
+            // The gate's words only go over the UI's `armed`, as in a real run.
+            if matches!(outcome, Gated | Capped) {
+                ctx.store.record_interrupt_outcome(id, Armed).unwrap();
             }
             ctx.store.record_interrupt_outcome(id, outcome).unwrap();
             let mut worker = worker_ctx_of(ctx, "worker-1");
             let pulled = pull(&mut worker);
-            assert_eq!(
-                pulled.contains(
-                    "[from director \u{2014} to you \u{2014} banto interrupted your turn for \
-                     this message; the tool call it cut was stopped, not refused]"
-                ),
-                header,
-                "{outcome:?}: {pulled}"
-            );
+            let expected = format!("[from director \u{2014} to you{}]", header.unwrap_or(""));
+            assert!(pulled.contains(&expected), "{outcome:?}: {pulled}");
         }
     }
 
     #[test]
-    fn brigade_status_shows_the_outcome_of_an_unread_interrupt_and_drops_it_once_read() {
+    fn a_message_that_was_not_an_interrupt_never_gets_the_header() {
+        let mut director = named_ctx();
+        let sent = call(
+            &mut director,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call",
+                "params":{"name":"send_to_peer","arguments":{"text":"plain","to":"worker-1"}}}"#,
+        );
+        assert!(!is_error(&sent));
+        let mut worker = worker_ctx_of(director, "worker-1");
+        let pulled = pull(&mut worker);
+        assert!(pulled.contains("plain"), "{pulled}");
+        assert!(!pulled.contains("banto refused tool calls"), "{pulled}");
+    }
+
+    #[test]
+    fn brigade_status_shows_the_word_of_an_unread_interrupt_and_drops_it_once_read() {
+        use InterruptOutcome::*;
         let mut ctx = named_ctx();
         interrupt_now(
             &mut ctx,
             json!({"member": "worker-1", "text": "zzz-marker"}),
         );
         let status = |ctx: &mut ServerContext| result_text(&call(ctx, &status_call()));
-        assert!(status(&mut ctx).contains("(interrupt not decided yet)"));
+        assert!(status(&mut ctx).contains("(interrupt sent 0m ago, not decided yet)"));
 
         let id = ctx.store.pending_interrupts(1).unwrap()[0].message_id;
-        ctx.store
-            .record_interrupt_outcome(id, InterruptOutcome::Pressed)
-            .unwrap();
+        ctx.store.record_interrupt_outcome(id, Armed).unwrap();
         let text = status(&mut ctx);
         assert!(
-            text.contains("has unread mail from you (interrupt: Esc pressed"),
+            text.contains(
+                "has unread mail from you (interrupt sent 0m ago, armed: its next tool calls \
+                 are refused until it reads your message)"
+            ),
             "{text}"
         );
-        ctx.store
-            .record_interrupt_outcome(id, InterruptOutcome::OtherText)
-            .unwrap();
+        ctx.store.record_interrupt_outcome(id, Gated).unwrap();
         let text = status(&mut ctx);
-        assert!(text.contains("unsent input banto did not type"), "{text}");
+        assert!(text.contains("interrupt sent 0m ago, gated:"), "{text}");
+        ctx.store.record_interrupt_outcome(id, Capped).unwrap();
+        let text = status(&mut ctx);
+        assert!(text.contains("interrupt sent 0m ago, capped:"), "{text}");
         // No quotation of anything on the line, only the fact.
         assert!(!text.contains("zzz-marker"), "{text}");
 
@@ -3293,30 +3603,542 @@ mod tests {
     }
 
     #[test]
-    fn every_outcome_is_worded_and_says_whether_an_esc_was_written() {
+    fn an_unread_interrupts_age_is_how_long_ago_it_was_written() {
+        let interrupt = |member: &str, outcome, ago_min: i64| UnreadInterrupt {
+            member: member.to_string(),
+            outcome,
+            created_at_ms: 10_000_000 - ago_min * 60_000,
+        };
+        let unread = [
+            interrupt("worker-1", Some(InterruptOutcome::Gated), 3),
+            interrupt("worker-2", Some(InterruptOutcome::Armed), 9),
+            interrupt("worker-1", None, 90),
+        ];
+        assert_eq!(
+            interrupt_note(&unread, "worker-1", 10_000_000),
+            " (interrupt sent 3m ago, gated: banto refused a tool call of it, and it has not \
+             read your message; interrupt sent 1h ago, not decided yet)"
+        );
+        assert_eq!(interrupt_note(&unread, "worker-3", 10_000_000), "");
+        // A clock that disagrees never prints a negative age.
+        assert!(interrupt_note(&unread, "worker-2", 0).contains("sent 0m ago"));
+    }
+
+    #[test]
+    fn every_outcome_is_worded_for_the_director_and_says_whether_anything_is_refused() {
         use InterruptOutcome::*;
-        for outcome in [
-            Pressed,
-            NotMidTurn,
-            Waiting,
-            Read,
-            Codex,
-            RelayManual,
-            NoPane,
-            Expired,
-            Stopped,
-            OtherText,
-            StillBusy,
-        ] {
+        for outcome in [Armed, Gated, Capped, Read, Codex, RelayManual, NoPane] {
             let text = interrupt_result("worker-1", outcome);
             assert!(text.contains("message"), "{outcome:?}: {text}");
+            assert!(!text.contains("Esc"), "{outcome:?}: {text}");
+            // Only the words that mean there is no gate start by saying nothing is
+            // refused; the others say what banto did or will do. `no-pane` is not
+            // one: a pane still starting may have the hook already.
             assert_eq!(
-                text.starts_with("No Esc written"),
-                !outcome.esc_written(),
+                text.starts_with("Nothing is refused"),
+                matches!(outcome, Read | Codex | RelayManual),
                 "{outcome:?}: {text}"
             );
             assert!(!interrupt_phrase(Some(outcome)).is_empty());
+            assert!(
+                interrupt_phrase(Some(outcome)).starts_with(outcome.as_token()),
+                "{outcome:?}: the status line leads with the stored word"
+            );
         }
+        let armed = interrupt_result("worker-1", Armed);
+        assert!(armed.contains("up to 3"), "{armed}");
+        assert!(
+            armed.contains("a call already running is not cut"),
+            "{armed}"
+        );
+        assert!(armed.contains("runs to its end"), "{armed}");
+    }
+
+    // --- the gate --------------------------------------------------------------------
+
+    /// A Worker's own context with one unread interrupt for it, and that
+    /// interrupt's id; `decided` is what the UI wrote over it, as the tick does.
+    fn worker_with_interrupt(decided: Option<InterruptOutcome>) -> (ServerContext, i64) {
+        let mut director = named_ctx();
+        interrupt_now(&mut director, json!({"member": "worker-1", "text": "stop"}));
+        let id = director.store.pending_interrupts(1).unwrap()[0].message_id;
+        if let Some(outcome) = decided {
+            assert!(
+                director
+                    .store
+                    .record_interrupt_outcome(id, outcome)
+                    .unwrap()
+            );
+        }
+        (worker_ctx_of(director, "worker-1"), id)
+    }
+
+    /// A Worker with no interrupt at all.
+    fn worker_with_none() -> ServerContext {
+        worker_ctx_of(named_ctx(), "worker-1")
+    }
+
+    fn another_interrupt(ctx: &mut ServerContext) -> i64 {
+        ctx.store
+            .enqueue_interrupt_message(1, "director", "worker-1", "again")
+            .unwrap()
+            .unwrap()
+    }
+
+    /// What the hook gets back for one call: `None` for a call let through (empty
+    /// text), the reason for one refused. The deny object is checked as Claude
+    /// Code reads it.
+    fn gate(ctx: &mut ServerContext, tool: &str, agent: &str) -> Option<String> {
+        let result = tool_interrupt_gate(
+            ctx,
+            &json!({
+                "params": {
+                    "name": GATE_TOOL,
+                    "arguments": { "tool_name": tool, "agent_id": agent }
+                }
+            }),
+        );
+        assert_eq!(result["isError"], false, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        if text.is_empty() {
+            return None;
+        }
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let output = &parsed["hookSpecificOutput"];
+        assert_eq!(output["hookEventName"], "PreToolUse");
+        assert_eq!(output["permissionDecision"], "deny");
+        assert_eq!(parsed.as_object().unwrap().len(), 1, "{parsed}");
+        Some(
+            output["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    }
+
+    fn stored(ctx: &ServerContext, id: i64) -> InterruptState {
+        ctx.store.interrupt_state(id).unwrap()
+    }
+
+    #[test]
+    fn nothing_the_gate_says_to_a_model_holds_the_number_of_refusals() {
+        // A model that read the cap would count on it.
+        for text in [
+            GATE_REASON_MAIN,
+            GATE_REASON_SUBAGENT,
+            GATE_REASON_SUBAGENT_MAIL,
+            INTERRUPT_HEADER_GATED,
+            INTERRUPT_HEADER_CAPPED,
+            CHECK_MESSAGES_INTERRUPT_SENTENCE,
+        ] {
+            let lower = text.to_lowercase();
+            assert!(!text.chars().any(|c| c.is_ascii_digit()), "{text}");
+            for word in ["three", "twice", "times", "cap"] {
+                assert!(!lower.contains(word), "{word}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_subagent_calling_check_messages_is_refused_with_no_interrupt_unread() {
+        let mut ctx = worker_with_none();
+        assert_eq!(
+            gate(&mut ctx, CHECK_MESSAGES_HOOK_NAME, "agent-1").as_deref(),
+            Some(GATE_REASON_SUBAGENT_MAIL)
+        );
+        // However often it asks: this is a rule, not a count.
+        for _ in 0..5 {
+            assert_eq!(
+                gate(&mut ctx, CHECK_MESSAGES_HOOK_NAME, "agent-1").as_deref(),
+                Some(GATE_REASON_SUBAGENT_MAIL)
+            );
+        }
+        // The main agent reads its own mail.
+        assert_eq!(gate(&mut ctx, CHECK_MESSAGES_HOOK_NAME, ""), None);
+    }
+
+    #[test]
+    fn a_subagent_calling_check_messages_is_refused_with_an_interrupt_unread_and_uncounted() {
+        // Before and after the cap opens; the reason is the interrupt one.
+        let (mut ctx, id) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        for _ in 0..5 {
+            assert_eq!(
+                gate(&mut ctx, CHECK_MESSAGES_HOOK_NAME, "agent-1").as_deref(),
+                Some(GATE_REASON_SUBAGENT),
+                "the reason is the subagent's own, outside the count"
+            );
+        }
+        // It spent none of the subagent's refusals and wrote nothing.
+        assert_eq!(
+            stored(&ctx, id),
+            InterruptState::Decided(InterruptOutcome::Armed)
+        );
+        for _ in 0..GATE_REFUSALS {
+            assert_eq!(
+                gate(&mut ctx, "Read", "agent-1").as_deref(),
+                Some(GATE_REASON_SUBAGENT)
+            );
+        }
+        assert_eq!(gate(&mut ctx, "Read", "agent-1"), None);
+        // The rule outlives the cap: the mail is still the main agent's.
+        assert_eq!(
+            gate(&mut ctx, CHECK_MESSAGES_HOOK_NAME, "agent-1").as_deref(),
+            Some(GATE_REASON_SUBAGENT)
+        );
+        // Once it is read, the subagent is told the other thing.
+        pull(&mut ctx);
+        assert_eq!(
+            gate(&mut ctx, CHECK_MESSAGES_HOOK_NAME, "agent-1").as_deref(),
+            Some(GATE_REASON_SUBAGENT_MAIL)
+        );
+    }
+
+    #[test]
+    fn with_no_unread_interrupt_every_call_is_allowed_and_nothing_is_written() {
+        let (mut ctx, id) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        pull(&mut ctx);
+        for tool in [
+            "Read",
+            "Bash",
+            "ToolSearch",
+            "SubagentHandback",
+            "mcp__other__x",
+        ] {
+            for agent in ["", "agent-1"] {
+                assert_eq!(gate(&mut ctx, tool, agent), None, "{tool} {agent:?}");
+            }
+        }
+        assert_eq!(
+            stored(&ctx, id),
+            InterruptState::Decided(InterruptOutcome::Armed)
+        );
+        // And with no interrupt ever.
+        let mut quiet = worker_with_none();
+        assert_eq!(gate(&mut quiet, "Bash", ""), None);
+    }
+
+    #[test]
+    fn an_unread_interrupt_refuses_three_calls_of_each_agent_and_then_lets_that_agent_through() {
+        let (mut ctx, _) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        // The main agent's three, whatever the tools are (a search counts).
+        for tool in ["Read", "ToolSearch", "Bash"] {
+            assert_eq!(
+                gate(&mut ctx, tool, "").as_deref(),
+                Some(GATE_REASON_MAIN),
+                "{tool}"
+            );
+        }
+        assert_eq!(gate(&mut ctx, "Read", ""), None);
+        assert_eq!(gate(&mut ctx, "Edit", ""), None);
+        // Each subagent has three of its own, untouched by the main agent's.
+        for agent in ["agent-1", "agent-2"] {
+            for _ in 0..GATE_REFUSALS {
+                assert_eq!(
+                    gate(&mut ctx, "Read", agent).as_deref(),
+                    Some(GATE_REASON_SUBAGENT),
+                    "{agent}"
+                );
+            }
+            assert_eq!(gate(&mut ctx, "Read", agent), None, "{agent}");
+        }
+        // And the cap is the same for them as for the main agent: three, not two.
+        assert_eq!(GATE_REFUSALS, 3);
+    }
+
+    #[test]
+    fn a_subagents_hand_back_is_counted_like_any_other_call() {
+        let (mut ctx, _) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        assert!(gate(&mut ctx, "Read", "agent-1").is_some());
+        assert!(gate(&mut ctx, "SubagentHandback", "agent-1").is_some());
+        assert!(gate(&mut ctx, "SubagentHandback", "agent-1").is_some());
+        // The third refusal was the last: the next hand-back goes through.
+        assert_eq!(gate(&mut ctx, "SubagentHandback", "agent-1"), None);
+    }
+
+    #[test]
+    fn banto_own_tools_always_pass_and_are_never_counted() {
+        let (mut ctx, _) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        for tool in [
+            "mcp__banto__check_messages",
+            "mcp__banto__send_to_peer",
+            "mcp__banto__brigade_status",
+        ] {
+            for _ in 0..5 {
+                assert_eq!(gate(&mut ctx, tool, ""), None, "{tool}");
+            }
+        }
+        // None of that spent a refusal: the other tools still get their three.
+        for _ in 0..GATE_REFUSALS {
+            assert!(gate(&mut ctx, "Read", "").is_some());
+        }
+        assert_eq!(gate(&mut ctx, "Read", ""), None);
+        // A subagent may use the others of banto's tools too.
+        assert_eq!(gate(&mut ctx, "mcp__banto__send_to_peer", "agent-1"), None);
+        // A tool of some other server that merely has a similar name is not banto's.
+        let (mut other, _) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        assert!(gate(&mut other, "mcp__bantoish__send_to_peer", "").is_some());
+        assert!(gate(&mut other, "banto__send_to_peer", "").is_some());
+    }
+
+    #[test]
+    fn gated_is_written_at_the_first_refusal_over_armed_and_over_no_word() {
+        for before in [Some(InterruptOutcome::Armed), None] {
+            let (mut ctx, id) = worker_with_interrupt(before);
+            assert!(gate(&mut ctx, "Read", "").is_some());
+            assert_eq!(
+                stored(&ctx, id),
+                InterruptState::Decided(InterruptOutcome::Gated),
+                "{before:?}"
+            );
+        }
+        // A call that is let through writes nothing: it is the first refusal that does.
+        let (mut ctx, id) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        assert_eq!(gate(&mut ctx, "mcp__banto__brigade_status", ""), None);
+        assert_eq!(
+            stored(&ctx, id),
+            InterruptState::Decided(InterruptOutcome::Armed)
+        );
+    }
+
+    #[test]
+    fn the_gate_never_reads_the_word_and_never_replaces_one_the_ui_wrote() {
+        use InterruptOutcome::*;
+        // Whatever the UI decided, an unread interrupt refuses the Worker's calls:
+        // the word is for the Director to read, and a `no-pane` for a pane that was
+        // still starting can still have a hook.
+        for outcome in [Codex, RelayManual, NoPane, Read] {
+            let (mut ctx, id) = worker_with_interrupt(Some(outcome));
+            assert_eq!(
+                gate(&mut ctx, "Read", "").as_deref(),
+                Some(GATE_REASON_MAIN),
+                "{outcome:?}"
+            );
+            for _ in 1..GATE_REFUSALS {
+                assert!(gate(&mut ctx, "Read", "").is_some());
+            }
+            assert_eq!(gate(&mut ctx, "Read", ""), None);
+            // ... and the word stays the UI's.
+            assert_eq!(
+                stored(&ctx, id),
+                InterruptState::Decided(outcome),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capped_is_written_when_the_cap_lets_the_main_agent_through_and_a_subagent_leaves_gated() {
+        let (mut ctx, id) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        for _ in 0..GATE_REFUSALS {
+            assert!(gate(&mut ctx, "Read", "agent-1").is_some());
+        }
+        // A subagent reaching the cap is let through and the word stays `gated`.
+        assert_eq!(gate(&mut ctx, "Read", "agent-1"), None);
+        assert_eq!(
+            stored(&ctx, id),
+            InterruptState::Decided(InterruptOutcome::Gated)
+        );
+        // The main agent still has its own three.
+        for _ in 0..GATE_REFUSALS {
+            assert!(gate(&mut ctx, "Bash", "").is_some());
+        }
+        assert_eq!(
+            stored(&ctx, id),
+            InterruptState::Decided(InterruptOutcome::Gated),
+            "refusing is not passing"
+        );
+        assert_eq!(gate(&mut ctx, "Bash", ""), None);
+        assert_eq!(
+            stored(&ctx, id),
+            InterruptState::Decided(InterruptOutcome::Capped)
+        );
+        // The header the Worker will read says so.
+        let pulled = pull(&mut ctx);
+        assert!(pulled.contains(INTERRUPT_HEADER_CAPPED), "{pulled}");
+        assert!(!pulled.contains(INTERRUPT_HEADER_GATED), "{pulled}");
+    }
+
+    #[test]
+    fn capped_goes_over_no_word_and_over_armed_and_is_written_once_per_interrupt() {
+        // Over no word: the UI's write had not landed when the cap opened.
+        let (mut ctx, id) = worker_with_interrupt(None);
+        for _ in 0..GATE_REFUSALS {
+            gate(&mut ctx, "Read", "");
+        }
+        assert_eq!(gate(&mut ctx, "Read", ""), None);
+        assert_eq!(
+            stored(&ctx, id),
+            InterruptState::Decided(InterruptOutcome::Capped)
+        );
+        assert!(ctx.gate.capped_written);
+        // Nothing goes over `capped`, whatever the UI writes late.
+        assert!(
+            !ctx.store
+                .record_interrupt_outcome(id, InterruptOutcome::Armed)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn reading_the_mail_ends_the_refusals_and_forgets_the_counts() {
+        let (mut ctx, _) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        assert!(gate(&mut ctx, "Read", "").is_some());
+        assert!(gate(&mut ctx, "Read", "").is_some());
+        // The Worker reads its mail: the gate that refused it is open at once.
+        pull(&mut ctx);
+        assert_eq!(gate(&mut ctx, "Read", ""), None);
+        assert_eq!(ctx.gate.refused.len(), 0, "the counts are forgotten");
+        assert_eq!(ctx.gate.watching, None);
+        // A later interrupt starts from three again, not from the one left over.
+        another_interrupt(&mut ctx);
+        for _ in 0..GATE_REFUSALS {
+            assert!(gate(&mut ctx, "Read", "").is_some());
+        }
+        assert_eq!(gate(&mut ctx, "Read", ""), None);
+    }
+
+    #[test]
+    fn a_new_interrupt_while_one_is_unread_starts_every_count_again() {
+        let (mut ctx, first) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        // Run the first one to its cap, for the main agent and a subagent.
+        for agent in ["", "agent-1"] {
+            for _ in 0..GATE_REFUSALS {
+                assert!(gate(&mut ctx, "Read", agent).is_some());
+            }
+            assert_eq!(gate(&mut ctx, "Read", agent), None);
+        }
+        assert_eq!(
+            stored(&ctx, first),
+            InterruptState::Decided(InterruptOutcome::Capped)
+        );
+        let second = another_interrupt(&mut ctx);
+        for agent in ["", "agent-1"] {
+            for _ in 0..GATE_REFUSALS {
+                assert_eq!(
+                    gate(&mut ctx, "Read", agent).as_deref(),
+                    Some(if agent.is_empty() {
+                        GATE_REASON_MAIN
+                    } else {
+                        GATE_REASON_SUBAGENT
+                    }),
+                    "{agent:?}"
+                );
+            }
+            assert_eq!(gate(&mut ctx, "Read", agent), None);
+        }
+        // Both unread interrupts took the words, since one pull reads both: the
+        // second one's `gated` and `capped` are written over the second only,
+        // the first stays `capped`.
+        assert_eq!(
+            stored(&ctx, second),
+            InterruptState::Decided(InterruptOutcome::Capped)
+        );
+        assert_eq!(
+            stored(&ctx, first),
+            InterruptState::Decided(InterruptOutcome::Capped)
+        );
+    }
+
+    #[test]
+    fn the_words_go_over_every_unread_interrupt_because_one_pull_reads_them_all() {
+        let (mut ctx, first) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        let second = another_interrupt(&mut ctx);
+        ctx.store
+            .record_interrupt_outcome(second, InterruptOutcome::Armed)
+            .unwrap();
+        assert!(gate(&mut ctx, "Read", "").is_some());
+        for id in [first, second] {
+            assert_eq!(
+                stored(&ctx, id),
+                InterruptState::Decided(InterruptOutcome::Gated)
+            );
+        }
+        let pulled = pull(&mut ctx);
+        assert_eq!(
+            pulled.matches(INTERRUPT_HEADER_GATED).count(),
+            2,
+            "{pulled}"
+        );
+    }
+
+    #[test]
+    fn only_a_workers_calls_are_gated() {
+        let (worker, _) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        // The Director and the Goinkyo share the store and carry no hook; if one
+        // were asked anyway, it is let through.
+        let mut director = worker_ctx_of(worker, "director");
+        director.identity.role = Some(BrigadeRole::Director);
+        assert_eq!(gate(&mut director, "Read", ""), None);
+        // Not even a subagent's `check_messages`, which is refused for a Worker:
+        // the mail of a Director is its subagents' to read as much as its own.
+        assert_eq!(
+            gate(&mut director, CHECK_MESSAGES_HOOK_NAME, "agent-1"),
+            None
+        );
+        let mut goinkyo = worker_ctx_of(director, "goinkyo");
+        goinkyo.identity.role = Some(BrigadeRole::Goinkyo);
+        assert_eq!(gate(&mut goinkyo, "Read", ""), None);
+        assert_eq!(
+            gate(&mut goinkyo, CHECK_MESSAGES_HOOK_NAME, "agent-1"),
+            None
+        );
+        // A caller the store does not know is not one to refuse on a guess.
+        let mut stranger = self::ctx("s", None, None, None);
+        assert_eq!(gate(&mut stranger, "Read", ""), None);
+        assert_eq!(gate(&mut stranger, "Read", "agent-1"), None);
+        assert_eq!(
+            gate(&mut stranger, CHECK_MESSAGES_HOOK_NAME, "agent-1"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_gate_answers_over_json_rpc_as_an_empty_text_or_a_deny_object() {
+        let (mut ctx, _) = worker_with_interrupt(Some(InterruptOutcome::Armed));
+        let ask = |ctx: &mut ServerContext, tool: &str| {
+            result_text(&call(
+                ctx,
+                &json!({
+                    "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                    "params": {
+                        "name": "interrupt_gate",
+                        "arguments": { "tool_name": tool, "agent_id": "" }
+                    }
+                })
+                .to_string(),
+            ))
+        };
+        let refused = ask(&mut ctx, "Read");
+        let parsed: Value = serde_json::from_str(&refused).unwrap();
+        assert_eq!(
+            parsed["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{refused}"
+        );
+        assert_eq!(
+            parsed["hookSpecificOutput"]["permissionDecisionReason"],
+            GATE_REASON_MAIN
+        );
+        assert_eq!(ask(&mut ctx, "mcp__banto__check_messages"), "");
+        // Arguments that are missing or of the wrong type read as empty: an unknown
+        // tool of the main agent, counted like any other.
+        let odd = result_text(&call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call",
+                "params":{"name":"interrupt_gate","arguments":{"tool_name":7,"agent_id":null}}}"#,
+        ));
+        assert!(odd.contains("deny"), "{odd}");
+    }
+
+    #[test]
+    fn a_server_with_no_store_answers_the_gate_with_an_error_which_the_hook_lets_through() {
+        let response = handle_refusing_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"interrupt_gate","arguments":{"tool_name":"Read","agent_id":""}}}"#,
+            "banto was replaced on disk; restart banto",
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["result"]["isError"], true);
     }
 
     /// Runs `act` on a second connection once the request is listed, the way the UI
@@ -3342,7 +4164,7 @@ mod tests {
         let (dir, mut ctx, _emporium) = file_backed_ctx();
         let decider = decide_while_waiting(dir.path().join("banto.db"), |store, id| {
             store
-                .record_interrupt_outcome(id, InterruptOutcome::Pressed)
+                .record_interrupt_outcome(id, InterruptOutcome::Armed)
                 .unwrap();
         });
         let response = interrupt_waiting(
@@ -3353,7 +4175,7 @@ mod tests {
         decider.join().unwrap();
         assert!(!is_error(&response));
         assert!(
-            result_text(&response).starts_with("Esc written into worker-1's pane"),
+            result_text(&response).starts_with("banto will refuse worker-1's next tool calls"),
             "{}",
             result_text(&response)
         );
@@ -3452,7 +4274,7 @@ mod tests {
 
     #[test]
     fn a_codex_worker_is_queued_like_any_other_and_the_ui_answers_codex() {
-        // The tool does not look at the product: whether a pane is pressed is the
+        // The tool does not look at the product: whether a pane is armed is the
         // UI's decision, and for a Codex Worker it is no.
         let mut ctx = named_ctx();
         let response = interrupt_now(&mut ctx, json!({"member": "worker-2", "text": "stop"}));
@@ -3787,6 +4609,7 @@ mod tests {
             goinkyo_dir: None,
             goinkyo_policy: GoinkyoPolicy::default(),
             message_log: None,
+            gate: GateState::default(),
         };
         (dir, ctx, emporium)
     }

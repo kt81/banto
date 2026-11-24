@@ -82,9 +82,10 @@ Director also gets:
 - `consult_goinkyo` / `dismiss_goinkyo`
 - `request_decision`: the Director needs a decision only you can make; banto tags it
   `▸ decision` until you press Enter in its pane, and does not stop it
-- `interrupt_worker`: stops a Claude Worker's running turn with one Esc and
-  delivers the Director's reason as a message; a Codex Worker gets the message but
-  is not interrupted yet
+- `interrupt_worker`: delivers the Director's reason to a Worker as a message and
+  has banto refuse a Claude Worker's next tool calls (up to 3) until it reads it, only
+  with relay `auto`. It cannot stop a turn or cut a call that is running; with relay
+  `manual`, and for a Codex Worker, it goes as ordinary mail and nothing is refused
 - `name_member`: gives a Worker a display name for its standing role (the token
   stays the address)
 

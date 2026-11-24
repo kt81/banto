@@ -56,6 +56,38 @@ pub struct PendingInterrupt {
     pub read: bool,
 }
 
+/// The statement behind [`Store::pending_interrupts`], a function of its own so
+/// that a test can ask SQLite how it runs it. It leans on the partial index of
+/// migration v22 (`WHERE interrupt = 1`), which is why `interrupt = 1` stays in
+/// the inner select where the planner can match it.
+fn pending_interrupts_sql() -> String {
+    format!(
+        "SELECT id, to_member, created_at_ms, read FROM (
+             SELECT m.id AS id, m.to_member AS to_member, m.created_at_ms AS created_at_ms,
+                    m.interrupt_outcome AS word,
+                    m.id <= COALESCE((SELECT c.last_seen_id FROM brigade_cursors c
+                                      WHERE c.brigade_id = m.brigade_id
+                                        AND c.member_token = m.to_member), 0) AS read
+             FROM brigade_messages m
+             WHERE m.brigade_id = ?1 AND m.interrupt = 1 AND m.to_member IS NOT NULL)
+         WHERE word IS NULL OR (NOT read AND word IN ('{}', '{}'))
+         ORDER BY id",
+        InterruptOutcome::Gated.as_token(),
+        InterruptOutcome::Capped.as_token()
+    )
+}
+
+/// An `interrupt_worker` request its Worker has not read yet, as
+/// `brigade_status` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadInterrupt {
+    pub member: MemberToken,
+    /// `None`: the UI has not decided yet, or wrote a word this build does not
+    /// know.
+    pub outcome: Option<InterruptOutcome>,
+    pub created_at_ms: i64,
+}
+
 /// Where an `interrupt_worker` request stands, for the tool that waits on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptState {
@@ -864,7 +896,7 @@ impl Store {
                         to_member: row.get(3)?,
                         interrupted: outcome
                             .and_then(|token| InterruptOutcome::from_token(&token))
-                            .is_some_and(InterruptOutcome::esc_written),
+                            .filter(|outcome| outcome.gate_refused()),
                     })
                 },
             )?;
@@ -1234,24 +1266,22 @@ impl Store {
         Ok(Some(id))
     }
 
-    /// The brigade's interrupt requests no outcome has been recorded for, oldest
-    /// first. Not bounded by the read cursor, on purpose: a Worker can pull the
-    /// message before the UI looks, and the request still has to be answered (the
-    /// answer is then `read`). `read` says which case a row is.
+    /// The brigade's interrupt requests the UI has not decided, oldest first: those
+    /// no outcome is recorded for, and those only the Worker's own `_mcp` has
+    /// written (`gated`, `capped`) and its Worker has not read. The gate can refuse
+    /// a call before the UI's first tick sees the request, and a row it got to
+    /// first is still the UI's to decide: the relay nudge state is reset and the
+    /// status line shown once per request, and the UI's own word goes over no word
+    /// only, so the gate's stays. A row with any other word was decided by the UI.
+    ///
+    /// Rows with no word are not bounded by the read cursor, on purpose: a Worker
+    /// can pull the message before the UI looks, and the request still has to be
+    /// answered (the answer is then `read`). `read` says which case a row is.
     pub fn pending_interrupts(
         &self,
         brigade_id: BrigadeId,
     ) -> Result<Vec<PendingInterrupt>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.to_member, m.created_at_ms,
-                    m.id <= COALESCE((SELECT c.last_seen_id FROM brigade_cursors c
-                                      WHERE c.brigade_id = m.brigade_id
-                                        AND c.member_token = m.to_member), 0)
-             FROM brigade_messages m
-             WHERE m.brigade_id = ?1 AND m.interrupt = 1 AND m.interrupt_outcome IS NULL
-               AND m.to_member IS NOT NULL
-             ORDER BY m.id",
-        )?;
+        let mut stmt = self.conn.prepare(&pending_interrupts_sql())?;
         let rows = stmt.query_map([brigade_id], |row| {
             Ok(PendingInterrupt {
                 message_id: row.get(0)?,
@@ -1263,26 +1293,40 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Records what the UI decided about the request on message `message_id`,
-    /// written once: a first decision only over an undecided row, a refinement
-    /// ([`InterruptOutcome::is_refinement`]) only over `pressed`. `true` when the
-    /// row changed, so a repeated or late write is a visible no-op, never an
-    /// overwrite.
+    /// Records what was decided about the request on message `message_id`: the
+    /// UI's first decision, or the Worker's own `_mcp` writing `gated` or
+    /// `capped`. The word is written only over what
+    /// [`InterruptOutcome::replaceable`] allows, or over no word, so a repeated or
+    /// late write is a visible no-op, never an overwrite. `true` when the row
+    /// changed.
     pub fn record_interrupt_outcome(
         &mut self,
         message_id: i64,
         outcome: InterruptOutcome,
     ) -> Result<bool, StoreError> {
-        let sql = if outcome.is_refinement() {
-            "UPDATE brigade_messages SET interrupt_outcome = ?2
-             WHERE id = ?1 AND interrupt = 1 AND interrupt_outcome = 'pressed'"
+        // The tokens are fixed strings written in `InterruptOutcome`, so
+        // spelling them into the statement is not an injection and keeps the
+        // table the only place the rule is written.
+        let replaceable = outcome
+            .replaceable()
+            .iter()
+            .map(|word| format!("'{}'", word.as_token()))
+            .collect::<Vec<_>>();
+        let guard = if replaceable.is_empty() {
+            "interrupt_outcome IS NULL".to_string()
         } else {
-            "UPDATE brigade_messages SET interrupt_outcome = ?2
-             WHERE id = ?1 AND interrupt = 1 AND interrupt_outcome IS NULL"
+            format!(
+                "(interrupt_outcome IS NULL OR interrupt_outcome IN ({}))",
+                replaceable.join(", ")
+            )
         };
+        let sql = format!(
+            "UPDATE brigade_messages SET interrupt_outcome = ?2
+             WHERE id = ?1 AND interrupt = 1 AND {guard}"
+        );
         Ok(self
             .conn
-            .execute(sql, params![message_id, outcome.as_token()])?
+            .execute(&sql, params![message_id, outcome.as_token()])?
             > 0)
     }
 
@@ -1308,16 +1352,16 @@ impl Store {
     }
 
     /// The brigade's interrupt requests whose message its Worker has not read,
-    /// oldest first, each with its outcome (`None`: not decided yet). What
+    /// oldest first, each with its outcome and when it was written. What
     /// `brigade_status` shows, and only while the message is unread: once it is
     /// read there is nothing left to say, and the witness of delivery is the read
     /// cursor, never the input line.
     pub fn unread_interrupts(
         &self,
         brigade_id: BrigadeId,
-    ) -> Result<Vec<(MemberToken, Option<InterruptOutcome>)>, StoreError> {
+    ) -> Result<Vec<UnreadInterrupt>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.to_member, m.interrupt_outcome
+            "SELECT m.to_member, m.interrupt_outcome, m.created_at_ms
              FROM brigade_messages m
              WHERE m.brigade_id = ?1 AND m.interrupt = 1 AND m.to_member IS NOT NULL
                AND m.id > COALESCE((SELECT c.last_seen_id FROM brigade_cursors c
@@ -1327,11 +1371,34 @@ impl Store {
         )?;
         let rows = stmt.query_map([brigade_id], |row| {
             let outcome: Option<String> = row.get(1)?;
-            Ok((
-                row.get::<_, MemberToken>(0)?,
-                outcome.and_then(|token| InterruptOutcome::from_token(&token)),
-            ))
+            Ok(UnreadInterrupt {
+                member: row.get(0)?,
+                outcome: outcome.and_then(|token| InterruptOutcome::from_token(&token)),
+                created_at_ms: row.get(2)?,
+            })
         })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The ids of the interrupt requests `member_token` has not read, oldest
+    /// first, whatever their outcome: what the Worker's gate refuses its tool
+    /// calls for. Empty once the Worker has pulled them (the read cursor passed
+    /// them), which is the whole of the gate's release.
+    pub fn unread_interrupt_ids(
+        &self,
+        brigade_id: BrigadeId,
+        member_token: &str,
+    ) -> Result<Vec<i64>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id
+             FROM brigade_messages m
+             WHERE m.brigade_id = ?1 AND m.interrupt = 1 AND m.to_member = ?2
+               AND m.id > COALESCE((SELECT c.last_seen_id FROM brigade_cursors c
+                                    WHERE c.brigade_id = m.brigade_id
+                                      AND c.member_token = m.to_member), 0)
+             ORDER BY m.id",
+        )?;
+        let rows = stmt.query_map(params![brigade_id, member_token], |row| row.get(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1662,7 +1729,7 @@ mod tests {
         assert_eq!(pulled[0].body, "stop, change course");
         assert_eq!(pulled[0].from_token, "director");
         assert_eq!(pulled[0].to_member.as_deref(), Some(worker.as_str()));
-        assert!(!pulled[0].interrupted, "no outcome had been decided");
+        assert_eq!(pulled[0].interrupted, None, "no outcome had been decided");
     }
 
     #[test]
@@ -1703,6 +1770,39 @@ mod tests {
     }
 
     #[test]
+    fn a_request_the_gate_reached_first_is_still_pending_until_it_is_read() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (br, worker) = with_a_worker(&mut store);
+        let mut ids = Vec::new();
+        for outcome in [
+            InterruptOutcome::Gated,
+            InterruptOutcome::Capped,
+            InterruptOutcome::Armed,
+            InterruptOutcome::NoPane,
+        ] {
+            let id = store
+                .enqueue_interrupt_message(br, "director", &worker, "m")
+                .unwrap()
+                .unwrap();
+            assert!(store.record_interrupt_outcome(id, outcome).unwrap());
+            ids.push(id);
+        }
+        let pending: Vec<i64> = store
+            .pending_interrupts(br)
+            .unwrap()
+            .iter()
+            .map(|p| p.message_id)
+            .collect();
+        assert_eq!(pending, ids[..2], "the gate's words, not the UI's");
+
+        // Read, they are the Worker's no longer.
+        store
+            .fetch_brigade_messages(br, &worker, BrigadeRole::Worker)
+            .unwrap();
+        assert!(store.pending_interrupts(br).unwrap().is_empty());
+    }
+
+    #[test]
     fn an_ordinary_message_is_never_a_pending_interrupt() {
         let mut store = Store::open_in_memory().unwrap();
         let (br, worker) = with_a_worker(&mut store);
@@ -1714,7 +1814,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outcome_is_written_once_and_only_a_press_is_refined() {
+    fn the_uis_decision_is_written_once_and_the_gates_words_follow_the_table() {
         use InterruptOutcome::*;
         let mut store = Store::open_in_memory().unwrap();
         let (br, worker) = with_a_worker(&mut store);
@@ -1727,70 +1827,135 @@ mod tests {
             InterruptState::Undecided
         );
 
-        // A refinement over nothing is refused: there was no press to refine.
-        assert!(!store.record_interrupt_outcome(id, Stopped).unwrap());
+        assert!(store.record_interrupt_outcome(id, Armed).unwrap());
         assert_eq!(
             store.interrupt_state(id).unwrap(),
-            InterruptState::Undecided
-        );
-
-        assert!(store.record_interrupt_outcome(id, Pressed).unwrap());
-        assert_eq!(
-            store.interrupt_state(id).unwrap(),
-            InterruptState::Decided(Pressed)
+            InterruptState::Decided(Armed)
         );
         // Taken: no longer listed for the UI to decide, whatever the cursor says.
         assert!(store.pending_interrupts(br).unwrap().is_empty());
-        // A second first-decision does not overwrite the first.
-        assert!(!store.record_interrupt_outcome(id, NotMidTurn).unwrap());
-        assert!(!store.record_interrupt_outcome(id, Pressed).unwrap());
-        // The press is refined, once.
-        assert!(store.record_interrupt_outcome(id, OtherText).unwrap());
-        assert!(!store.record_interrupt_outcome(id, Stopped).unwrap());
+        // A second first-decision does not overwrite the first, whatever it says.
+        for again in [Read, Codex, RelayManual, NoPane, Armed] {
+            assert!(
+                !store.record_interrupt_outcome(id, again).unwrap(),
+                "{again:?}"
+            );
+        }
+        // The gate writes over `armed`, and `capped` over `gated`.
+        assert!(store.record_interrupt_outcome(id, Gated).unwrap());
+        assert!(!store.record_interrupt_outcome(id, Gated).unwrap());
+        assert!(!store.record_interrupt_outcome(id, Armed).unwrap());
+        assert!(store.record_interrupt_outcome(id, Capped).unwrap());
+        // Nothing goes over `capped`.
+        for later in [Read, Codex, RelayManual, NoPane, Armed, Gated, Capped] {
+            assert!(
+                !store.record_interrupt_outcome(id, later).unwrap(),
+                "{later:?}"
+            );
+        }
         assert_eq!(
             store.interrupt_state(id).unwrap(),
-            InterruptState::Decided(OtherText)
+            InterruptState::Decided(Capped)
         );
 
         // A row that is not an interrupt cannot be given an outcome at all.
         let plain = store
             .enqueue_brigade_message(br, "director", BrigadeRole::Worker, Some(&worker), "p")
             .unwrap();
-        assert!(!store.record_interrupt_outcome(plain, Pressed).unwrap());
+        assert!(!store.record_interrupt_outcome(plain, Armed).unwrap());
         assert_eq!(store.interrupt_state(plain).unwrap(), InterruptState::Gone);
     }
 
     #[test]
-    fn the_inbox_flag_is_true_exactly_for_a_row_an_esc_was_written_for() {
+    fn the_gate_may_write_before_the_uis_decision_has_landed_and_the_late_decision_is_a_no_op() {
         use InterruptOutcome::*;
         let mut store = Store::open_in_memory().unwrap();
         let (br, worker) = with_a_worker(&mut store);
-        let mut ids = Vec::new();
-        for outcome in [Pressed, NotMidTurn, Stopped, Waiting, StillBusy, Codex] {
+        let id = store
+            .enqueue_interrupt_message(br, "director", &worker, "m")
+            .unwrap()
+            .unwrap();
+        assert!(store.record_interrupt_outcome(id, Gated).unwrap());
+        assert!(!store.record_interrupt_outcome(id, Armed).unwrap());
+        assert_eq!(
+            store.interrupt_state(id).unwrap(),
+            InterruptState::Decided(Gated)
+        );
+
+        // `capped` also goes over no word at all, and over `armed`.
+        for before in [None, Some(Armed)] {
             let id = store
                 .enqueue_interrupt_message(br, "director", &worker, "m")
                 .unwrap()
                 .unwrap();
-            if outcome.is_refinement() {
-                assert!(store.record_interrupt_outcome(id, Pressed).unwrap());
+            if let Some(before) = before {
+                assert!(store.record_interrupt_outcome(id, before).unwrap());
             }
+            assert!(
+                store.record_interrupt_outcome(id, Capped).unwrap(),
+                "{before:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_word_a_ui_wrote_is_never_replaced_by_the_gate() {
+        use InterruptOutcome::*;
+        let mut store = Store::open_in_memory().unwrap();
+        let (br, worker) = with_a_worker(&mut store);
+        for decided in [Read, Codex, RelayManual, NoPane] {
+            let id = store
+                .enqueue_interrupt_message(br, "director", &worker, "m")
+                .unwrap()
+                .unwrap();
+            assert!(store.record_interrupt_outcome(id, decided).unwrap());
+            for gate in [Gated, Capped] {
+                assert!(
+                    !store.record_interrupt_outcome(id, gate).unwrap(),
+                    "{gate:?} over {decided:?}"
+                );
+            }
+            assert_eq!(
+                store.interrupt_state(id).unwrap(),
+                InterruptState::Decided(decided)
+            );
+        }
+    }
+
+    #[test]
+    fn the_inbox_flag_is_true_exactly_for_a_row_whose_call_the_gate_refused() {
+        use InterruptOutcome::*;
+        let mut store = Store::open_in_memory().unwrap();
+        let (br, worker) = with_a_worker(&mut store);
+        let mut ids = Vec::new();
+        for outcome in [Armed, Gated, Capped, Codex, RelayManual, NoPane, Read] {
+            let id = store
+                .enqueue_interrupt_message(br, "director", &worker, "m")
+                .unwrap()
+                .unwrap();
             assert!(store.record_interrupt_outcome(id, outcome).unwrap());
             ids.push((id, outcome));
         }
+        // A row nothing was decided for.
+        let undecided = store
+            .enqueue_interrupt_message(br, "director", &worker, "m")
+            .unwrap()
+            .unwrap();
         let pulled = store
             .fetch_brigade_messages(br, &worker, BrigadeRole::Worker)
             .unwrap();
-        let flags: Vec<(i64, bool)> = pulled.iter().map(|m| (m.id, m.interrupted)).collect();
+        let flags: Vec<(i64, Option<InterruptOutcome>)> =
+            pulled.iter().map(|m| (m.id, m.interrupted)).collect();
+        let mut expected: Vec<(i64, Option<InterruptOutcome>)> = ids
+            .iter()
+            .map(|(id, outcome)| (*id, outcome.gate_refused().then_some(*outcome)))
+            .collect();
+        expected.push((undecided, None));
+        assert_eq!(flags, expected);
         assert_eq!(
-            flags,
-            ids.iter()
-                .map(|(id, outcome)| (*id, outcome.esc_written()))
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            flags.iter().filter(|(_, flag)| *flag).count(),
-            3,
-            "pressed, stopped and still-busy"
+            flags.iter().filter(|(_, flag)| flag.is_some()).count(),
+            2,
+            "gated and capped"
         );
     }
 
@@ -1802,10 +1967,11 @@ mod tests {
             .enqueue_interrupt_message(br, "director", &worker, "m")
             .unwrap()
             .unwrap();
+        // `pressed` is what a banto that typed an Esc wrote.
         store
             .conn
             .execute(
-                "UPDATE brigade_messages SET interrupt_outcome = 'from-the-future' WHERE id = ?1",
+                "UPDATE brigade_messages SET interrupt_outcome = 'pressed' WHERE id = ?1",
                 [id],
             )
             .unwrap();
@@ -1816,11 +1982,11 @@ mod tests {
         let pulled = store
             .fetch_brigade_messages(br, &worker, BrigadeRole::Worker)
             .unwrap();
-        assert!(!pulled[0].interrupted);
+        assert_eq!(pulled[0].interrupted, None);
     }
 
     #[test]
-    fn unread_interrupts_show_their_outcome_until_the_worker_reads_them() {
+    fn unread_interrupts_show_their_outcome_and_age_until_the_worker_reads_them() {
         use InterruptOutcome::*;
         let mut store = Store::open_in_memory().unwrap();
         let (br, worker) = with_a_worker(&mut store);
@@ -1832,25 +1998,68 @@ mod tests {
             .enqueue_interrupt_message(br, "director", &worker, "b")
             .unwrap()
             .unwrap();
-        store.record_interrupt_outcome(first, Pressed).unwrap();
+        store.record_interrupt_outcome(first, Armed).unwrap();
+        let listed = |store: &Store| -> Vec<(MemberToken, Option<InterruptOutcome>)> {
+            store
+                .unread_interrupts(br)
+                .unwrap()
+                .into_iter()
+                .map(|unread| (unread.member, unread.outcome))
+                .collect()
+        };
         assert_eq!(
-            store.unread_interrupts(br).unwrap(),
-            [(worker.clone(), Some(Pressed)), (worker.clone(), None)]
+            listed(&store),
+            [(worker.clone(), Some(Armed)), (worker.clone(), None)]
         );
-        store.record_interrupt_outcome(first, Stopped).unwrap();
+        store.record_interrupt_outcome(first, Gated).unwrap();
         store.record_interrupt_outcome(second, Codex).unwrap();
         assert_eq!(
-            store.unread_interrupts(br).unwrap(),
-            [
-                (worker.clone(), Some(Stopped)),
-                (worker.clone(), Some(Codex))
-            ]
+            listed(&store),
+            [(worker.clone(), Some(Gated)), (worker.clone(), Some(Codex))]
         );
+        let written: Vec<i64> = store
+            .unread_interrupts(br)
+            .unwrap()
+            .into_iter()
+            .map(|unread| unread.created_at_ms)
+            .collect();
+        assert!(written.iter().all(|ms| *ms > 0), "{written:?}");
         // The witness of delivery is the read cursor: once read, nothing is said.
         store
             .fetch_brigade_messages(br, &worker, BrigadeRole::Worker)
             .unwrap();
         assert!(store.unread_interrupts(br).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_unread_interrupt_ids_are_one_members_and_end_when_it_reads_them() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (br, worker) = with_a_worker(&mut store);
+        let other = store.add_worker(br, None).unwrap();
+        let first = store
+            .enqueue_interrupt_message(br, "director", &worker, "a")
+            .unwrap()
+            .unwrap();
+        // An ordinary message, another Worker's interrupt: neither is this one's.
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, Some(&worker), "p")
+            .unwrap();
+        store
+            .enqueue_interrupt_message(br, "director", &other, "o")
+            .unwrap();
+        let second = store
+            .enqueue_interrupt_message(br, "director", &worker, "b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.unread_interrupt_ids(br, &worker).unwrap(),
+            [first, second]
+        );
+        store
+            .fetch_brigade_messages(br, &worker, BrigadeRole::Worker)
+            .unwrap();
+        assert!(store.unread_interrupt_ids(br, &worker).unwrap().is_empty());
+        assert_eq!(store.unread_interrupt_ids(br, &other).unwrap().len(), 1);
     }
 
     #[test]
@@ -1866,7 +2075,7 @@ mod tests {
         assert!(store.pending_interrupts(br).unwrap().is_empty());
         assert!(
             !store
-                .record_interrupt_outcome(id, InterruptOutcome::Pressed)
+                .record_interrupt_outcome(id, InterruptOutcome::Armed)
                 .unwrap()
         );
     }
@@ -1897,6 +2106,32 @@ mod tests {
             .optional()
             .unwrap();
         assert!(index.is_some_and(|sql| sql.contains("WHERE")));
+    }
+
+    #[test]
+    fn the_pending_interrupts_query_is_answered_from_the_partial_index() {
+        // Every second, per brigade, on a table that only grows: a scan of it is
+        // what v22 exists to prevent.
+        let store = Store::open_in_memory().unwrap();
+        let sql = pending_interrupts_sql();
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([1], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let plan = plan.join(
+            "
+",
+        );
+        assert!(
+            plan.contains("USING INDEX brigade_messages_interrupts")
+                || plan.contains("USING COVERING INDEX brigade_messages_interrupts"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN m"), "{plan}");
     }
 
     #[test]

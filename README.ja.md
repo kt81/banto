@@ -38,7 +38,7 @@ banto は MCP 上でメンバー間のメッセージを中継します。各メ
 
 - `consult_goinkyo` / `dismiss_goinkyo`
 - `request_decision`: あなたにしか下せない判断を Director が待つときのものです。banto はその Director に `▸ decision` タグを付け、そのペインで Enter を押すまで残します。Director は止めません
-- `interrupt_worker`: Claude の Worker が実行中のターンを Esc 1 回で止め、Director が書いた理由をメッセージとして渡します。Codex の Worker にはメッセージは届きますが、まだ中断はされません
+- `interrupt_worker`: Director が書いた理由をメッセージとして Worker に渡し、Claude の Worker には、リレーが `auto` のときだけ、それを読むまで次のツール呼び出しを banto が断ります（最大 3 回）。ターンを止めることも、実行中の呼び出しを切ることもできません。リレーが `manual` の場合と Codex の Worker には、通常のメッセージとして届くだけで、何も断られません
 - `name_member`: Worker の常設の役割に表示名を付けます（宛先は引き続きトークンです）
 
 Goinkyo は、Director が `consult_goinkyo` で相談する助言役のセッションです。既定では Director と同じプロダクトで動くため、Codex の Director の Goinkyo は Codex になります（`goinkyo_agent`）。`goinkyo_agent = "claude"` にすると Claude のままです。Codex の Goinkyo は読み取り専用で、承認の確認なしに動くので、ビルドもテストもできません。Codex がまだ信頼していないディレクトリでの最初の相談は、Codex 自身の信頼の質問で止まり、Goinkyo のペインで答えるまで待ちます。Goinkyo のプロダクトが動かせないとき（`agents` で有効になっていない、ホームが見つからない、banto のフックが未信頼または起動できない）、`consult_goinkyo` は最初に拒否します。

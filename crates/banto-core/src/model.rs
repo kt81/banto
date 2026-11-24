@@ -592,12 +592,13 @@ pub struct BrigadeMessage {
     /// broadcast to every member of the recipient role — the original,
     /// still-default addressing.
     pub to_member: Option<MemberToken>,
-    /// An Esc was written into the recipient's pane for this message
-    /// (`interrupt_worker`): the inbox header says so, because the transcript of
-    /// the turn it cut reads as the user having refused. Only what the UI
-    /// process had decided when the message was pulled counts; a Worker that
-    /// pulls first is told nothing, and the outcome is then `read`.
-    pub interrupted: bool,
+    /// What the gate did for this message (`interrupt_worker`), when it refused
+    /// tool calls of the recipient: `Gated` or `Capped`, and `None` for every
+    /// other word and for none. The inbox header says it, because the transcript
+    /// records a refused call as a hook's error and nothing in it says the call
+    /// never ran or whose decision it was. A message pulled before any call was
+    /// refused carries no header.
+    pub interrupted: Option<InterruptOutcome>,
 }
 
 /// A brigade message reduced to what a collapsed tile shows: when it was
@@ -684,57 +685,51 @@ impl PtyExitReason {
     }
 }
 
-/// What banto decided about one `interrupt_worker` request, as the store keeps
-/// it in `brigade_messages.interrupt_outcome` and the tool prints it. Written
-/// once by the UI process (the `_mcp` process cannot see a screen), and only
-/// [`Self::Pressed`] is ever refined, once, into one of the three that say what
-/// the Esc did.
+/// What banto did about one `interrupt_worker` request, as the store keeps it in
+/// `brigade_messages.interrupt_outcome` and the tool prints it.
+///
+/// Two processes write it. The UI makes the first decision, over an undecided
+/// row only, with one of the first five words (it can see what is hosted and the
+/// configuration, which the Worker's `_mcp` cannot). The Worker's own `_mcp`
+/// writes the other two, from what the gate it answers did; the gate itself never
+/// reads the word. [`Self::replaceable`] is the one place that says which word
+/// may be written over which.
 ///
 /// The tokens are the durable format: changing a variant's spelling must not
 /// rewrite what a store already holds, so the strings are written out here and
-/// nowhere derived.
+/// nowhere derived. A token this build does not know (an older banto wrote
+/// `pressed`, `stopped` and the like when it typed an Esc) reads as no outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InterruptOutcome {
-    /// One Esc was written into the Worker's pane.
-    Pressed,
-    /// No running turn to stop (the reason is an [`InterruptWhy`]).
-    NotMidTurn,
-    /// The pane waits on a prompt only the operator can answer.
-    Waiting,
     /// The Worker had already read the message when the request was first seen.
     Read,
-    /// The Worker is a Codex one: its turn is not interrupted yet.
+    /// The Worker is a Codex one: its message goes as ordinary mail.
     Codex,
-    /// `[brigade] relay = "manual"`: banto writes nothing into panes by itself.
+    /// `[brigade] relay = "manual"`: the Worker has no gate, and the message goes
+    /// as ordinary mail.
     RelayManual,
     /// No hosted pane with a live process (the reason is an [`InterruptWhy`]).
     NoPane,
-    /// The request was already too old when it was first seen (a banto restart
-    /// in between): an Esc now would cut whatever the Worker is doing instead.
-    Expired,
-    /// After a press: the pane came to rest and nothing holds the nudge.
-    Stopped,
-    /// After a press: the pane came to rest with text on the input line that is
-    /// not the nudge sentence, so delivery waits on the operator.
-    OtherText,
-    /// After a press: the pane did not come to rest.
-    StillBusy,
+    /// A hosted Claude Worker with the relay on: its gate refuses its next tool
+    /// calls until it reads the message. Nothing has been refused yet.
+    Armed,
+    /// The gate has refused a call of the Worker's. The call never ran.
+    Gated,
+    /// The gate let the main agent's call through after refusing its quota, so
+    /// the request ends with the message still unread.
+    Capped,
 }
 
 impl InterruptOutcome {
     pub fn as_token(self) -> &'static str {
         match self {
-            Self::Pressed => "pressed",
-            Self::NotMidTurn => "not-mid-turn",
-            Self::Waiting => "waiting",
             Self::Read => "read",
             Self::Codex => "codex",
             Self::RelayManual => "relay-manual",
             Self::NoPane => "no-pane",
-            Self::Expired => "expired",
-            Self::Stopped => "stopped",
-            Self::OtherText => "other-text",
-            Self::StillBusy => "still-busy",
+            Self::Armed => "armed",
+            Self::Gated => "gated",
+            Self::Capped => "capped",
         }
     }
 
@@ -742,31 +737,37 @@ impl InterruptOutcome {
     /// build does not know.
     pub fn from_token(token: &str) -> Option<Self> {
         Some(match token {
-            "pressed" => Self::Pressed,
-            "not-mid-turn" => Self::NotMidTurn,
-            "waiting" => Self::Waiting,
             "read" => Self::Read,
             "codex" => Self::Codex,
             "relay-manual" => Self::RelayManual,
             "no-pane" => Self::NoPane,
-            "expired" => Self::Expired,
-            "stopped" => Self::Stopped,
-            "other-text" => Self::OtherText,
-            "still-busy" => Self::StillBusy,
+            "armed" => Self::Armed,
+            "gated" => Self::Gated,
+            "capped" => Self::Capped,
             _ => return None,
         })
     }
 
-    /// Whether this is what a press turned into: written only over
-    /// [`Self::Pressed`], never over a first decision.
-    pub fn is_refinement(self) -> bool {
-        matches!(self, Self::Stopped | Self::OtherText | Self::StillBusy)
+    /// The words this one may be written over, besides no word at all, which
+    /// every outcome may be written over. The one table of the overwrite rule:
+    /// the store builds its guard from it and nothing else spells the rule.
+    ///
+    /// The UI's words go over nothing, so a repeated or late decision is a no-op.
+    /// `gated` goes over `armed` and also over no word, because the gate can
+    /// refuse a call before the UI's write has landed. `capped` goes over what
+    /// `gated` does and `gated` too, and nothing goes over `capped`.
+    pub fn replaceable(self) -> &'static [InterruptOutcome] {
+        match self {
+            Self::Read | Self::Codex | Self::RelayManual | Self::NoPane | Self::Armed => &[],
+            Self::Gated => &[Self::Armed],
+            Self::Capped => &[Self::Armed, Self::Gated],
+        }
     }
 
-    /// Whether an Esc was written into the pane, which is what the Worker's
-    /// inbox header says (a `pressed` row may later be refined, and stays true).
-    pub fn esc_written(self) -> bool {
-        self == Self::Pressed || self.is_refinement()
+    /// Whether the gate refused a call for this request, which is what the
+    /// Worker's inbox header says.
+    pub fn gate_refused(self) -> bool {
+        matches!(self, Self::Gated | Self::Capped)
     }
 }
 
@@ -775,19 +776,12 @@ impl InterruptOutcome {
 /// nothing a pane showed is ever recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InterruptWhy {
-    /// `not-mid-turn`: the live file says idle (or any status that is not a turn).
-    Idle,
-    /// `not-mid-turn`: the turn ended with a background command still running.
-    BackgroundCommand,
-    /// `not-mid-turn`: a line of banto's own was just going into the pane, and the
-    /// relay already declines to act across its own write.
-    OwnLine,
     /// `no-pane`: the member's brigade is being closed.
     Closing,
     /// `no-pane`: the pane is being ended.
     Ending,
-    /// `no-pane`: the pane is open but cannot be read yet: it has no session, its
-    /// product is not resolved, or a Claude process has published no live file.
+    /// `no-pane`: the pane is open but cannot be read yet: it has no session or
+    /// its product is not resolved.
     Starting,
     /// `no-pane`: nothing hosts the member.
     NotRunning,
@@ -796,9 +790,6 @@ pub enum InterruptWhy {
 impl InterruptWhy {
     pub fn as_token(self) -> &'static str {
         match self {
-            Self::Idle => "idle",
-            Self::BackgroundCommand => "background-command",
-            Self::OwnLine => "own-line",
             Self::Closing => "closing",
             Self::Ending => "ending",
             Self::Starting => "starting",
@@ -813,41 +804,67 @@ mod tests {
 
     use super::*;
 
+    const ALL_OUTCOMES: [InterruptOutcome; 7] = [
+        InterruptOutcome::Read,
+        InterruptOutcome::Codex,
+        InterruptOutcome::RelayManual,
+        InterruptOutcome::NoPane,
+        InterruptOutcome::Armed,
+        InterruptOutcome::Gated,
+        InterruptOutcome::Capped,
+    ];
+
     #[test]
     fn interrupt_outcome_tokens_round_trip_and_unknown_is_none() {
-        let all = [
-            InterruptOutcome::Pressed,
-            InterruptOutcome::NotMidTurn,
-            InterruptOutcome::Waiting,
-            InterruptOutcome::Read,
-            InterruptOutcome::Codex,
-            InterruptOutcome::RelayManual,
-            InterruptOutcome::NoPane,
-            InterruptOutcome::Expired,
-            InterruptOutcome::Stopped,
-            InterruptOutcome::OtherText,
-            InterruptOutcome::StillBusy,
-        ];
-        for outcome in all {
+        for outcome in ALL_OUTCOMES {
             assert_eq!(
                 InterruptOutcome::from_token(outcome.as_token()),
                 Some(outcome)
             );
         }
-        assert_eq!(InterruptOutcome::from_token("from-the-future"), None);
-        // Only the three that say what a press did are refinements, and an Esc
-        // was written for exactly those and `pressed`.
-        let refinements: Vec<_> = all.into_iter().filter(|o| o.is_refinement()).collect();
+        // What an older banto wrote when it typed an Esc is a word nobody reads.
+        for retired in [
+            "pressed",
+            "not-mid-turn",
+            "waiting",
+            "expired",
+            "stopped",
+            "other-text",
+            "still-busy",
+            "from-the-future",
+        ] {
+            assert_eq!(InterruptOutcome::from_token(retired), None, "{retired}");
+        }
+    }
+
+    #[test]
+    fn the_overwrite_table_lets_only_the_workers_own_words_replace_another() {
+        use InterruptOutcome::*;
+        let table: Vec<(InterruptOutcome, Vec<InterruptOutcome>)> = ALL_OUTCOMES
+            .into_iter()
+            .map(|outcome| (outcome, outcome.replaceable().to_vec()))
+            .collect();
         assert_eq!(
-            refinements,
+            table,
             [
-                InterruptOutcome::Stopped,
-                InterruptOutcome::OtherText,
-                InterruptOutcome::StillBusy
+                (Read, vec![]),
+                (Codex, vec![]),
+                (RelayManual, vec![]),
+                (NoPane, vec![]),
+                (Armed, vec![]),
+                (Gated, vec![Armed]),
+                (Capped, vec![Armed, Gated]),
             ]
         );
-        let written: Vec<_> = all.into_iter().filter(|o| o.esc_written()).collect();
-        assert_eq!(written.len(), 4);
+    }
+
+    #[test]
+    fn only_gated_and_capped_say_a_call_was_refused() {
+        let refused: Vec<_> = ALL_OUTCOMES
+            .into_iter()
+            .filter(|outcome| outcome.gate_refused())
+            .collect();
+        assert_eq!(refused, [InterruptOutcome::Gated, InterruptOutcome::Capped]);
     }
 
     #[test]

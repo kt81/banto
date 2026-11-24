@@ -358,19 +358,28 @@ pub(super) const MIGRATIONS: &[&str] = &[
         title TEXT NOT NULL,
         ended_at_ms INTEGER NOT NULL
     );",
-    // v21: `interrupt_worker`. The request to stop a Worker's turn is a property
-    // of the message that explains it, so it is a column of that row and is
-    // written in the same transaction (a request with no reason, or a reason
-    // that arrives without its request, would each be a different bug).
-    // `interrupt_outcome` is what the UI process decided: NULL until it has, and
-    // from then on also the mark that the request was taken, so it is never
-    // decided twice. Only the UI writes it, because only the UI can see the
-    // screen. A partial index, since the UI looks for undecided requests every
-    // second and the table only grows.
+    // v21: `interrupt_worker`. The request is a property of the message that
+    // explains it, so it is a column of that row and is written in the same
+    // transaction (a request with no reason, or a reason that arrives without its
+    // request, would each be a different bug). `interrupt_outcome` is a word
+    // (`InterruptOutcome`): NULL until something decides, then the UI's judgement
+    // of whether a gate is there (written over NULL only), then what the Worker's
+    // own `_mcp` did with it (`gated`, `capped`). The UI looks for undecided
+    // requests every second and the table only grows, so the index holds the rows
+    // with no word. `pending_interrupts` later also wanted the rows the gate
+    // wrote first, which this index does not hold: v22 adds one that does.
     "ALTER TABLE brigade_messages ADD COLUMN interrupt INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE brigade_messages ADD COLUMN interrupt_outcome TEXT;
     CREATE INDEX brigade_messages_open_interrupts ON brigade_messages (brigade_id, id)
         WHERE interrupt = 1 AND interrupt_outcome IS NULL;",
+    // v22: every interrupt row, whatever its word. `pending_interrupts` runs every
+    // second per brigade and lists the rows with no word and those only the gate
+    // has written (`gated`, `capped`) that are still unread; the v21 index covers
+    // only the first, and on a copy of a real database the query without this one
+    // scanned the whole table (0.078 ms became 5.7 ms). The v21 index stays: it is
+    // a subset of this one and dropping it would be a change nobody asked for.
+    "CREATE INDEX brigade_messages_interrupts ON brigade_messages (brigade_id, id)
+        WHERE interrupt = 1;",
 ];
 
 /// The schema version this build migrates to and knows how to read.

@@ -13,8 +13,6 @@ use banto_core::engine::{Event, SessionKey};
 use banto_core::model::PtyExitReason;
 use banto_io::pty::{PtyHost, PtyIo, Resizer};
 
-use super::quiet_writes::QuietWrites;
-
 /// The result of one non-blocking poll of a [`PtyHandle`]'s output channel.
 pub(crate) enum PtyPoll {
     /// One chunk of output — becomes `Event::PtyOutput`.
@@ -64,10 +62,6 @@ pub(crate) struct PtyHandle {
     /// [`Self::begin_graceful_close`] has run: the child has been hung up and
     /// the master given away, so a second request has nothing left to do.
     hung_up: bool,
-    /// What an interrupting Esc holds back: see [`QuietWrites`]. Lives here,
-    /// with the one writer, so it moves with the handle when its pane is rekeyed
-    /// and goes with it when the pane ends.
-    quiet: QuietWrites,
 }
 
 /// How long a disconnected output stream waits for the child's own exit report
@@ -96,7 +90,6 @@ impl PtyHandle {
             output_loss_reported: false,
             output_lost_grace: OUTPUT_LOST_GRACE,
             hung_up: false,
-            quiet: QuietWrites::default(),
         })
     }
 
@@ -204,23 +197,9 @@ impl PtyHandle {
 
     /// Forward raw bytes (mouse report, paste, relay nudge/submit) to the
     /// child's stdin — the single stdin-write path.
-    ///
-    /// Held for [`QuietWrites`]'s quiet time after an [`Self::interrupt`], then
-    /// written in order.
     pub(crate) fn send_bytes(&mut self, bytes: &[u8]) {
-        self.quiet.write(&mut *self.io.input, bytes, Instant::now());
-    }
-
-    /// Write one Esc to stop the child's running turn (`Cmd::InterruptPty`'s
-    /// executor), never held itself, and hold everything else for a moment after.
-    pub(crate) fn interrupt(&mut self) {
-        self.quiet.interrupt(&mut *self.io.input, Instant::now());
-    }
-
-    /// Release what the quiet time held, if it is over: called every turn of the
-    /// event loop.
-    pub(crate) fn flush_quiet(&mut self) {
-        self.quiet.flush_due(&mut *self.io.input, Instant::now());
+        let _ = self.io.input.write_all(bytes);
+        let _ = self.io.input.flush();
     }
 
     /// Resize the child's PTY.
@@ -275,7 +254,6 @@ impl PtyHandle {
             return;
         }
         self.hung_up = true;
-        self.quiet.discard();
         if !self.has_exited() {
             let _ = self.io.hangup.hangup();
         }
@@ -740,55 +718,6 @@ mod tests {
             "master/resizer was dropped"
         );
         assert_eq!(*kills.lock().unwrap(), 0, "a graceful close is not a kill");
-    }
-
-    #[test]
-    fn an_interrupt_writes_a_lone_esc_and_holds_the_next_write_for_the_quiet_time() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let host = MockPtyHost {
-            captured: captured.clone(),
-            ..Default::default()
-        };
-        let mut handle = open_handle(&host);
-
-        handle.interrupt();
-        assert_eq!(&*captured.lock().unwrap(), b"\x1b", "the Esc goes at once");
-
-        // Any byte that follows within about 50 ms turns the Esc into an Alt chord,
-        // and the one write path is where that is prevented for every producer.
-        handle.send_bytes(b"k");
-        handle.flush_quiet();
-        assert_eq!(&*captured.lock().unwrap(), b"\x1b", "held, not written");
-
-        std::thread::sleep(
-            super::super::quiet_writes::QUIET_AFTER_INTERRUPT
-                + std::time::Duration::from_millis(30),
-        );
-        handle.flush_quiet();
-        assert_eq!(
-            &*captured.lock().unwrap(),
-            b"\x1bk",
-            "released after it, in order"
-        );
-    }
-
-    #[test]
-    fn a_pane_that_is_ending_drops_what_the_quiet_time_held() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let host = MockPtyHost {
-            captured: captured.clone(),
-            ..Default::default()
-        };
-        let mut handle = open_handle(&host);
-        handle.interrupt();
-        handle.send_bytes(b"never");
-        handle.begin_graceful_close();
-        std::thread::sleep(
-            super::super::quiet_writes::QUIET_AFTER_INTERRUPT
-                + std::time::Duration::from_millis(30),
-        );
-        handle.flush_quiet();
-        assert_eq!(&*captured.lock().unwrap(), b"\x1b");
     }
 
     #[test]

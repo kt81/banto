@@ -136,6 +136,11 @@ pub(crate) enum AgentLaunch {
         /// a resumed session remembering a launch flag.
         autocompact: Option<String>,
         append_system_prompt: Option<String>,
+        /// `--settings <file>`: the one file banto passes a Claude Worker whose
+        /// relay is on, holding the hook that gates its tool calls while an
+        /// interrupt is unread. Pushed right before `--mcp-config`, so that both
+        /// follow every other flag; `None` for every other member.
+        settings: Option<PathBuf>,
         mcp_config: Option<PathBuf>,
         /// The positional prompt of `claude [flags] -- "<prompt>"`: the first
         /// user message of a session being created, which starts its first turn
@@ -499,7 +504,7 @@ impl AgentLaunch {
     /// `--model` since `claude --help` groups the two: `--resume`, or `--model`
     /// then `--effort`, then `--permission-mode`, `--disallowedTools`,
     /// `--autocompact`, `--append-system-prompt` (then `--system-prompt-snapshot
-    /// off`, when asked for), `--mcp-config`. Codex's: the `resume <uuid>`
+    /// off`, when asked for), `--settings`, `--mcp-config`. Codex's: the `resume <uuid>`
     /// subcommand (or nothing, for a fresh launch), then `-m`, then the
     /// notification `-c` overrides (always present — see
     /// [`NOTIFICATION_OVERRIDES`]), then `-c model_reasoning_effort` (a new
@@ -529,6 +534,7 @@ impl AgentLaunch {
                 disallowed_tools,
                 autocompact,
                 append_system_prompt,
+                settings,
                 mcp_config,
                 first_prompt,
             } => {
@@ -567,6 +573,10 @@ impl AgentLaunch {
                         argv.push("--system-prompt-snapshot".to_string());
                         argv.push("off".to_string());
                     }
+                }
+                if let Some(path) = settings {
+                    argv.push("--settings".to_string());
+                    argv.push(path.to_string_lossy().into_owned());
                 }
                 if let Some(path) = mcp_config {
                     argv.push("--mcp-config".to_string());
@@ -807,6 +817,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            settings: None,
             mcp_config: None,
             first_prompt: None,
         }
@@ -831,6 +842,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            settings: None,
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-worker-1.json")),
             first_prompt: None,
         };
@@ -856,6 +868,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            settings: None,
             mcp_config: None,
             first_prompt: None,
         };
@@ -873,6 +886,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            settings: None,
             mcp_config: None,
             first_prompt: None,
         };
@@ -893,6 +907,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            settings: None,
             mcp_config: None,
             first_prompt: None,
         };
@@ -919,6 +934,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            settings: None,
             mcp_config: None,
             first_prompt: None,
         };
@@ -936,6 +952,7 @@ mod tests {
             disallowed_tools: Some("Edit".to_string()),
             autocompact: Some("250000".to_string()),
             append_system_prompt: Some("you are a Worker".to_string()),
+            settings: None,
             mcp_config: Some(PathBuf::from("/tmp/mcp.json")),
             first_prompt: None,
         };
@@ -967,6 +984,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: Some("auto".to_string()),
             append_system_prompt: None,
+            settings: None,
             mcp_config: None,
             first_prompt: None,
         };
@@ -984,6 +1002,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            settings: None,
             mcp_config: None,
             first_prompt: None,
         };
@@ -1004,6 +1023,7 @@ mod tests {
             disallowed_tools: Some("Edit,Write,NotebookEdit".to_string()),
             autocompact: None,
             append_system_prompt: None,
+            settings: None,
             mcp_config: None,
             first_prompt: None,
         };
@@ -1032,6 +1052,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            settings: None,
             mcp_config: None,
             first_prompt: None,
         };
@@ -1057,6 +1078,7 @@ mod tests {
             disallowed_tools: Some("Edit,Write,NotebookEdit".to_string()),
             autocompact: None,
             append_system_prompt: Some("you are the Director".to_string()),
+            settings: None,
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-director.json")),
             first_prompt: None,
         }
@@ -1170,6 +1192,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            settings: None,
             mcp_config: None,
             first_prompt: None,
         };
@@ -1829,6 +1852,7 @@ mod tests {
             disallowed_tools: Some("Bash,Edit".to_string()),
             autocompact: None,
             append_system_prompt: Some("brief".to_string()),
+            settings: None,
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-goinkyo.json")),
             first_prompt: prompt.map(str::to_string),
         }
@@ -1847,6 +1871,38 @@ mod tests {
         let config = argv.iter().position(|arg| arg == "--mcp-config").unwrap();
         assert_eq!(argv[config + 1], "C:/data/banto/mcp/1-goinkyo.json");
         assert_eq!(config + 2, argv.len() - 2);
+    }
+
+    #[test]
+    fn the_settings_file_comes_right_before_the_mcp_config_and_before_the_first_prompt() {
+        let mut launch = claude_with_prompt(create(), Some(FIRST_PROMPT));
+        let AgentLaunch::Claude { settings, .. } = &mut launch else {
+            unreachable!();
+        };
+        *settings = Some(PathBuf::from("C:/data/banto/mcp/1-worker-1.settings.json"));
+        let argv = launch.argv("claude");
+        let at = argv.iter().position(|arg| arg == "--settings").unwrap();
+        assert_eq!(argv[at + 1], "C:/data/banto/mcp/1-worker-1.settings.json");
+        assert_eq!(argv[at + 2], "--mcp-config");
+        assert_eq!(&argv[argv.len() - 2..], ["--", FIRST_PROMPT]);
+        // A resume carries it too: the gate is the member's, not the session's.
+        let mut resume = claude_with_prompt(SessionStart::Resume("sess-1".to_string()), None);
+        let AgentLaunch::Claude { settings, .. } = &mut resume else {
+            unreachable!();
+        };
+        *settings = Some(PathBuf::from("/s.json"));
+        assert!(
+            resume
+                .argv("claude")
+                .windows(2)
+                .any(|w| w == ["--settings", "/s.json"])
+        );
+    }
+
+    #[test]
+    fn a_launch_without_a_settings_file_has_no_settings_flag() {
+        let argv = claude_with_prompt(create(), Some(FIRST_PROMPT)).argv("claude");
+        assert!(!argv.iter().any(|arg| arg == "--settings"));
     }
 
     #[test]
