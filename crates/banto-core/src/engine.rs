@@ -33,9 +33,7 @@ use crate::display_text::{display_name, shorten_to_columns};
 use crate::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use crate::input_line::{
-    InputLine, read_codex_input_line, read_input_line, typed_text_without_whitespace,
-};
+use crate::input_line::{InputLine, read_input_line, typed_text_without_whitespace};
 use crate::key_encode::{
     ForwardedInput, InputEffect, input_effect, key_to_encoded_input, normalize_paste_line_endings,
     wrap_bracketed_paste,
@@ -278,9 +276,7 @@ const INPUT_ECHO_SETTLE: Duration = Duration::from_secs(3);
 /// Code's screen layout changes without notice, and a reader that quietly
 /// stopped recognising it would look exactly like one that works. A minute
 /// outlasts the menus and pickers that legitimately replace the input block
-/// for a while; nothing measured it. A Codex member's mail held because its pane
-/// is not at its prompt waits the same minute for the same reason before the
-/// operator is told, and stops holding the brigade bell then.
+/// for a while; nothing measured it.
 const INPUT_LINE_UNREADABLE_AFTER: Duration = Duration::from_secs(60);
 /// Minimum gap between nudges to the same member.
 const RELAY_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
@@ -426,14 +422,34 @@ const DATA_DIR_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// it. Three times that bound, so a slow but real answer is never pre-empted.
 const CODEX_CATALOG_GIVE_UP: Duration = Duration::from_secs(15);
 
-/// How long a Codex pane's own output must have been quiet before the relay
-/// types into it ([`codex_relay_at_prompt`]). Measured 2026-08-02: Codex's own
-/// boot sequence (terminal-mode escapes, the hook-bypass warning banner, an MCP
-/// server booting, the composer frame settling) ran for ~2s after spawn in the
-/// captured run, every gap *inside* that burst under 400ms; 700ms clears the
-/// noisiest observed mid-boot gap with real margin, without piling much more
-/// wait on top. A line typed at that mark was not dropped or garbled.
-const CODEX_PROMPT_QUIET_PERIOD: Duration = Duration::from_millis(700);
+/// How long after a Codex wake's answer a member is given to show it took the
+/// message up (went not idle) before the wake is called not received.
+///
+/// Measured on Codex 0.171.0 (`docs/notes/codex-wake-spike-2026-11-23.md`): a
+/// message queued to a loaded, idle thread starts its turn on a 10 s beat, so
+/// 0 to 10 s later, and none of the few runs took longer than about 10.2 s; a
+/// handful of runs prove no bound. Twenty seconds is two beats, a margin and not a
+/// derived value. Counted from the answer to `codex queue`, not from the request:
+/// the process can take seconds of its own, and the beat is counted from when
+/// Codex has the message.
+const CODEX_WAKE_WINDOW: Duration = Duration::from_secs(20);
+
+/// How old a Codex pane's process must be before the relay counts its idle
+/// readings toward a wake. A message queued earlier (before banto restarted, or
+/// before the pane was closed and reopened) flows about 1.5 s after the process
+/// loads the thread (measured, same note): the member reads idle for that second
+/// and a bit and is about to start a turn, and a wake sent into it would be a
+/// second message. Covers that flow and a tick; it does not cover a dialog that
+/// is up when the thread opens (the queue flows about 0.3 s after the dialog is
+/// answered, however long that is), or a thread that was interrupted before it
+/// exited. Neither of those two is measured here.
+const CODEX_WAKE_START_GUARD: Duration = Duration::from_secs(5);
+
+/// How long a `Cmd::QueueCodexMessage` may wait for its answer before the wake is
+/// given up on and held. The shell runs one `codex queue` at a time, each with its
+/// own five-second bound, so a late answer is several of those in a row; one this
+/// late is not coming (a lost event, or a replay that omitted it).
+const CODEX_QUEUE_ANSWER_GIVE_UP: Duration = Duration::from_secs(30);
 
 /// The fixed first prompt a freshly created Codex Worker gets on its command
 /// line. The turn it starts is what makes Codex's own `SessionStart` hook fire at
@@ -469,6 +485,70 @@ pub struct NudgeState {
 pub struct RelayState {
     idle_streak: u32,
     nudge: NudgeState,
+}
+
+/// Where one Codex member's wake stands, from the `codex queue` that carried it
+/// to what the member did with it. Kept for a member that has unread mail and
+/// dropped when the mail is read or the member unstages ([`EmporiumState::unstage`]).
+/// An exit that [`relaunch_member`] answers by reopening the pane never unstages,
+/// so a wake outlives that pane. Every other exit does (the Director's, a
+/// Goinkyo's, a brigade being closed, a pane the operator closed), and a pane
+/// opened after it starts with no wake and no attempts: what protects it from
+/// waking a thread whose earlier message is still queued is the start guard
+/// ([`CODEX_WAKE_START_GUARD`]), since a queued message flows about 1.5 s after
+/// the thread loads.
+#[derive(Debug, Default, Clone)]
+struct CodexWake {
+    phase: WakePhase,
+    /// Since when the member's own reading has been idle on every tick, unbroken.
+    /// A second wake for the same unread mail waits for a window of this
+    /// ([`CODEX_WAKE_WINDOW`]): a message queued behind a turn the operator is
+    /// running starts the moment that turn ends, and a member seen idle for a
+    /// couple of ticks in between is not one the first wake missed.
+    idle_since: Option<Instant>,
+}
+
+#[derive(Debug, Default, Clone)]
+enum WakePhase {
+    /// Nothing is out for this member.
+    #[default]
+    Free,
+    /// `Cmd::QueueCodexMessage` is issued and unanswered. `session_id` is what
+    /// finds this member again from the answer, which names the thread and not
+    /// the member.
+    Asking { session_id: String, since: Instant },
+    /// Codex accepted the message at `since`. The member is expected to go not
+    /// idle within [`CODEX_WAKE_WINDOW`] of it; when the window ends with no such
+    /// reading, whether the member reads idle or cannot be read, the wake is held.
+    Watching { since: Instant },
+    /// Banto will not wake this member again for this unread mail. Left only by
+    /// a not-idle reading on a tick after `since`, or by the mail being read:
+    /// the member doing something is the evidence the queue is flowing, and a
+    /// second message sent before that would be a double.
+    Held {
+        since: Instant,
+        cause: HoldCause,
+        /// Whether the operator has been told, said once into a free status line.
+        told: bool,
+    },
+}
+
+/// Why a wake is held, which is what the notice says; the notice names no cause
+/// that was not observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HoldCause {
+    /// The queue accepted the message and the member was still idle when the
+    /// window ended.
+    NotTakenUp,
+    /// `codex queue` was killed at its timeout: not known whether it queued.
+    TimedOut,
+    /// No answer came at all.
+    NoAnswer,
+    /// `codex` could not be run; nothing was queued.
+    NotLaunched(String),
+    /// `codex queue` exited 0 with output banto does not recognise: probably
+    /// queued, not known.
+    Unrecognised,
 }
 
 /// What banto knows about the operator's input to one pane when deciding
@@ -570,22 +650,6 @@ pub fn tick_relay_decision(
         state.nudge.attempts += 1;
     }
     nudge
-}
-
-fn would_nudge_on_tick(
-    state: Option<&RelayState>,
-    now: Instant,
-    is_idle_this_tick: Option<bool>,
-    input: PaneInput,
-    has_unseen: bool,
-) -> bool {
-    let state = state.copied().unwrap_or_default();
-    let idle_streak = if is_idle_this_tick == Some(true) {
-        state.idle_streak + 1
-    } else {
-        0
-    };
-    should_nudge(now, idle_streak, input, has_unseen, &state.nudge)
 }
 
 /// What the relay gather read about one brigade, enough to name it to the
@@ -1281,6 +1345,8 @@ pub struct EmporiumState {
     /// the first off-stage Director left with unread mail exposed that sharing
     /// a cooldown or attempt count across those cells is wrong.
     pub relay_states: HashMap<(BrigadeId, MemberToken), RelayState>,
+    /// Each Codex member's wake, by the same identity as [`Self::relay_states`].
+    codex_wakes: HashMap<(BrigadeId, MemberToken), CodexWake>,
     /// The `interrupt_worker` requests this run has decided, each with its
     /// brigade. A request is decided once, on the first tick that sees it, and the
     /// store's outcome column is what stops it being seen again; this is what stops
@@ -1415,13 +1481,6 @@ pub struct EmporiumState {
     /// Announces on the status line that a nudge is being held back by
     /// [`Self::unsent_operator_input`]; see [`update_tick`].
     draft_hold_reminder: StatusReminder,
-    /// Since when each Codex member's nudge has been held because its pane is not
-    /// at its prompt, unbroken (see [`codex_relay_at_prompt`]). Keyed by member
-    /// like [`Self::unreadable_since`].
-    prompt_held_since: HashMap<(BrigadeId, MemberToken), Instant>,
-    /// Announces that a Codex member's mail waits on the operator's answer to its
-    /// pane; see [`update_tick`].
-    prompt_hold_reminder: StatusReminder,
     /// Since when each idle Claude member's input line has read as
     /// [`InputLine::Unrecognized`], unbroken. Keyed by member rather than by
     /// pane so a rename of the pane's key does not restart the count.
@@ -1429,13 +1488,6 @@ pub struct EmporiumState {
     /// Members already told about an unreadable input line, so the status
     /// line says it once, not every [`INPUT_LINE_UNREADABLE_AFTER`].
     unreadable_noticed: HashSet<(BrigadeId, MemberToken)>,
-    /// When a pane's child last produced *any* output, keyed by its own
-    /// [`SessionKey`] — the baseline the relay's Codex prompt check measures
-    /// quiet time against (see [`CODEX_PROMPT_QUIET_PERIOD`]). Only meaningful
-    /// for a Codex pane, but kept for every pane regardless: a `HashMap` write on
-    /// every `Event::PtyOutput` is cheaper than checking membership first.
-    /// Dropped when its pane unstages, same as [`Self::last_forwarded_input`].
-    last_output_at: HashMap<SessionKey, Instant>,
     /// Panes whose own OSC 7501 report has shown `done` or `error` since this
     /// process started: proof that a turn ran in them. Latched, because a sticky
     /// report must not have to be caught on one particular tick, and never
@@ -1903,6 +1955,7 @@ impl EmporiumState {
             status_set_at: None,
             startup_notices: VecDeque::new(),
             relay_states: HashMap::new(),
+            codex_wakes: HashMap::new(),
             interrupt_decided: HashMap::new(),
             interrupt_watches: HashMap::new(),
             interrupt_repairs: HashSet::new(),
@@ -1922,11 +1975,8 @@ impl EmporiumState {
             last_given_input: HashMap::new(),
             unsent_operator_input: HashSet::new(),
             draft_hold_reminder: StatusReminder::default(),
-            prompt_held_since: HashMap::new(),
-            prompt_hold_reminder: StatusReminder::default(),
             unreadable_since: HashMap::new(),
             unreadable_noticed: HashSet::new(),
-            last_output_at: HashMap::new(),
             codex_turn_ran: HashSet::new(),
             unbriefed_told: HashSet::new(),
             first_turn_watch: HashMap::new(),
@@ -2070,9 +2120,6 @@ impl EmporiumState {
         if self.unsent_operator_input.remove(old_key) {
             self.unsent_operator_input.insert(new_key.clone());
         }
-        if let Some(value) = self.last_output_at.remove(old_key) {
-            self.last_output_at.insert(new_key.clone(), value);
-        }
         if self.codex_turn_ran.remove(old_key) {
             self.codex_turn_ran.insert(new_key.clone());
         }
@@ -2171,6 +2218,7 @@ impl EmporiumState {
         if let (Some(token), Some(brigade_id)) = (token, brigade_id) {
             let member = (brigade_id, token);
             self.relay_states.remove(&member);
+            self.codex_wakes.remove(&member);
             self.interrupt_watches.remove(&member);
             self.interrupt_repairs.remove(&member);
         }
@@ -2179,7 +2227,6 @@ impl EmporiumState {
         self.last_prompted.remove(key);
         self.process_started.remove(key);
         self.unsent_operator_input.remove(key);
-        self.last_output_at.remove(key);
         self.codex_turn_ran.remove(key);
         self.unbriefed_told.remove(key);
         self.latched_attention_panes.remove(key);
@@ -3210,17 +3257,17 @@ impl EmporiumState {
     /// not idle) does not matter — it will go out when that passes. Mail the
     /// relay will not deliver (relay off, attempts exhausted) is not counted: the
     /// brigade is then waiting on the operator. Neither is mail for a Codex member
-    /// held for [`INPUT_LINE_UNREADABLE_AFTER`] because its pane is not at its
-    /// prompt: the operator has been told (see [`update_tick`]) and the mail
-    /// waits on their answer. (A pane carrying the operator's unsent mark keeps
-    /// holding the bell, as any draft does.) A member this tick did not observe
-    /// has no mail as far as the bell knows.
+    /// whose wake is held ([`WakePhase::Held`]): the operator has been told (see
+    /// [`say_codex_holds`]) and the mail waits on what they do. A wake still
+    /// inside its window is counted: the turn it starts begins up to ten seconds
+    /// after the message is queued, which neither `last_prompted` nor the settle
+    /// can cover. A member this tick did not observe has no mail as far as the
+    /// bell knows.
     fn mail_pending(
         &self,
         key: &SessionKey,
         relay_auto: bool,
         observed: &TickObservations,
-        now: Instant,
     ) -> bool {
         relay_auto
             && observed.unread.get(key).is_some_and(|(brigade_id, token)| {
@@ -3228,17 +3275,38 @@ impl EmporiumState {
                 self.relay_states
                     .get(&member)
                     .is_none_or(|relay| relay.nudge.attempts < RELAY_MAX_ATTEMPTS)
-                    && !(self.prompt_held_past_notice(&member, now)
-                        && !self.unsent_operator_input.contains(key))
+                    && !self
+                        .codex_wakes
+                        .get(&member)
+                        .is_some_and(|wake| matches!(wake.phase, WakePhase::Held { .. }))
             })
     }
 
-    /// Whether a Codex member's nudge has been held back for not being at its
-    /// prompt for the time that earns the operator a notice.
-    fn prompt_held_past_notice(&self, member: &(BrigadeId, MemberToken), now: Instant) -> bool {
-        self.prompt_held_since.get(member).is_some_and(|since| {
-            now.saturating_duration_since(*since) >= INPUT_LINE_UNREADABLE_AFTER
-        })
+    /// Whether a Codex wake for `key`'s member is out and not yet judged: asked
+    /// of `codex queue` and unanswered, or accepted and inside its window.
+    fn codex_wake_waiting(&self, key: &SessionKey) -> bool {
+        let (Some(brigade_id), Some(token)) =
+            (self.member_brigades.get(key), self.member_tokens.get(key))
+        else {
+            return false;
+        };
+        self.codex_wakes
+            .get(&(*brigade_id, token.clone()))
+            .is_some_and(|wake| {
+                matches!(
+                    wake.phase,
+                    WakePhase::Asking { .. } | WakePhase::Watching { .. }
+                )
+            })
+    }
+
+    /// Whether `key`'s process is old enough for its idle readings to count toward
+    /// a Codex wake ([`CODEX_WAKE_START_GUARD`]). A pane with no recorded start has
+    /// none to wait out.
+    fn past_codex_wake_guard(&self, key: &SessionKey, now: Instant) -> bool {
+        self.process_started
+            .get(key)
+            .is_none_or(|started| now.saturating_duration_since(*started) >= CODEX_WAKE_START_GUARD)
     }
 
     /// `last_given_input` is stamped for every key forwarded from pane focus,
@@ -3260,12 +3328,17 @@ impl EmporiumState {
     }
 
     /// banto's own write ([`Self::last_prompted`]) is inside
-    /// [`QUIT_RECENT_INPUT_WINDOW`]: what the quit question calls
-    /// [`QuitReason::Nudged`], unless the operator's input is also inside it.
+    /// [`QUIT_RECENT_INPUT_WINDOW`], or a Codex wake for the pane is still waiting
+    /// for its answer or its window ([`Self::codex_wake_waiting`]: a queued message
+    /// starts its turn up to ten seconds later, long after the write): what the
+    /// quit question calls [`QuitReason::Nudged`], unless the operator's input is
+    /// also inside it.
     fn prompted_recently(&self, key: &SessionKey, now: Instant) -> bool {
-        self.last_prompted
-            .get(key)
-            .is_some_and(|at| now.saturating_duration_since(*at) < QUIT_RECENT_INPUT_WINDOW)
+        self.codex_wake_waiting(key)
+            || self
+                .last_prompted
+                .get(key)
+                .is_some_and(|at| now.saturating_duration_since(*at) < QUIT_RECENT_INPUT_WINDOW)
     }
 
     /// Whether the brigade-quiet bell rings with the Director's pane focused
@@ -4136,8 +4209,15 @@ pub enum Cmd {
     /// in the pane's draft is touched. The shell runs it through the binary the
     /// member was launched with, in banto's own environment as the pane is (see
     /// `banto_io::codex_queue` for when that reaches a different home than the
-    /// one banto reads), and answers with `Event::CodexMessageQueued`. It is the sending half of the Codex relay and
-    /// nothing emits it yet; the relay's judgement still types.
+    /// one banto reads), and answers with `Event::CodexMessageQueued`. It is how the
+    /// relay wakes a Codex member: the core issues it from [`update_tick`] and
+    /// judges what came of it from the answer and the member's own readings
+    /// (`CodexWake`). The shell runs it off the event loop, one at a time, so the
+    /// answer arrives in a later iteration than the request, never in the same
+    /// one: the process takes about 0.2 s and is bounded at five, and the loop
+    /// is what draws the screen. The core keeps the mark that a request is out
+    /// and gives up on it by its own clock ([`CODEX_QUEUE_ANSWER_GIVE_UP`]), so
+    /// a stream that lacks the answer still ends.
     QueueCodexMessage {
         /// The pane the message is for. Echoed back, since the answer arrives
         /// later and the session may have been re-keyed in between.
@@ -4726,7 +4806,6 @@ pub fn update(
         Event::Input(input) => update_input(state, app, brigade, input, now),
         Event::Resized { width, height } => update_resized(state, app, width, height),
         Event::PtyOutput { key, chunk } => {
-            state.last_output_at.insert(key.clone(), now);
             let mut cmds = Vec::new();
             let mut rang = false;
             overlay_may_have_changed = false;
@@ -4939,9 +5018,9 @@ pub fn update(
         Event::CodexCatalogRead { round, result } => {
             update_codex_catalog_read(state, round, result, now)
         }
-        // Nothing reads the answer yet: no Cmd asks the question. The Codex relay
-        // that does will decide here what a refusal or an unknown outcome costs.
-        Event::CodexMessageQueued { .. } => Vec::new(),
+        Event::CodexMessageQueued {
+            session_id, result, ..
+        } => update_codex_message_queued(state, app, &session_id, result, now),
         Event::BrigadeFormed {
             director_row_id,
             name,
@@ -5469,8 +5548,7 @@ fn update_brigade_quiet(
         // sense that matters: it is about to be started.
         brigade.members.push(
             if sampled == Quiescence::Idle
-                && (state.first_turn_owed(key)
-                    || state.mail_pending(key, relay_auto, observed, now))
+                && (state.first_turn_owed(key) || state.mail_pending(key, relay_auto, observed))
             {
                 Quiescence::Unknown
             } else {
@@ -9403,9 +9481,6 @@ fn drop_leftovers_of_ended_panes(
         .retain(|pending| !ended.contains(&pending.key));
     state.first_turn_watch.retain(|key, _| !ended.contains(key));
     state
-        .prompt_held_since
-        .retain(|(id, _), _| *id != brigade_id);
-    state
         .unreadable_since
         .retain(|(id, _), _| *id != brigade_id);
     state.unreadable_noticed.retain(|(id, _)| *id != brigade_id);
@@ -11685,12 +11760,12 @@ fn update_tick(
 
     // Members whose nudge only an unsent draft is holding back.
     let mut held_by_draft: Vec<(Option<BrigadeId>, MemberToken)> = Vec::new();
-    // Codex members whose nudge has been held for long enough, because the pane
-    // is not at its prompt, to tell the operator.
-    let mut held_off_prompt: Vec<(Option<BrigadeId>, MemberToken)> = Vec::new();
     // Idle Claude members whose input line has been unreadable long enough
     // to say so.
     let mut unreadable_due: Vec<(BrigadeId, MemberToken)> = Vec::new();
+    // Before the relay below, and whether or not the relay is on: a wake whose
+    // answer never came is given up on by the clock, not by an observation.
+    age_codex_wakes(state, now);
     if brigade.relay == RelayMode::Auto {
         let focused = state.stage.focused_key().cloned();
         for obs in relay {
@@ -11698,6 +11773,13 @@ fn update_tick(
             // process was asked to end, and a line typed into it would only
             // become another queued Enter for a pane that is gone.
             if state.closing.contains_key(&obs.brigade_id) {
+                continue;
+            }
+            // A Codex member is woken through its queue, not typed into: none of
+            // what follows (the input line, the draft fence, the delayed Enter)
+            // applies to it.
+            if obs.agent == Some(AgentKind::Codex) {
+                wake_codex_member(state, app, &obs, now, &mut cmds);
                 continue;
             }
             let InputVerdict {
@@ -11751,38 +11833,6 @@ fn update_tick(
                 last_forwarded,
                 has_unsent,
             };
-            // A Codex pane is typed into only when it is at its prompt, mark or no
-            // mark (`codex_relay_at_prompt`), and only on a tick that would nudge
-            // otherwise, so the screen is read when a decision needs it. At its
-            // prompt the operator's mark is released (kept until the nudge goes out,
-            // below); off it, a marked pane keeps the draft wording and an unmarked
-            // one is held with no attempt spent, and told about after
-            // INPUT_LINE_UNREADABLE_AFTER. There is no blind fallback.
-            let member = (obs.brigade_id, obs.token.clone());
-            let mut release_codex = false;
-            let mut held_off = false;
-            let mut at_prompt = false;
-            if obs.agent == Some(AgentKind::Codex)
-                && would_nudge_on_tick(
-                    state.relay_states.get(&member),
-                    now,
-                    idle_this_tick,
-                    PaneInput {
-                        has_unsent: false,
-                        ..input
-                    },
-                    obs.has_unseen,
-                )
-            {
-                if codex_relay_at_prompt(state, &obs.key, last_forwarded, now) {
-                    at_prompt = true;
-                    release_codex = input.has_unsent;
-                    input.has_unsent = false;
-                } else if !input.has_unsent {
-                    held_off = true;
-                    input.has_unsent = true;
-                }
-            }
             // The Enter-only repair. An Esc written before the model produced any
             // output puts the prompt it cut back into the input box, and when that
             // prompt was the nudge, the line reads as text and the unsent-draft
@@ -11803,22 +11853,6 @@ fn update_tick(
             if enter_only {
                 input.has_unsent = false;
             }
-            // The clock ends only when the pane reads at its prompt or the mail is
-            // gone. A tick on which the member is merely not eligible (not idle
-            // that tick, the operator's keystroke quiet window, which typing into
-            // the picker starts) says nothing about the pane and must not restart
-            // the minute: the bell would be held again for a pane still waiting on
-            // the operator.
-            if held_off {
-                state.prompt_held_since.entry(member.clone()).or_insert(now);
-            } else if at_prompt || !obs.has_unseen || obs.agent != Some(AgentKind::Codex) {
-                state.prompt_held_since.remove(&member);
-            }
-            if state.prompt_held_past_notice(&member, now)
-                && !state.unsent_operator_input.contains(&obs.key)
-            {
-                held_off_prompt.push((Some(obs.brigade_id), obs.token.clone()));
-            }
             let nudge = tick_relay_decision(
                 &mut state.relay_states,
                 obs.brigade_id,
@@ -11829,9 +11863,6 @@ fn update_tick(
                 obs.has_unseen,
             );
             if nudge {
-                if release_codex {
-                    state.unsent_operator_input.remove(&obs.key);
-                }
                 if enter_only {
                     state.last_prompted.insert(obs.key.clone(), now);
                     cmds.push(Cmd::WritePty {
@@ -11862,7 +11893,6 @@ fn update_tick(
                 let how = if enter_only { " (Enter only)" } else { "" };
                 state.set_status(format!("relay: nudged {member}{how}{prompt}"), now);
             } else if input.has_unsent
-                && !held_off
                 && state
                     .relay_states
                     .get(&(obs.brigade_id, obs.token.clone()))
@@ -11910,21 +11940,7 @@ fn update_tick(
         );
     }
 
-    // A Codex member whose mail waits on the operator's answer to its pane. The
-    // same cycle as the draft hold: a nudge is never typed into a screen that is
-    // not a prompt, so the operator is the only way out.
-    if state
-        .prompt_hold_reminder
-        .due(!held_off_prompt.is_empty(), state.status.is_none(), now)
-    {
-        let members = state.members_phrase(app, &held_off_prompt);
-        state.set_status(
-            format!(
-                "relay: {members}: not at its prompt \u{2014} answer what the pane shows; its mail waits"
-            ),
-            now,
-        );
-    }
+    say_codex_holds(state, app, now);
 
     // Said once per member, and only into a free status line: a member left
     // due stays due until it fits.
@@ -11961,6 +11977,293 @@ fn update_tick(
     ));
 
     cmds
+}
+
+/// One tick of a Codex member's wake: judge the one that is out, and send a
+/// new one when the member is due.
+///
+/// A wake goes through the member's queue (`Cmd::QueueCodexMessage`) and is
+/// judged only by what the member does, read from the observation's own idle
+/// reading, never from the one the Claude path adjusts for a line banto has in
+/// flight: banto reading its own not-idle as the member's would call every wake
+/// received.
+///
+/// - Received: inside the window the member reads not idle (a turn of the
+///   operator's does too: what is queued runs after it), or the unread mail is
+///   gone.
+/// - Not received: still idle when the window ends. The member is held, once and
+///   without a resend, because sending again is exactly how a message is
+///   delivered twice; only the member doing something releases it.
+///
+/// A second wake for mail the first did not clear waits a window of unbroken
+/// idle as well as the cooldown and the attempt cap the relay always had, and
+/// the first needs the usual two idle ticks. No part of a Codex pane is read
+/// and no key sent: the draft fence, the prompt gate and the delayed Enter are
+/// the typing path's.
+fn wake_codex_member(
+    state: &mut EmporiumState,
+    app: &App,
+    obs: &RelayObservation,
+    now: Instant,
+    cmds: &mut Vec<Cmd>,
+) {
+    let member = (obs.brigade_id, obs.token.clone());
+    if !obs.has_unseen {
+        state.codex_wakes.remove(&member);
+        state.relay_states.remove(&member);
+        return;
+    }
+    let reading = obs.is_idle_this_tick;
+    let attempts = state
+        .relay_states
+        .get(&member)
+        .map_or(0, |relay| relay.nudge.attempts);
+    // Idle counts neither toward a wake nor toward judging one not taken up while
+    // the process is still loading what an earlier wake queued (a pane reopened
+    // inside a window is judged by the new process, not by the clock that ran
+    // out meanwhile), or while the first prompt banto gave the member is not yet
+    // a turn: the member reads idle through both and is about to be busy. (banto
+    // writes nothing into a Codex pane, so `written_this_tick`, which the typing
+    // path uses for the same purpose, is never set for one.)
+    let not_counted = !state.past_codex_wake_guard(&obs.key, now)
+        || state.first_turn_watch.contains_key(&obs.key);
+    let counted_idle = if not_counted { Some(false) } else { reading };
+    let wake = state.codex_wakes.entry(member.clone()).or_default();
+    wake.idle_since = match reading {
+        Some(true) => Some(wake.idle_since.unwrap_or(now)),
+        _ => None,
+    };
+    match wake.phase {
+        WakePhase::Watching { since } => {
+            if reading == Some(false) {
+                wake.phase = WakePhase::Free;
+            } else if !not_counted && now.saturating_duration_since(since) >= CODEX_WAKE_WINDOW {
+                // Held for want of evidence, not for evidence of idleness: a
+                // reading that cannot be taken (`None`) shows no turn either, and
+                // the window is the whole of what a message is given.
+                wake.phase = WakePhase::Held {
+                    since: now,
+                    cause: HoldCause::NotTakenUp,
+                    told: false,
+                };
+            }
+        }
+        // Strictly after: a hold that began on this very tick has not been seen
+        // past.
+        WakePhase::Held { since, .. } if reading == Some(false) && since < now => {
+            wake.phase = WakePhase::Free;
+        }
+        _ => {}
+    }
+    let free = matches!(wake.phase, WakePhase::Free);
+    let window_idle = wake
+        .idle_since
+        .is_some_and(|at| now.saturating_duration_since(at) >= CODEX_WAKE_WINDOW);
+    let may_wake = free && (attempts == 0 || window_idle) && !obs.key.is_synthetic();
+    if !tick_codex_wake_decision(
+        &mut state.relay_states,
+        obs.brigade_id,
+        &obs.token,
+        now,
+        counted_idle,
+        may_wake,
+    ) {
+        return;
+    }
+    let session_id = obs.key.as_str().to_string();
+    state.last_prompted.insert(obs.key.clone(), now);
+    if let Some(wake) = state.codex_wakes.get_mut(&member) {
+        wake.phase = WakePhase::Asking {
+            session_id: session_id.clone(),
+            since: now,
+        };
+    }
+    cmds.push(Cmd::QueueCodexMessage {
+        key: obs.key.clone(),
+        session_id,
+        message: RELAY_NUDGE_LINE.to_string(),
+    });
+    let who = state.members_phrase(app, &[(Some(obs.brigade_id), obs.token.clone())]);
+    // What prompted it: the newest message to this member, as applied from this
+    // very tick's observation.
+    let prompt = state
+        .member_facts
+        .get(&member)
+        .and_then(|facts| facts.inbound.as_ref())
+        .map(|inbound| nudge_prompt(state, obs.brigade_id, inbound))
+        .unwrap_or_default();
+    state.set_status(format!("relay: nudged {who}{prompt}"), now);
+}
+
+/// [`tick_relay_decision`] for a member woken through its queue: the same idle
+/// streak, cooldown and attempt cap, with no draft fence and no focus quiet
+/// period (nothing is typed), and `may_wake` for what only the wake's own state
+/// knows. The streak is counted whether or not a wake may go out.
+fn tick_codex_wake_decision(
+    states: &mut HashMap<(BrigadeId, MemberToken), RelayState>,
+    brigade_id: BrigadeId,
+    token: &MemberToken,
+    now: Instant,
+    idle: Option<bool>,
+    may_wake: bool,
+) -> bool {
+    let state = states.entry((brigade_id, token.clone())).or_default();
+    state.idle_streak = if idle == Some(true) {
+        state.idle_streak + 1
+    } else {
+        0
+    };
+    let wake = may_wake
+        && should_nudge(
+            now,
+            state.idle_streak,
+            PaneInput::default(),
+            true,
+            &state.nudge,
+        );
+    if wake {
+        state.nudge.last_nudge = Some(now);
+        state.nudge.attempts += 1;
+    }
+    wake
+}
+
+/// Hold the wakes whose answer never came, by the clock: not an observation's to
+/// notice, since a member the tick did not observe has none.
+fn age_codex_wakes(state: &mut EmporiumState, now: Instant) {
+    for wake in state.codex_wakes.values_mut() {
+        if let WakePhase::Asking { since, .. } = wake.phase
+            && now.saturating_duration_since(since) >= CODEX_QUEUE_ANSWER_GIVE_UP
+        {
+            wake.phase = WakePhase::Held {
+                since: now,
+                cause: HoldCause::NoAnswer,
+                told: false,
+            };
+        }
+    }
+}
+
+/// What `codex queue` came to for the member whose wake `session_id` names.
+///
+/// Only a non-zero exit is a wake known not to have been queued (measured: a
+/// refused queue queues nothing), so only that one is free to go out again, under
+/// the cooldown and the cap. A timeout kill and output banto does not recognise
+/// may have queued it, and a missing `codex` cannot be helped by trying again:
+/// those are held, and the operator is told. An answer for a member that has no
+/// wake out (it was unstaged, or the wake was given up on) is ignored.
+fn update_codex_message_queued(
+    state: &mut EmporiumState,
+    app: &App,
+    session_id: &str,
+    result: crate::codex_queue::CodexQueueResult,
+    now: Instant,
+) -> Vec<Cmd> {
+    use crate::codex_queue::CodexQueueResult;
+    let Some(member) = state.codex_wakes.iter().find_map(|(member, wake)| {
+        matches!(&wake.phase, WakePhase::Asking { session_id: asked, .. } if asked == session_id)
+            .then(|| member.clone())
+    }) else {
+        return Vec::new();
+    };
+    let held = |cause| WakePhase::Held {
+        since: now,
+        cause,
+        told: false,
+    };
+    let phase = match result {
+        CodexQueueResult::Queued { .. } => WakePhase::Watching { since: now },
+        CodexQueueResult::Failed {
+            exit_code: Some(code),
+            summary,
+        } => {
+            let who = state.members_phrase(app, &[(Some(member.0), member.1.clone())]);
+            state.set_status(
+                format!("relay: `codex queue` for {who} failed (exit {code}): {summary}"),
+                now,
+            );
+            WakePhase::Free
+        }
+        CodexQueueResult::Failed {
+            exit_code: None, ..
+        } => held(HoldCause::TimedOut),
+        CodexQueueResult::NotLaunched { reason } => held(HoldCause::NotLaunched(reason)),
+        CodexQueueResult::UnexpectedOutput { .. } => held(HoldCause::Unrecognised),
+    };
+    if let Some(wake) = state.codex_wakes.get_mut(&member) {
+        wake.phase = phase;
+    }
+    Vec::new()
+}
+
+/// Where a member stands in its brigade's roster, which the store orders
+/// `director`, then the Workers by number: the rank to say things in, since the
+/// wakes live in a map with no order of its own. Compared as text `worker-10`
+/// would come before `worker-2`.
+fn roster_rank(member: &(BrigadeId, MemberToken)) -> (BrigadeId, u8, u64, MemberToken) {
+    let (brigade_id, token) = member;
+    let (class, number) = if token == DIRECTOR_TOKEN {
+        (0, 0)
+    } else if let Some(number) = token
+        .strip_prefix("worker-")
+        .and_then(|digits| digits.parse().ok())
+    {
+        (1, number)
+    } else {
+        (2, 0)
+    };
+    (*brigade_id, class, number, token.clone())
+}
+
+/// Tell the operator, once and into a free status line, about a Codex member
+/// whose wake is held. One member a tick, in roster order; a member left due stays
+/// due until the line is free.
+///
+/// The text states what was seen and no cause: a wake that was accepted and not
+/// taken up looks the same whether the pane waits at a dialog, Codex is slow, or
+/// the queue is stuck, and the operator is the one who can look.
+fn say_codex_holds(state: &mut EmporiumState, app: &App, now: Instant) {
+    if state.status.is_some() {
+        return;
+    }
+    let Some((member, cause)) = state
+        .codex_wakes
+        .iter()
+        .filter_map(|(member, wake)| match &wake.phase {
+            WakePhase::Held {
+                told: false, cause, ..
+            } => Some((member.clone(), cause.clone())),
+            _ => None,
+        })
+        .min_by_key(|(member, _)| roster_rank(member))
+    else {
+        return;
+    };
+    let who = state.members_phrase(app, &[(Some(member.0), member.1.clone())]);
+    let look = "look at its pane, answer what it shows, or type it a word";
+    let text = match cause {
+        HoldCause::NotTakenUp => format!("relay: woke {who} but nothing happened \u{2014} {look}"),
+        HoldCause::TimedOut => format!(
+            "relay: `codex queue` for {who} timed out, so the wake may or may not be queued \u{2014} {look}"
+        ),
+        HoldCause::NoAnswer => {
+            format!("relay: no answer came for the wake of {who} \u{2014} {look}")
+        }
+        HoldCause::NotLaunched(reason) => format!(
+            "relay: could not run `codex queue` for {who} ({reason}); nothing was sent \u{2014} {look}"
+        ),
+        HoldCause::Unrecognised => format!(
+            "relay: `codex queue` for {who} printed something banto does not recognise, so the wake may or may not be queued \u{2014} {look}"
+        ),
+    };
+    state.set_status(text, now);
+    if let Some(WakePhase::Held { told, .. }) = state
+        .codex_wakes
+        .get_mut(&member)
+        .map(|wake| &mut wake.phase)
+    {
+        *told = true;
+    }
 }
 
 /// Say, once per launch, that a hosted Codex member ran a turn and was never
@@ -12419,56 +12722,6 @@ fn update_goinkyo_awaiting_spawn(
         return hold_for_catalog(state, open);
     }
     vec![open]
-}
-
-/// A Codex pane is at its prompt when its own latest report (OSC 7501) is one
-/// `accepts` and its input line reads as the empty prompt. Neither alone is
-/// enough, measured on Codex 0.169.0: `idle` holds for as long as the sandbox
-/// menu is up, and the empty-prompt shape shows briefly before the trust dialog
-/// and about 260 ms after the trust answer with no report yet. The two
-/// coincided for only about 22 ms, while output was still arriving, so asking
-/// them on a tick that already passed [`CODEX_PROMPT_QUIET_PERIOD`] makes the
-/// pair stable. A pane that has reported nothing is never at its prompt.
-///
-/// The report is read off the screen directly, not through
-/// [`EmporiumState::codex_report`]: that one believes a pane only once it is
-/// known to be Codex.
-fn codex_pane_at_prompt(
-    state: &EmporiumState,
-    key: &SessionKey,
-    accepts: impl Fn(ReportedState) -> bool,
-) -> bool {
-    state.screens.get(key).is_some_and(|screen| {
-        screen.reported_state().is_some_and(accepts)
-            && read_codex_input_line(screen) == InputLine::Empty
-    })
-}
-
-/// Whether a Codex member's pane is at its prompt, so that the relay may type its
-/// nudge: output quiet for [`CODEX_PROMPT_QUIET_PERIOD`] (the report and the
-/// painted line agree only on a pane that has stopped painting), a report that is
-/// not `blocked`, an empty prompt, and [`INPUT_ECHO_SETTLE`] since banto last
-/// forwarded a key (the screen lags its keys). Any report but `blocked` will do:
-/// a pane that ran a turn sits in `done` until touched, and the relay's own idle
-/// reading from the rollout is asked separately. A picker reports `idle` and a
-/// dialog `blocked`; it is the painted line that tells a picker from a prompt
-/// (measured on Codex 0.169.0: the nudge's `k` moved a picker's selection and its
-/// Enter applied it).
-fn codex_relay_at_prompt(
-    state: &EmporiumState,
-    key: &SessionKey,
-    last_forwarded: Option<Instant>,
-    now: Instant,
-) -> bool {
-    // A pane with no output on record has painted nothing, and the read below
-    // then finds no prompt.
-    let quiet = state
-        .last_output_at
-        .get(key)
-        .is_none_or(|at| now.saturating_duration_since(*at) >= CODEX_PROMPT_QUIET_PERIOD);
-    quiet
-        && last_forwarded.is_none_or(|at| now.saturating_duration_since(at) >= INPUT_ECHO_SETTLE)
-        && codex_pane_at_prompt(state, key, |report| !report.is_blocked())
 }
 
 #[cfg(test)]
@@ -17655,7 +17908,7 @@ mod tests {
     }
 
     #[test]
-    fn pty_exited_clears_the_watch_and_last_output_for_that_pane() {
+    fn pty_exited_clears_the_watch_for_that_pane() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let key = SessionKey::from_id("sess-1");
         state.screens.insert(key.clone(), Screen::new(24, 80));
@@ -17667,7 +17920,6 @@ mod tests {
                 told: false,
             },
         );
-        state.last_output_at.insert(key.clone(), test_instant());
         let mut app = app_with(vec![row("sess-1")]);
         let brigade = brigade_config();
 
@@ -17683,21 +17935,6 @@ mod tests {
         );
 
         assert!(state.first_turn_watch.is_empty());
-        assert!(!state.last_output_at.contains_key(&key));
-    }
-
-    /// Paint a hand-made two-option menu — what Codex draws for its sandbox and
-    /// trust questions — and, when given, an OSC 7501 report. Measured on Codex
-    /// 0.169.0: such a menu reports `idle` for as long as it is up.
-    fn paint_codex_menu(state: &mut EmporiumState, key: &SessionKey, report: Option<&str>) {
-        let screen = state.screens.get_mut(key).unwrap();
-        let mut bytes =
-            "\x1b[2J\x1b[1;1HAllow this session?\r\n\r\n> 1. Yes, continue\r\n  2. No, quit"
-                .to_string();
-        if let Some(report) = report {
-            bytes.push_str(&format!("\x1b]7501;state={report}:app=codex\x07"));
-        }
-        screen.process(bytes.as_bytes());
     }
 
     #[test]
@@ -18816,439 +19053,1523 @@ mod tests {
 
     const CLAUDE: Option<AgentKind> = Some(AgentKind::ClaudeCode);
 
-    fn draw_empty_codex_prompt(state: &mut EmporiumState, key: &SessionKey) {
-        let screen = state.screens.get_mut(key).unwrap();
-        let (rows, _) = screen.size();
-        screen.process(format!("\x1b[2J\x1b[{};1H\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\x1b[{};3H\x1b]7501;state=idle\x07", rows - 3, rows - 3).as_bytes());
+    const CODEX: Option<AgentKind> = Some(AgentKind::Codex);
+
+    // --- waking a Codex member through its queue ------------------------------
+
+    /// A Codex Director observation for one tick: whether the member reads idle
+    /// and whether it has unread mail.
+    fn codex_tick(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        key: &SessionKey,
+        idle: Option<bool>,
+        has_unseen: bool,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        tick_obs(
+            state,
+            app,
+            brigade,
+            key,
+            Seen {
+                agent: CODEX,
+                idle,
+                has_unseen,
+            },
+            now,
+        )
     }
 
-    #[test]
-    fn codex_empty_releases_mark_only_at_an_eligible_nudge() {
-        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
-        state.unsent_operator_input.insert(director.clone());
-        state.last_forwarded_input.insert(director.clone(), now);
-        draw_empty_codex_prompt(&mut state, &director);
-        let codex = Some(AgentKind::Codex);
-        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, codex, &mut now);
-        assert!(writes.is_empty());
-        assert!(state.has_unsent_operator_input(&director));
-        now += INPUT_ECHO_SETTLE;
-        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, codex, &mut now);
-        assert_eq!(writes, nudge_then_enter_for(&director));
-        assert!(!state.has_unsent_operator_input(&director));
+    fn queued_of(cmds: &[Cmd]) -> Vec<(SessionKey, String, String)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::QueueCodexMessage {
+                    key,
+                    session_id,
+                    message,
+                } => Some((key.clone(), session_id.clone(), message.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
-    #[test]
-    fn codex_empty_retains_mark_when_other_nudge_gates_block() {
-        for gate in [
-            "streak",
-            "focus",
-            "cooldown",
-            "no_mail",
-            "busy",
-            "attempt_cap",
-        ] {
-            let (mut state, mut app, brigade, director, now) = reading_fixture();
-            state.unsent_operator_input.insert(director.clone());
-            state
-                .last_forwarded_input
-                .insert(director.clone(), now - INPUT_ECHO_SETTLE);
-            draw_empty_codex_prompt(&mut state, &director);
-            if gate != "streak" {
-                state.relay_states.insert(
-                    (1, "director".into()),
-                    RelayState {
-                        idle_streak: 1,
-                        nudge: NudgeState::default(),
-                    },
-                );
-            }
-            if gate == "focus"
-                && let Stage::Brigade { focused, .. } = &mut state.stage
-            {
-                *focused = 0;
-            }
-            if gate == "cooldown" {
-                state
-                    .relay_states
-                    .get_mut(&(1, "director".into()))
-                    .unwrap()
-                    .nudge
-                    .last_nudge = Some(now);
-            }
-            if gate == "attempt_cap" {
-                state
-                    .relay_states
-                    .get_mut(&(1, "director".into()))
-                    .unwrap()
-                    .nudge
-                    .attempts = RELAY_MAX_ATTEMPTS;
-            }
-            let cmds = tick_obs(
-                &mut state,
-                &mut app,
-                &brigade,
-                &director,
-                Seen {
-                    agent: Some(AgentKind::Codex),
-                    idle: Some(gate != "busy"),
-                    has_unseen: gate != "no_mail",
-                },
-                now,
-            );
-            assert!(writes_of(&cmds).is_empty(), "{gate}");
-            assert!(state.has_unsent_operator_input(&director), "{gate}");
+    fn answer_queue(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        key: &SessionKey,
+        result: crate::codex_queue::CodexQueueResult,
+        now: Instant,
+    ) {
+        update(
+            state,
+            app,
+            brigade,
+            Event::CodexMessageQueued {
+                key: key.clone(),
+                session_id: key.as_str().to_string(),
+                result,
+            },
+            now,
+        );
+    }
+
+    fn queued_ok() -> crate::codex_queue::CodexQueueResult {
+        crate::codex_queue::CodexQueueResult::Queued {
+            message_id: "m-1".to_string(),
+            thread_id: "t-1".to_string(),
         }
     }
 
-    #[test]
-    fn unrecognized_codex_keeps_draft_and_uses_existing_reminder_only() {
+    fn the_wake(state: &EmporiumState) -> Option<&CodexWake> {
+        state.codex_wakes.get(&(1, "director".to_string()))
+    }
+
+    fn wake_is_held(state: &EmporiumState) -> bool {
+        the_wake(state).is_some_and(|wake| matches!(wake.phase, WakePhase::Held { .. }))
+    }
+
+    fn wake_is_free(state: &EmporiumState) -> bool {
+        the_wake(state).is_some_and(|wake| matches!(wake.phase, WakePhase::Free))
+    }
+
+    type WokenDirector = (
+        EmporiumState,
+        App,
+        BrigadeConfig,
+        SessionKey,
+        Instant,
+        Vec<Cmd>,
+    );
+
+    /// Two idle ticks a second apart, the second of which asks for the wake;
+    /// returns the instant of that tick and what it produced.
+    fn woken_codex_director() -> WokenDirector {
         let (mut state, mut app, brigade, director, mut now) = reading_fixture();
-        state.unsent_operator_input.insert(director.clone());
-        let mut writes = two_ticks_as(
+        now += Duration::from_secs(1);
+        let first = codex_tick(
             &mut state,
             &mut app,
             &brigade,
             &director,
-            Some(AgentKind::Codex),
-            &mut now,
+            Some(true),
+            true,
+            now,
         );
-        now += Duration::from_secs(70);
-        writes.extend(two_ticks_as(
+        assert!(queued_of(&first).is_empty(), "one idle tick is not enough");
+        now += Duration::from_secs(1);
+        let cmds = codex_tick(
             &mut state,
             &mut app,
             &brigade,
             &director,
-            Some(AgentKind::Codex),
-            &mut now,
-        ));
-        assert!(writes.is_empty());
-        assert!(state.has_unsent_operator_input(&director));
+            Some(true),
+            true,
+            now,
+        );
+        (state, app, brigade, director, now, cmds)
+    }
+
+    #[test]
+    fn an_idle_codex_member_with_mail_is_woken_through_its_queue_and_nothing_is_typed() {
+        let (state, _app, _brigade, director, _now, cmds) = woken_codex_director();
+
+        assert_eq!(
+            queued_of(&cmds),
+            vec![(
+                director.clone(),
+                director.as_str().to_string(),
+                RELAY_NUDGE_LINE.to_string()
+            )]
+        );
+        assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
         assert!(
             state
                 .status
                 .as_deref()
-                .is_some_and(|s| s.contains("holding the nudge"))
+                .is_some_and(|s| s.contains("nudged"))
         );
-        assert!(state.unreadable_since.is_empty());
-        assert!(state.unreadable_noticed.is_empty());
-    }
-
-    const CODEX: Option<AgentKind> = Some(AgentKind::Codex);
-
-    /// A Codex pane showing something other than its empty prompt, unmarked.
-    fn unmarked_codex_pane_shows(paint: impl Fn(&mut EmporiumState, &SessionKey)) {
-        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
-        paint(&mut state, &director);
-        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
-        assert!(writes.is_empty(), "{writes:?}");
-        let attempts = state
-            .relay_states
-            .get(&(1, "director".into()))
-            .map_or(0, |relay| relay.nudge.attempts);
-        assert_eq!(attempts, 0, "no attempt is spent while held");
-    }
-
-    #[test]
-    fn an_unmarked_codex_pane_at_a_picker_is_not_typed_into() {
-        // The report says idle while a picker is open (measured, 0.169.0): only
-        // the painted line tells it from a prompt.
-        unmarked_codex_pane_shows(|state, key| paint_codex_menu(state, key, Some("idle")));
-    }
-
-    #[test]
-    fn an_unmarked_codex_pane_at_a_dialog_is_not_typed_into() {
-        unmarked_codex_pane_shows(|state, key| {
-            paint_codex_menu(state, key, Some("blocked:kind=permission"));
-        });
-    }
-
-    #[test]
-    fn an_unmarked_codex_pane_with_text_in_the_composer_is_not_typed_into() {
-        unmarked_codex_pane_shows(paint_codex_prompt_with_text);
-    }
-
-    #[test]
-    fn an_unmarked_codex_pane_that_has_reported_nothing_is_not_typed_into() {
-        unmarked_codex_pane_shows(|state, key| {
-            let screen = state.screens.get_mut(key).unwrap();
-            let (rows, _) = screen.size();
-            screen.process(
-                format!(
-                    "\x1b[2J\x1b[{row};1H\x1b[1m\u{203a}\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m",
-                    row = rows - 3
-                )
-                .as_bytes(),
-            );
-        });
-    }
-
-    #[test]
-    fn a_codex_pane_at_its_empty_prompt_is_nudged_whether_it_reports_idle_or_done() {
-        for report in ["idle", "done", "working"] {
-            let (mut state, mut app, brigade, director, mut now) = reading_fixture();
-            draw_empty_codex_prompt(&mut state, &director);
-            report_codex_state(&mut state, &director, report);
-            let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
-            assert_eq!(writes, nudge_for(&director), "{report}");
-        }
-    }
-
-    #[test]
-    fn a_codex_pane_reporting_blocked_is_not_nudged_even_where_the_line_reads_empty() {
-        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
-        draw_empty_codex_prompt(&mut state, &director);
-        report_codex_state(&mut state, &director, "blocked:kind=permission");
-        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
-        assert!(writes.is_empty(), "{writes:?}");
-    }
-
-    #[test]
-    fn a_codex_pane_still_painting_is_not_nudged_until_it_has_been_quiet() {
-        let (mut state, mut app, brigade, director, now) = reading_fixture();
-        draw_empty_codex_prompt(&mut state, &director);
-        state.last_output_at.insert(director.clone(), now);
-        state.relay_states.insert(
-            (1, "director".into()),
-            RelayState {
-                idle_streak: 1,
-                nudge: NudgeState::default(),
-            },
-        );
-        let seen = Seen {
-            agent: CODEX,
-            idle: Some(true),
-            has_unseen: true,
-        };
-
-        let early = tick_obs(
-            &mut state,
-            &mut app,
-            &brigade,
-            &director,
-            seen,
-            now + CODEX_PROMPT_QUIET_PERIOD - Duration::from_millis(1),
-        );
-        assert!(writes_of(&early).is_empty(), "{early:?}");
-        let due = tick_obs(
-            &mut state,
-            &mut app,
-            &brigade,
-            &director,
-            seen,
-            now + CODEX_PROMPT_QUIET_PERIOD,
-        );
-        assert_eq!(writes_of(&due), nudge_for(&director));
-    }
-
-    #[test]
-    fn a_codex_pane_held_off_its_prompt_is_told_about_once_after_a_minute_and_nothing_is_typed() {
-        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
-        paint_codex_menu(&mut state, &director, Some("idle"));
-        let mut writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
-        assert!(state.status.is_none(), "not yet: {:?}", state.status);
-
-        now += INPUT_LINE_UNREADABLE_AFTER;
-        writes.extend(two_ticks_as(
-            &mut state, &mut app, &brigade, &director, CODEX, &mut now,
+        assert!(matches!(
+            the_wake(&state).map(|wake| &wake.phase),
+            Some(WakePhase::Asking { .. })
         ));
+    }
 
-        assert!(writes.is_empty(), "{writes:?}");
+    #[test]
+    fn a_draft_in_a_codex_composer_does_not_hold_the_wake_since_nothing_is_typed() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        state.unsent_operator_input.insert(director.clone());
+        let mut queued = Vec::new();
+        for _ in 0..2 {
+            now += Duration::from_secs(1);
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                now,
+            );
+            assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+            queued.extend(queued_of(&cmds));
+        }
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert!(state.has_unsent_operator_input(&director), "left alone");
+    }
+
+    #[test]
+    fn a_wake_is_not_asked_for_again_while_its_answer_is_out_and_is_given_up_not_resent() {
+        let (mut state, mut app, brigade, director, mut now, _) = woken_codex_director();
+        for _ in 0..5 {
+            now += Duration::from_secs(70);
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                now,
+            );
+            // 70 s is past the cooldown, so only the answer mark keeps it from
+            // going out again; the give-up takes it to a hold, not a resend.
+            assert!(queued_of(&cmds).is_empty(), "{cmds:?}");
+        }
+        assert!(wake_is_held(&state));
+    }
+
+    #[test]
+    fn a_member_that_goes_busy_after_the_message_was_queued_received_it() {
+        let (mut state, mut app, brigade, director, mut now, _) = woken_codex_director();
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+        now += Duration::from_secs(3);
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(false),
+            true,
+            now,
+        );
+        assert!(wake_is_free(&state));
+
+        // Idle again with the mail still unread: no hold, no notice, and no second
+        // message inside the cooldown and a window of idle.
+        for _ in 0..4 {
+            now += Duration::from_secs(5);
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                now,
+            );
+            assert!(queued_of(&cmds).is_empty(), "{cmds:?}");
+        }
+        assert!(!wake_is_held(&state));
+    }
+
+    #[test]
+    fn a_member_still_idle_when_the_window_ends_is_held_and_the_operator_told_once() {
+        let (mut state, mut app, brigade, director, mut now, _) = woken_codex_director();
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+        state.status = None;
+
+        now += CODEX_WAKE_WINDOW - Duration::from_secs(1);
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
+            now,
+        );
+        assert!(!wake_is_held(&state), "the window is not over");
+        assert!(state.status.is_none());
+
+        now += Duration::from_secs(1);
+        let cmds = codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
+            now,
+        );
+        assert!(wake_is_held(&state));
+        assert!(queued_of(&cmds).is_empty());
         let status = state.status.clone().unwrap_or_default();
         assert!(
-            status.contains("not at its prompt")
-                && status.contains("answer what the pane shows")
-                && status.contains("its mail waits"),
+            status.contains("nothing happened") && status.contains("look at its pane"),
             "{status}"
         );
-        assert!(!status.contains("unsent input"), "{status}");
+        assert!(
+            !status.contains("dialog") && !status.contains("stuck"),
+            "the notice guesses no cause: {status}"
+        );
 
-        // Said once: the next tick, inside the reminder cycle, says nothing more.
+        // Said once, and no resend however long it stays idle.
         state.status = None;
-        now += Duration::from_secs(1);
-        tick_obs(
-            &mut state,
-            &mut app,
-            &brigade,
-            &director,
-            Seen {
-                agent: CODEX,
-                idle: Some(true),
-                has_unseen: true,
-            },
-            now,
-        );
-        assert!(state.status.is_none(), "{:?}", state.status);
-    }
-
-    #[test]
-    fn mail_held_off_a_codex_prompt_for_a_minute_stops_holding_the_bell_and_resumes_at_the_prompt()
-    {
-        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
-        paint_codex_menu(&mut state, &director, Some("idle"));
-        two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
-        let observed = TickObservations {
-            unread: HashMap::from([(director.clone(), (1, "director".to_string()))]),
-            directors: HashSet::new(),
-        };
-        assert!(
-            state.mail_pending(&director, true, &observed, now),
-            "a minute has not passed: the mail is on the way"
-        );
-
-        now += INPUT_LINE_UNREADABLE_AFTER;
-        two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
-        assert!(
-            !state.mail_pending(&director, true, &observed, now),
-            "mail the relay will not deliver does not hold the bell"
-        );
-
-        // The operator answers the picker; the prompt is back and the nudge goes
-        // out on that very tick, the held time having spent no attempt.
-        draw_empty_codex_prompt(&mut state, &director);
-        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
-        assert_eq!(writes, nudge_then_enter_for(&director));
-        assert!(state.prompt_held_since.is_empty());
-        assert!(state.mail_pending(&director, true, &observed, now));
-    }
-
-    #[test]
-    fn a_tick_on_which_a_held_codex_member_is_not_eligible_does_not_restart_the_minute() {
-        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
-        paint_codex_menu(&mut state, &director, Some("idle"));
-        two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
-        let observed = TickObservations {
-            unread: HashMap::from([(director.clone(), (1, "director".to_string()))]),
-            directors: HashSet::new(),
-        };
-        now += INPUT_LINE_UNREADABLE_AFTER;
-        two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
-        assert!(!state.mail_pending(&director, true, &observed, now));
-
-        // One tick on which the member reads busy: no verdict on the pane.
-        now += Duration::from_secs(1);
-        tick_obs(
-            &mut state,
-            &mut app,
-            &brigade,
-            &director,
-            Seen {
-                agent: CODEX,
-                idle: Some(false),
-                has_unseen: true,
-            },
-            now,
-        );
-        assert!(
-            !state.mail_pending(&director, true, &observed, now),
-            "still past the notice, the bell still released"
-        );
-
-        // The mail being read ends it.
-        now += Duration::from_secs(1);
-        tick_obs(
-            &mut state,
-            &mut app,
-            &brigade,
-            &director,
-            Seen {
-                agent: CODEX,
-                idle: Some(true),
-                has_unseen: false,
-            },
-            now,
-        );
-        assert!(state.prompt_held_since.is_empty());
-    }
-
-    #[test]
-    fn a_marked_codex_pane_off_its_prompt_keeps_the_draft_wording() {
-        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
-        paint_codex_menu(&mut state, &director, Some("idle"));
-        state.unsent_operator_input.insert(director.clone());
-        let mut writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
-        now += INPUT_LINE_UNREADABLE_AFTER;
-        writes.extend(two_ticks_as(
-            &mut state, &mut app, &brigade, &director, CODEX, &mut now,
-        ));
-
-        assert!(writes.is_empty(), "{writes:?}");
-        let status = state.status.clone().unwrap_or_default();
-        assert!(status.contains("unsent input in the pane"), "{status}");
-        assert!(!status.contains("not at its prompt"), "{status}");
-        assert!(state.prompt_held_since.is_empty());
-    }
-
-    #[test]
-    fn a_codex_pane_that_is_not_waiting_for_mail_is_not_read_or_reported() {
-        // The gate runs only on a tick that would nudge: no mail, no screen read,
-        // no held-since entry, however odd the screen.
-        let (mut state, mut app, brigade, director, now) = reading_fixture();
-        paint_codex_menu(&mut state, &director, Some("idle"));
-        tick_obs(
-            &mut state,
-            &mut app,
-            &brigade,
-            &director,
-            Seen {
-                agent: CODEX,
-                idle: Some(true),
-                has_unseen: false,
-            },
-            now,
-        );
-        assert!(state.prompt_held_since.is_empty());
-    }
-
-    #[test]
-    fn input_after_codex_release_cancels_delayed_submit() {
-        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
-        state.unsent_operator_input.insert(director.clone());
-        draw_empty_codex_prompt(&mut state, &director);
-        state.relay_states.insert(
-            (1, "director".into()),
-            RelayState {
-                idle_streak: 1,
-                nudge: NudgeState::default(),
-            },
-        );
-        let cmds = tick_obs(
-            &mut state,
-            &mut app,
-            &brigade,
-            &director,
-            Seen {
-                agent: Some(AgentKind::Codex),
-                idle: Some(true),
-                has_unseen: true,
-            },
-            now,
-        );
-        assert_eq!(writes_of(&cmds), nudge_for(&director));
-        if let Stage::Brigade { focused, .. } = &mut state.stage {
-            *focused = 0;
+        for _ in 0..20 {
+            now += Duration::from_secs(30);
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                now,
+            );
+            assert!(queued_of(&cmds).is_empty(), "{cmds:?}");
+            assert!(state.status.is_none(), "{:?}", state.status);
         }
-        forward_key(
+    }
+
+    #[test]
+    fn the_window_is_counted_from_the_answer_not_from_the_request() {
+        let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+        // The answer comes 8 s after the request (a slow process or a busy loop).
+        let answered = now + Duration::from_secs(8);
+        answer_queue(
             &mut state,
             &mut app,
             &brigade,
-            KeyCode::Char('x'),
-            Modifiers::NONE,
+            &director,
+            queued_ok(),
+            answered,
+        );
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
+            now + CODEX_WAKE_WINDOW,
+        );
+        assert!(
+            !wake_is_held(&state),
+            "20 s from the request is 12 s from the answer"
+        );
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
+            answered + CODEX_WAKE_WINDOW,
+        );
+        assert!(wake_is_held(&state));
+    }
+
+    #[test]
+    fn a_held_member_is_released_only_by_a_not_idle_reading_after_the_hold_began() {
+        let (mut state, mut app, brigade, director, mut now, _) = woken_codex_director();
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+        now += CODEX_WAKE_WINDOW;
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
             now,
         );
-        now += RELAY_SUBMIT_DELAY;
-        let cmds = update(
+        assert!(wake_is_held(&state));
+
+        // An unreadable reading is not evidence of anything.
+        now += Duration::from_secs(1);
+        codex_tick(&mut state, &mut app, &brigade, &director, None, true, now);
+        assert!(wake_is_held(&state));
+
+        now += Duration::from_secs(1);
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(false),
+            true,
+            now,
+        );
+        assert!(
+            wake_is_free(&state),
+            "it did something: the queue is flowing"
+        );
+    }
+
+    #[test]
+    fn a_hold_begun_by_an_answer_is_not_released_by_a_not_idle_reading_on_that_tick() {
+        let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+        answer_queue(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            crate::codex_queue::CodexQueueResult::Failed {
+                exit_code: None,
+                summary: "killed".to_string(),
+            },
+            now,
+        );
+        assert!(wake_is_held(&state));
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(false),
+            true,
+            now,
+        );
+        assert!(
+            wake_is_held(&state),
+            "same instant: not seen after the hold"
+        );
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(false),
+            true,
+            now + Duration::from_secs(1),
+        );
+        assert!(wake_is_free(&state));
+    }
+
+    #[test]
+    fn a_held_member_whose_mail_is_read_is_forgotten() {
+        let (mut state, mut app, brigade, director, mut now, _) = woken_codex_director();
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+        now += CODEX_WAKE_WINDOW;
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
+            now,
+        );
+        assert!(wake_is_held(&state));
+
+        now += Duration::from_secs(1);
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            false,
+            now,
+        );
+        assert!(the_wake(&state).is_none());
+        assert!(
+            !state
+                .relay_states
+                .contains_key(&(1, "director".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_refused_queue_may_be_asked_again_but_only_after_the_idle_window_and_the_cooldown() {
+        let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+        answer_queue(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            crate::codex_queue::CodexQueueResult::Failed {
+                exit_code: Some(1),
+                summary: "no such thread".to_string(),
+            },
+            now,
+        );
+        assert!(wake_is_free(&state));
+        let status = state.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("exit 1") && status.contains("no such thread"),
+            "{status}"
+        );
+
+        let mut asked_after = None;
+        let mut at = now;
+        for _ in 0..90 {
+            at += Duration::from_secs(1);
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                at,
+            );
+            if !queued_of(&cmds).is_empty() {
+                asked_after = Some(at - now);
+                break;
+            }
+        }
+        let asked_after = asked_after.expect("asked again once both had passed");
+        assert!(asked_after >= RELAY_NUDGE_COOLDOWN, "{asked_after:?}");
+    }
+
+    #[test]
+    fn a_killed_queue_and_an_unrecognised_answer_hold_the_member_without_a_resend() {
+        use crate::codex_queue::CodexQueueResult as R;
+        for result in [
+            R::Failed {
+                exit_code: None,
+                summary: "timed out".to_string(),
+            },
+            R::UnexpectedOutput {
+                summary: "hello".to_string(),
+            },
+            R::NotLaunched {
+                reason: "no codex".to_string(),
+            },
+        ] {
+            let (mut state, mut app, brigade, director, mut now, _) = woken_codex_director();
+            state.status = None;
+            answer_queue(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                result.clone(),
+                now,
+            );
+            assert!(wake_is_held(&state), "{result:?}");
+            now += Duration::from_secs(1);
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                now,
+            );
+            assert!(state.status.is_some(), "{result:?}: the operator is told");
+            assert!(queued_of(&cmds).is_empty(), "{result:?}");
+            assert!(
+                writes_of(&cmds).is_empty(),
+                "{result:?}: no fallback to typing"
+            );
+            now += Duration::from_secs(300);
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                now,
+            );
+            assert!(queued_of(&cmds).is_empty() && writes_of(&cmds).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_wake_nobody_answered_is_held_by_the_clock_even_with_nothing_observed() {
+        let (mut state, mut app, brigade, _director, now, _) = woken_codex_director();
+        update(
             &mut state,
             &mut app,
             &brigade,
             Event::Tick {
-                relay: vec![],
-                brigades: vec![],
+                relay: Vec::new(),
+                brigades: Vec::new(),
+            },
+            now + CODEX_QUEUE_ANSWER_GIVE_UP,
+        );
+        assert!(wake_is_held(&state));
+    }
+
+    #[test]
+    fn an_answer_nobody_is_waiting_for_changes_nothing() {
+        let (mut state, mut app, brigade, director, mut now, _) = woken_codex_director();
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+        now += CODEX_WAKE_WINDOW;
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
+            now,
+        );
+        assert!(wake_is_held(&state));
+
+        // A late answer, and one for a thread no wake asked about.
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+        let stranger = SessionKey::from_id("someone-else");
+        answer_queue(&mut state, &mut app, &brigade, &stranger, queued_ok(), now);
+        assert!(wake_is_held(&state));
+    }
+
+    #[test]
+    fn a_codex_process_younger_than_the_guard_is_not_counted_idle() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        state.process_started.insert(director.clone(), now);
+        for _ in 0..3 {
+            now += Duration::from_secs(1);
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                now,
+            );
+            assert!(queued_of(&cmds).is_empty(), "{cmds:?}");
+        }
+        now += CODEX_WAKE_START_GUARD;
+        let mut asked = false;
+        for _ in 0..2 {
+            now += Duration::from_secs(1);
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                now,
+            );
+            asked |= !queued_of(&cmds).is_empty();
+        }
+        assert!(asked, "past the guard the member is woken as usual");
+    }
+
+    #[test]
+    fn a_member_whose_first_prompt_is_not_yet_a_turn_is_not_woken() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        state.first_turn_watch.insert(
+            director.clone(),
+            FirstTurnWatch {
+                agent: AgentKind::Codex,
+                told: false,
+            },
+        );
+        for _ in 0..4 {
+            now += Duration::from_secs(1);
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                now,
+            );
+            assert!(queued_of(&cmds).is_empty(), "{cmds:?}");
+        }
+    }
+
+    #[test]
+    fn a_held_wake_stops_the_bell_but_one_still_out_does_not() {
+        let (mut state, mut app, brigade, director, mut now, _) = woken_codex_director();
+        let observed = TickObservations {
+            unread: HashMap::from([(director.clone(), (1, "director".to_string()))]),
+            directors: HashSet::new(),
+        };
+        assert!(state.mail_pending(&director, true, &observed), "asked");
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+        assert!(
+            state.mail_pending(&director, true, &observed),
+            "inside the window"
+        );
+        now += CODEX_WAKE_WINDOW;
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
+            now,
+        );
+        assert!(!state.mail_pending(&director, true, &observed), "held");
+    }
+
+    #[test]
+    fn a_wake_still_out_counts_as_a_nudge_for_the_quit_question() {
+        let (mut state, mut app, brigade, director, mut now, _) = woken_codex_director();
+        state.member_brigades.insert(director.clone(), 1);
+        state
+            .member_tokens
+            .insert(director.clone(), "director".to_string());
+        let asked = now;
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+        now += QUIT_RECENT_INPUT_WINDOW + Duration::from_secs(1);
+        assert!(
+            state.prompted_recently(&director, now),
+            "queued, inside its window: the turn has not started"
+        );
+        now = asked + CODEX_WAKE_WINDOW.max(QUIT_RECENT_INPUT_WINDOW) + Duration::from_secs(1);
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
+            now,
+        );
+        assert!(wake_is_held(&state));
+        assert!(
+            !state.prompted_recently(&director, now),
+            "held, not waiting"
+        );
+    }
+
+    #[test]
+    fn a_relaunched_pane_keeps_its_hold_and_an_unstaged_member_loses_it() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![codex_row("w-codex")]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        let key = SessionKey::from_id("w-codex");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.member_brigades.insert(key.clone(), 1);
+        state
+            .member_tokens
+            .insert(key.clone(), "worker-1".to_string());
+        let member = (1, "worker-1".to_string());
+        state.codex_wakes.insert(
+            member.clone(),
+            CodexWake {
+                phase: WakePhase::Held {
+                    since: now,
+                    cause: HoldCause::NotTakenUp,
+                    told: true,
+                },
+                idle_since: None,
+            },
+        );
+
+        // The pane's process died on its own and was reopened over the same
+        // thread: the queued message is in the thread, not in the pane.
+        relaunch_member(&mut state, &app, &brigade, &key, false, now);
+        assert!(
+            matches!(
+                state.codex_wakes.get(&member).map(|wake| &wake.phase),
+                Some(WakePhase::Held { .. })
+            ),
+            "a reopen is not a not-idle reading"
+        );
+
+        state.unstage(&key);
+        assert!(!state.codex_wakes.contains_key(&member));
+        let _ = &mut app;
+    }
+
+    // --- the wake, pinned from the side (found by mutating it) ----------------
+
+    fn refused() -> crate::codex_queue::CodexQueueResult {
+        crate::codex_queue::CodexQueueResult::Failed {
+            exit_code: Some(1),
+            summary: "no such thread".to_string(),
+        }
+    }
+
+    fn the_phase_of<'a>(state: &'a EmporiumState, token: &str) -> Option<&'a WakePhase> {
+        state
+            .codex_wakes
+            .get(&(1, token.to_string()))
+            .map(|wake| &wake.phase)
+    }
+
+    /// One tick observing the Director (key `dir`) and Worker 1 (key `w1`), both
+    /// Codex with unread mail, with the given idle readings.
+    fn codex_pair_tick(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        idle: (Option<bool>, Option<bool>),
+        now: Instant,
+    ) -> Vec<Cmd> {
+        let observe = |token: &str, key: &str, idle| RelayObservation {
+            live: None,
+            glance: None,
+            brigade_id: 1,
+            token: token.to_string(),
+            key: SessionKey::from_id(key),
+            has_unseen: true,
+            is_idle_this_tick: idle,
+            agent: CODEX,
+            briefed_since_launch: None,
+        };
+        update(
+            state,
+            app,
+            brigade,
+            Event::Tick {
+                relay: vec![
+                    observe("director", "dir", idle.0),
+                    observe("worker-1", "w1", idle.1),
+                ],
+                brigades: Vec::new(),
+            },
+            now,
+        )
+    }
+
+    #[test]
+    fn a_wake_whose_window_ends_with_the_member_unreadable_is_held_not_left_waiting() {
+        // A reading that cannot be taken shows no turn either. Left alone it would
+        // keep the bell waiting and the quit question asking for as long as the
+        // member stayed unreadable.
+        let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+        state.status = None;
+        let observed = TickObservations {
+            unread: HashMap::from([(director.clone(), (1, "director".to_string()))]),
+            directors: HashSet::new(),
+        };
+
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            None,
+            true,
+            now + CODEX_WAKE_WINDOW - Duration::from_secs(1),
+        );
+        assert!(!wake_is_held(&state), "the window is not over");
+        assert!(state.mail_pending(&director, true, &observed));
+
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            None,
+            true,
+            now + CODEX_WAKE_WINDOW,
+        );
+        assert!(wake_is_held(&state));
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("nothing happened")),
+            "{:?}",
+            state.status
+        );
+        assert!(!state.mail_pending(&director, true, &observed), "held");
+    }
+
+    #[test]
+    fn a_refused_queue_is_asked_again_no_more_often_than_the_attempt_cap_allows() {
+        let (mut state, mut app, brigade, director, mut now, first) = woken_codex_director();
+        let observed = TickObservations {
+            unread: HashMap::from([(director.clone(), (1, "director".to_string()))]),
+            directors: HashSet::new(),
+        };
+        let mut asks = queued_of(&first).len();
+        answer_queue(&mut state, &mut app, &brigade, &director, refused(), now);
+        assert!(
+            state.mail_pending(&director, true, &observed),
+            "one attempt of three spent: the bell still waits on the next"
+        );
+        for _ in 0..600 {
+            now += Duration::from_secs(1);
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                now,
+            );
+            let asked = queued_of(&cmds).len();
+            asks += asked;
+            if asked > 0 {
+                answer_queue(&mut state, &mut app, &brigade, &director, refused(), now);
+            }
+        }
+        assert_eq!(asks, RELAY_MAX_ATTEMPTS as usize, "no fourth wake, ever");
+        assert!(
+            !state.mail_pending(&director, true, &observed),
+            "every attempt spent: the brigade is waiting on the operator"
+        );
+    }
+
+    #[test]
+    fn an_answer_goes_to_the_member_whose_thread_it_names() {
+        for swapped in [false, true] {
+            let (mut state, mut app, brigade, _director, mut now) = reading_fixture();
+            let mut asked = Vec::new();
+            for _ in 0..2 {
+                now += Duration::from_secs(1);
+                asked.extend(queued_of(&codex_pair_tick(
+                    &mut state,
+                    &mut app,
+                    &brigade,
+                    (Some(true), Some(true)),
+                    now,
+                )));
+            }
+            assert_eq!(asked.len(), 2, "both are woken: {asked:?}");
+            assert!(matches!(
+                the_phase_of(&state, "director"),
+                Some(WakePhase::Asking { .. })
+            ));
+
+            let (took, refused_by) = if swapped {
+                ("dir", "w1")
+            } else {
+                ("w1", "dir")
+            };
+            answer_queue(
+                &mut state,
+                &mut app,
+                &brigade,
+                &SessionKey::from_id(took),
+                queued_ok(),
+                now,
+            );
+            answer_queue(
+                &mut state,
+                &mut app,
+                &brigade,
+                &SessionKey::from_id(refused_by),
+                refused(),
+                now,
+            );
+            let (took_token, refused_token) = if swapped {
+                ("director", "worker-1")
+            } else {
+                ("worker-1", "director")
+            };
+            assert!(
+                matches!(
+                    the_phase_of(&state, took_token),
+                    Some(WakePhase::Watching { .. })
+                ),
+                "{took_token}: {:?}",
+                the_phase_of(&state, took_token)
+            );
+            assert!(
+                matches!(the_phase_of(&state, refused_token), Some(WakePhase::Free)),
+                "{refused_token}: {:?}",
+                the_phase_of(&state, refused_token)
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_queued_behind_the_operators_turn_is_not_followed_by_a_second_wake_at_its_end() {
+        // The turn the operator is running ends, the queued message starts at
+        // once, and the member reads idle for a tick or two in between: that is
+        // not a member the first wake missed. A second wake waits a whole window
+        // of idle that no not-idle reading has broken, however long ago the
+        // cooldown ran out.
+        let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+        let mut tick = |state: &mut EmporiumState, secs: u64, idle| {
+            codex_tick(
+                state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(idle),
+                true,
+                now + Duration::from_secs(secs),
+            )
+        };
+        for secs in (10..=100).step_by(10) {
+            assert!(queued_of(&tick(&mut state, secs, false)).is_empty());
+        }
+        let mut first_ask = None;
+        for secs in 101..=140 {
+            if !queued_of(&tick(&mut state, secs, true)).is_empty() {
+                first_ask = Some(secs);
+                break;
+            }
+        }
+        assert_eq!(
+            first_ask,
+            Some(101 + CODEX_WAKE_WINDOW.as_secs()),
+            "a window after the first idle reading since the last busy one"
+        );
+    }
+
+    #[test]
+    fn a_pane_reopened_inside_the_window_is_judged_by_its_new_process() {
+        let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+        // The thread was loaded again two seconds before the window ends.
+        state.process_started.insert(
+            director.clone(),
+            now + CODEX_WAKE_WINDOW - Duration::from_secs(2),
+        );
+        let mut tick = |state: &mut EmporiumState, secs: u64, idle| {
+            codex_tick(
+                state,
+                &mut app,
+                &brigade,
+                &director,
+                idle,
+                true,
+                now + CODEX_WAKE_WINDOW + Duration::from_secs(secs),
+            );
+        };
+
+        tick(&mut state, 0, Some(true));
+        assert!(
+            matches!(
+                the_phase_of(&state, "director"),
+                Some(WakePhase::Watching { .. })
+            ),
+            "a process that has just loaded reads idle before the queued message flows: neither received nor missed"
+        );
+        tick(&mut state, 1, None);
+        assert!(matches!(
+            the_phase_of(&state, "director"),
+            Some(WakePhase::Watching { .. })
+        ));
+        tick(&mut state, 6, Some(true));
+        assert!(wake_is_held(&state), "8 s old and still idle: not taken up");
+    }
+
+    #[test]
+    fn a_held_member_is_not_released_by_the_idle_of_a_process_that_has_just_loaded() {
+        let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+        answer_queue(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            crate::codex_queue::CodexQueueResult::Failed {
+                exit_code: None,
+                summary: "killed".to_string(),
             },
             now,
         );
-        assert!(writes_of(&cmds).is_empty());
-        assert!(state.has_unsent_operator_input(&director));
+        assert!(wake_is_held(&state));
+        let reopened = now + Duration::from_secs(100);
+        state.process_started.insert(director.clone(), reopened);
+        for secs in 1..=3 {
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                reopened + Duration::from_secs(secs),
+            );
+            assert!(queued_of(&cmds).is_empty(), "{cmds:?}");
+            assert!(wake_is_held(&state), "idle is no evidence the queue flows");
+        }
+    }
+
+    #[test]
+    fn the_idle_streak_counts_only_idle_readings_and_any_other_breaks_it() {
+        for broken_by in [None, Some(false)] {
+            let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+            let mut asked_at = None;
+            for (n, idle) in [Some(true), broken_by, Some(true), Some(true)]
+                .into_iter()
+                .enumerate()
+            {
+                now += Duration::from_secs(1);
+                let cmds = codex_tick(&mut state, &mut app, &brigade, &director, idle, true, now);
+                if !queued_of(&cmds).is_empty() {
+                    asked_at = Some(n);
+                }
+            }
+            assert_eq!(
+                asked_at,
+                Some(3),
+                "{broken_by:?}: two idle readings in a row, counted from the break"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wake_stamps_the_pane_as_written_to_so_the_quit_question_and_the_bell_see_it() {
+        let (state, _app, _brigade, director, now, cmds) = woken_codex_director();
+        assert_eq!(queued_of(&cmds).len(), 1);
+        assert_eq!(state.last_prompted.get(&director), Some(&now));
+    }
+
+    #[test]
+    fn each_way_a_wake_is_held_says_what_was_seen_and_is_said_once() {
+        use crate::codex_queue::CodexQueueResult as R;
+        let cases = [
+            (
+                R::Failed {
+                    exit_code: None,
+                    summary: "killed".to_string(),
+                },
+                vec!["timed out", "may or may not be queued"],
+            ),
+            (
+                R::UnexpectedOutput {
+                    summary: "hello".to_string(),
+                },
+                vec!["does not recognise", "may or may not be queued"],
+            ),
+            (
+                R::NotLaunched {
+                    reason: "no codex on the path".to_string(),
+                },
+                vec![
+                    "could not run `codex queue`",
+                    "no codex on the path",
+                    "nothing was sent",
+                ],
+            ),
+        ];
+        for (result, expected) in cases {
+            let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+            state.status = None;
+            answer_queue(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                result.clone(),
+                now,
+            );
+            codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                now + Duration::from_secs(1),
+            );
+            let said = state.status.clone().unwrap_or_default();
+            for part in expected.iter().chain(&["look at its pane"]) {
+                assert!(said.contains(part), "{result:?}: {said}");
+            }
+            assert!(
+                matches!(
+                    the_phase_of(&state, "director"),
+                    Some(WakePhase::Held { told: true, .. })
+                ),
+                "{result:?}"
+            );
+            state.status = None;
+            codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                now + Duration::from_secs(2),
+            );
+            assert!(state.status.is_none(), "{result:?}: said once");
+        }
+    }
+
+    #[test]
+    fn a_wake_nobody_answered_says_so_once_it_is_held() {
+        let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+        state.status = None;
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
+            now + CODEX_QUEUE_ANSWER_GIVE_UP - Duration::from_secs(1),
+        );
+        assert!(!wake_is_held(&state), "not yet");
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
+            now + CODEX_QUEUE_ANSWER_GIVE_UP,
+        );
+        assert!(wake_is_held(&state));
+        let said = state.status.clone().unwrap_or_default();
+        assert!(
+            said.contains("no answer came") && said.contains("look at its pane"),
+            "{said}"
+        );
+        assert!(matches!(
+            the_phase_of(&state, "director"),
+            Some(WakePhase::Held { told: true, .. })
+        ));
+    }
+
+    #[test]
+    fn a_hold_is_not_said_over_a_status_that_is_showing_and_waits_for_the_line() {
+        let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+        answer_queue(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            crate::codex_queue::CodexQueueResult::Failed {
+                exit_code: None,
+                summary: "killed".to_string(),
+            },
+            now,
+        );
+        state.set_status("something else", now);
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
+            now,
+        );
+        assert_eq!(state.status.as_deref(), Some("something else"));
+        assert!(matches!(
+            the_phase_of(&state, "director"),
+            Some(WakePhase::Held { told: false, .. })
+        ));
+
+        state.status = None;
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(true),
+            true,
+            now,
+        );
+        assert!(state.status.is_some(), "the line is free: said now");
+        assert!(matches!(
+            the_phase_of(&state, "director"),
+            Some(WakePhase::Held { told: true, .. })
+        ));
+    }
+
+    /// The order `say_codex_holds` tells these held members in, one a tick; the
+    /// members are put in the map in the order given, which is never the answer.
+    fn told_in_order(members: &[(BrigadeId, &str)]) -> Vec<(BrigadeId, String)> {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let app = app_with(vec![]);
+        let now = test_instant();
+        for (brigade_id, token) in members {
+            state.codex_wakes.insert(
+                (*brigade_id, token.to_string()),
+                CodexWake {
+                    phase: WakePhase::Held {
+                        since: now,
+                        cause: HoldCause::NotTakenUp,
+                        told: false,
+                    },
+                    idle_since: None,
+                },
+            );
+        }
+        let told = |state: &EmporiumState| -> HashSet<(BrigadeId, MemberToken)> {
+            state
+                .codex_wakes
+                .iter()
+                .filter(|(_, wake)| matches!(wake.phase, WakePhase::Held { told: true, .. }))
+                .map(|(member, _)| member.clone())
+                .collect()
+        };
+        let mut order = Vec::new();
+        for _ in members {
+            let before = told(&state);
+            state.status = None;
+            say_codex_holds(&mut state, &app, now);
+            let new: Vec<_> = told(&state).difference(&before).cloned().collect();
+            assert_eq!(new.len(), 1, "one member a tick: {new:?}");
+            order.push(new[0].clone());
+        }
+        order
+    }
+
+    #[test]
+    fn held_members_are_told_one_a_time_in_roster_order() {
+        assert_eq!(
+            told_in_order(&[
+                (2, "director"),
+                (1, "worker-10"),
+                (1, "worker-2"),
+                (1, "director"),
+            ]),
+            [
+                (1, "director".to_string()),
+                (1, "worker-2".to_string()),
+                (1, "worker-10".to_string()),
+                (2, "director".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_member_that_is_neither_the_director_nor_a_numbered_worker_is_told_last() {
+        assert_eq!(
+            told_in_order(&[(1, "goinkyo"), (1, "worker-2"), (1, "director")]),
+            [
+                (1, "director".to_string()),
+                (1, "worker-2".to_string()),
+                (1, "goinkyo".to_string()),
+            ]
+        );
+    }
+
+    // --- the wake, second round of side tests ------------------------------------
+
+    /// The Director's maps as the shell fills them when it opens the pane, which
+    /// `reading_fixture` leaves out: what `unstage` and `codex_wake_waiting` go by.
+    fn register_director(state: &mut EmporiumState, director: &SessionKey) {
+        state.member_brigades.insert(director.clone(), 1);
+        state
+            .member_tokens
+            .insert(director.clone(), "director".to_string());
+    }
+
+    #[test]
+    fn an_answer_that_names_no_wake_that_is_out_changes_nothing() {
+        // The one member with a wake out is asked on thread `dir`; an answer for
+        // thread `other` is not about it. Matching by anything but the thread id
+        // would hand it to whichever member the map happens to hold first, which
+        // the two-member test only catches on some runs.
+        for result in [queued_ok(), refused()] {
+            let (mut state, mut app, brigade, director, now) = reading_fixture();
+            state.codex_wakes.insert(
+                (1, "director".to_string()),
+                CodexWake {
+                    phase: WakePhase::Asking {
+                        session_id: "dir".to_string(),
+                        since: now,
+                    },
+                    idle_since: None,
+                },
+            );
+            state.status = None;
+
+            update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::CodexMessageQueued {
+                    key: director.clone(),
+                    session_id: "other".to_string(),
+                    result: result.clone(),
+                },
+                now,
+            );
+
+            assert!(
+                matches!(
+                    the_phase_of(&state, "director"),
+                    Some(WakePhase::Asking { session_id, .. }) if session_id == "dir"
+                ),
+                "{result:?}: {:?}",
+                the_phase_of(&state, "director")
+            );
+            assert!(state.status.is_none(), "{result:?}: {:?}", state.status);
+        }
+    }
+
+    #[test]
+    fn a_pane_that_ends_and_is_staged_again_starts_its_wakes_afresh() {
+        // The attempt count, the cooldown and the window all go with the pane
+        // (`unstage`); the next pane for the same member is not held to a wake
+        // the last one was given. Kept, they would make the first tick of the
+        // new pane wait out a cooldown and a whole window of idle.
+        let (mut state, mut app, brigade, director, now, first) = woken_codex_director();
+        register_director(&mut state, &director);
+        assert_eq!(queued_of(&first).len(), 1);
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: director.clone(),
+                reason: None,
+            },
+            now + Duration::from_secs(1),
+        );
+        assert!(
+            the_wake(&state).is_none(),
+            "the exit took the wake with the pane"
+        );
+
+        let restaged = now + Duration::from_secs(2);
+        register_director(&mut state, &director);
+        state.process_started.insert(director.clone(), restaged);
+        let mut asked_at = None;
+        for secs in [
+            CODEX_WAKE_START_GUARD.as_secs() + 1,
+            CODEX_WAKE_START_GUARD.as_secs() + 2,
+        ] {
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Some(true),
+                true,
+                restaged + Duration::from_secs(secs),
+            );
+            if !queued_of(&cmds).is_empty() {
+                asked_at = Some(secs);
+            }
+        }
+        assert_eq!(
+            asked_at,
+            Some(CODEX_WAKE_START_GUARD.as_secs() + 2),
+            "the second idle tick of the new pane asks, as for a member never woken"
+        );
+    }
+
+    #[test]
+    fn a_wake_given_up_on_by_the_clock_is_not_released_by_that_ticks_busy_reading() {
+        let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+        let give_up = now + CODEX_QUEUE_ANSWER_GIVE_UP;
+
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(false),
+            true,
+            give_up,
+        );
+        assert!(
+            wake_is_held(&state),
+            "held on this tick, and not yet seen past"
+        );
+
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(false),
+            true,
+            give_up + Duration::from_secs(1),
+        );
+        assert!(wake_is_free(&state), "a busy reading after the hold began");
+    }
+
+    #[test]
+    fn a_wake_is_waiting_while_asked_and_while_watched_and_not_once_held() {
+        let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+        register_director(&mut state, &director);
+        // Past the three seconds a write is "recent" for: only the wake's own
+        // state can keep the quit question saying "nudged".
+        let later = now + QUIT_RECENT_INPUT_WINDOW + Duration::from_secs(1);
+        assert!(
+            state.prompted_recently(&director, later),
+            "asked of `codex queue`, no answer yet"
+        );
+
+        answer_queue(&mut state, &mut app, &brigade, &director, queued_ok(), now);
+        assert!(
+            state.prompted_recently(&director, later),
+            "accepted, inside its window"
+        );
+
+        state
+            .codex_wakes
+            .get_mut(&(1, "director".to_string()))
+            .unwrap()
+            .phase = WakePhase::Held {
+            since: now,
+            cause: HoldCause::NotTakenUp,
+            told: true,
+        };
+        assert!(
+            !state.prompted_recently(&director, later),
+            "held: nothing is waiting"
+        );
+    }
+
+    #[test]
+    fn a_reading_that_cannot_be_taken_breaks_the_stretch_of_idle_a_second_wake_waits_for() {
+        // `None` is no evidence of idleness, so the window of idle a second wake
+        // needs restarts after one.
+        let (mut state, mut app, brigade, director, now, _) = woken_codex_director();
+        answer_queue(&mut state, &mut app, &brigade, &director, refused(), now);
+        // A turn between, so the idle the first wake was asked in is not counted,
+        // and the cooldown is over.
+        let t0 = now + RELAY_NUDGE_COOLDOWN + Duration::from_secs(1);
+        codex_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(false),
+            true,
+            t0 - Duration::from_secs(1),
+        );
+
+        let mut readings: Vec<(u64, Option<bool>)> = vec![
+            (0, Some(true)),
+            (5, Some(true)),
+            (10, Some(true)),
+            (12, None),
+        ];
+        readings.extend((14..=40).map(|secs| (secs, Some(true))));
+        let mut first_ask = None;
+        for (secs, idle) in readings {
+            let cmds = codex_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                idle,
+                true,
+                t0 + Duration::from_secs(secs),
+            );
+            if first_ask.is_none() && !queued_of(&cmds).is_empty() {
+                first_ask = Some(secs);
+            }
+        }
+        assert_eq!(
+            first_ask,
+            Some(14 + CODEX_WAKE_WINDOW.as_secs()),
+            "a whole window of idle counted from the first idle reading after the unreadable one"
+        );
+    }
+
+    #[test]
+    fn the_start_guard_is_over_at_exactly_its_length() {
+        let (mut state, _app, _brigade, director, now) = reading_fixture();
+        state
+            .process_started
+            .insert(director.clone(), now - CODEX_WAKE_START_GUARD);
+        assert!(state.past_codex_wake_guard(&director, now));
+        state.process_started.insert(
+            director.clone(),
+            now - CODEX_WAKE_START_GUARD + Duration::from_millis(1),
+        );
+        assert!(!state.past_codex_wake_guard(&director, now));
     }
 
     #[test]
@@ -19817,19 +21138,6 @@ mod tests {
             .get_mut(key)
             .unwrap()
             .process(bytes.as_bytes());
-    }
-
-    /// A Codex line with text on it: a prompt row whose cursor is past the
-    /// placeholder, which `read_codex_input_line` does not call empty.
-    fn paint_codex_prompt_with_text(state: &mut EmporiumState, key: &SessionKey) {
-        let screen = state.screens.get_mut(key).unwrap();
-        let (rows, _) = screen.size();
-        let row = rows - 3;
-        let bytes = format!(
-            "\x1b[2J\x1b[{row};1H\x1b[1m›\x1b[0m the first line, unsent\x1b[{row};26H\
-             \x1b]7501;state=idle:app=codex\x07"
-        );
-        screen.process(bytes.as_bytes());
     }
 
     // --- a Codex member that ran a turn and was never briefed -----------------
@@ -27970,7 +29278,6 @@ mod tests {
         state.stage = Stage::Solo(old.clone());
         state.last_forwarded_input.insert(old.clone(), now);
         state.unsent_operator_input.insert(old.clone());
-        state.last_output_at.insert(old.clone(), now);
         state.pending_opens.insert(old.clone(), PendingOpen::Solo);
         state.attention_panes.insert(old.clone());
         state.latched_attention_panes.insert(old.clone());
@@ -28001,7 +29308,6 @@ mod tests {
         assert!(!state.screens.contains_key(&old));
         assert!(!state.last_forwarded_input.contains_key(&old));
         assert!(!state.unsent_operator_input.contains(&old));
-        assert!(!state.last_output_at.contains_key(&old));
         assert!(!state.pending_opens.contains_key(&old));
         assert!(!state.attention_panes.contains(&old));
         assert!(!state.latched_attention_panes.contains(&old));
@@ -30103,7 +31409,6 @@ mod tests {
         }
         for brigade_id in [2, 3] {
             let member = (brigade_id, "worker-1".to_string());
-            state.prompt_held_since.insert(member.clone(), at);
             state.unreadable_since.insert(member.clone(), at);
             state.unreadable_noticed.insert(member);
         }
@@ -30126,9 +31431,14 @@ mod tests {
             sorted_keys(vec![director, other]),
             "the same for a first-turn watch: the Worker's goes"
         );
-        for map in [&state.prompt_held_since, &state.unreadable_since] {
-            assert_eq!(map.keys().map(|(id, _)| *id).collect::<Vec<_>>(), vec![3]);
-        }
+        assert_eq!(
+            state
+                .unreadable_since
+                .keys()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
         assert_eq!(
             state
                 .unreadable_noticed

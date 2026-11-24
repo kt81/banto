@@ -2315,9 +2315,9 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   mouse events forwarded to a Claude pane count as operator input), every member
   sampled idle meanwhile, and the bell rang 5 s in with the report still unread; to
   him the work was not finished. Mail the relay will not deliver — relay not
-  automatic, attempts exhausted, or a Codex member held for `INPUT_LINE_UNREADABLE_AFTER`
-  (60 s) because its pane is not at its prompt (see "Auto-relay") — does not hold
-  the bell: the brigade is then waiting on the operator. Consequences: a nudge delivered but never read keeps the
+  automatic, attempts exhausted, or a Codex member whose wake is held (see "Waking a
+  Codex member") — does not hold the bell: the brigade is then waiting on the
+  operator. Consequences: a nudge delivered but never read keeps the
   bell held through the relay's retries, and an operator's draft left in a Worker's
   pane holds that Worker's mail and so the bell. In detail, for a nudge typed but
   not answered: the bell stays held through the relay's retries (a cooldown of 60 s
@@ -4242,9 +4242,12 @@ without a nudge. With the relay in `auto`, a message to an idle recipient
 can wake it for a turn over its whole context, even when the message asks for
 nothing. The relay holds the nudge back when the relay is `manual`, the pane is
 marked for possible unsent input or Claude's reader detects text, a Codex member's
-pane is not at its prompt (below), the member has no
+earlier wake is still out or held (below), the member has no
 hosted pane or an unknown idle state, or its
-attempts on the batch are used up. The auto-relay closes that loop: it
+attempts on the batch are used up. A Codex member is woken through its queue, not
+by typing: everything in this section about a line typed, its delayed Enter, the
+operator's mark and the input-line reader is about Claude members, and "Waking a
+Codex member" says what Codex members get instead. The auto-relay closes that loop: it
 observes every live brigade pane's idle/busy status, including panes behind
 the currently displayed brigade (the same
 `sessions/<pid>.json` live-state read the Activity indicator uses) and unseen
@@ -4277,9 +4280,7 @@ pane is marked when banto forwards something that may add text to its input
 line — a printable key, a paste, Tab, or Shift+Enter — and unmarked only when
 an Enter that reaches the child as a `\r` (plain, Alt, Ctrl) is forwarded, the
 pane goes away, or a settled
-screen reading recognises an empty Claude input line. The Codex
-reader additionally requires the relay to be eligible to nudge on that same
-tick before an empty reading clears the mark (below). While a pane is
+screen reading recognises an empty Claude input line. While a pane is
 marked, a nudge to it is suppressed whatever the focus and however long ago
 the operator last typed, a nudge's own delayed Enter is dropped if the mark
 appeared before it was due, and the status line says the nudge is being held
@@ -4418,58 +4419,72 @@ off-stage brigade's only because that is where he was not looking. The reader no
 accepts the labelled border (above), so such a member reads `Empty` or `HasText` and
 its draft protection works.
 
-**Codex's bounded empty reader.** At the same relay decision, the reader
-recognises one prompt shape. The visible
-cursor is in column 2 of row R, with no fixed offset from the bottom. Column 0
-of R holds a bold, non-dim `›` or `»`; column 1 is blank; columns 2 through 25
-hold exactly `Ask Codex to do anything`, each character dim and single-width;
-the rest of the row is blank. Rows R−1 and R+1 are entirely blank, both must
-exist, and the screen must be at least 27 columns wide, not in synchronized
-output, and at scrollback offset zero. No color or OSC status is required. A
-mismatch reads `Unrecognized`; blank cells contain only spaces or no-break
-spaces, or have no contents, and are neither wide nor wide continuations. The
-Codex reader never returns `HasText`. A
-recognised `Empty` clears a mark only on a tick otherwise eligible to nudge and
-at least 3 seconds after the last forwarded input. Until then the mark holds.
-This applies automatically, with no new setting or operator action. The dim
-attribute is required and was observed through ConPTY. The prompt glyph and
-placeholder are tied to Codex 0.169.0; a future change reads `Unrecognized`, and
-the relay then types nothing into that pane (below).
+**Waking a Codex member (through its queue; replaces the Codex gate of 2026-11-19).**
+A Codex member is never typed into by the relay. When the relay would nudge it
+(idle for `RELAY_IDLE_STREAK_REQUIRED` ticks with mail waiting, subject to the
+cooldown and the attempt cap), banto runs `codex queue --thread <session id>
+--message <the nudge sentence>` through the binary the member was launched with,
+off the event loop, on one thread, one request at a time
+(`Cmd::QueueCodexMessage`; the answer comes back as `Event::CodexMessageQueued` in
+a later loop iteration). Codex then starts a turn with the sentence by itself, so a
+picker, a dialog or a draft in the composer is not touched, which is what the old
+gate (the painted-prompt reading, the 60 s hold and its "not at its prompt"
+notice) existed to protect and why none of it remains; the operator's unsent mark
+and the focus quiet period do not apply to a Codex member either, since nothing is
+typed into its pane. A queued message starts its turn up to 10 s after the queue is
+made (a 10 s beat; measured, `docs/notes/codex-wake-spike-2026-11-23.md`), at once
+after a turn of the operator's ends (about 12 ms after an Esc-interrupted one), about
+0.3 s after a start-up dialog is answered, and about 1.5 s after `codex resume`
+loads a thread that had the message queued.
 
-**The Codex gate (approved 2026-11-19).** The relay types a nudge into a Codex
-member's pane only when the pane is at its prompt, whether or not the operator's
-mark is set: its output has been quiet for `CODEX_PROMPT_QUIET_PERIOD`; its own
-OSC 7501 report is present and not `blocked` (any other state will do, because a
-pane that took a turn sits in `done`; the relay's idle reading from the rollout is
-still asked separately); and the reader above says `Empty`, with the 3-second
-settle after banto's last forwarded input (`codex_relay_at_prompt`). The
-screen is read only on a tick that would nudge otherwise. Why: on Codex 0.169.0 the
-pane's report says `idle` while a picker (`/permissions`, `/model`, `/statusline`,
-`/title`) is open, and the nudge's `k` moved the selection and its delayed Enter
-applied it — Read Only permissions, another model, a rewritten `config.toml`.
-A pane that is not at its prompt is never typed into, and there is no fallback to
-typing blind. No attempt on the batch is spent while it is held, and the nudge goes
-out on the tick the prompt reads `Empty` again. The hold's clock starts on the
-first held tick and ends only when the pane reads at its prompt or the member has
-no unseen mail left; a tick on which the member is merely not eligible to nudge
-(busy that tick, the operator's keystroke quiet window after typing into the
-picker) neither restarts it nor ends it. After `INPUT_LINE_UNREADABLE_AFTER`
-(60 s) of being held the operator is told, once and then on the status reminder
-cycle: `relay: <member>: not at its prompt — answer what the pane shows; its mail
-waits`. That held mail also stops counting as on the way for the brigade-quiet bell
-("Mail on the way"), as it now waits on the operator. A pane carrying the operator's
-unsent mark that is not at its prompt keeps the existing "unsent input in the pane"
-wording instead, and keeps holding the bell as any draft does. Claude members are unchanged.
+A wake left queued is delivered when its thread is next loaded: inside banto, or by
+a plain `codex resume` outside banto. Banto cannot take it back.
 
-The reading is evidence of a painted shape, not a guarantee that Codex has no
-draft. Unmarked text recalled from history or restored reads `Unrecognized`, so the
-relay does not type over it. An attachment-only composer can
-look empty to this reader, so a nudge can be sent with images attached. A draft
-held by Codex outside the composer is not observable here; whether a restored
-startup draft can coexist with this placeholder is unverified. A mark over an
-unrecognised shape still holds until a later recognised empty reading or an Enter
-reaches the pane. Claude's reader can additionally detect `HasText` without a
-mark; Codex's cannot.
+The wake is judged only by what the member does, read from the member's own idle
+reading (the rollout's, as for any member), never from the reading the Claude path
+adjusts for a line banto has in flight, and never from ids the queue or the rollout
+carry. Within 20 s (`CODEX_WAKE_WINDOW`), counted from when the answer to `codex
+queue` arrived and not from when it was asked for, the wake is received if the
+member reads not idle (a turn of the operator's counts) or its unread mail is gone.
+Still idle when the window ends, or unreadable (its idle state cannot be taken),
+it is not received, since a received wake needs evidence: the member is put on
+hold and the operator is told once, with no cause named, because a message accepted and not
+taken up looks the same whether a dialog is up, Codex is slow or the queue is stuck:
+`relay: woke <member> but nothing happened — look at its pane, answer what it shows,
+or type it a word`. A held member is not woken again for that mail. The hold ends
+only when the member reads not idle on a tick after the hold began, or its mail is
+read. A pane that exits and is put back by banto's own relaunch of a Worker (the
+reopen after an agent updated itself) keeps the hold, since the message is in the
+thread and not in the pane; any other exit (the Director's, the Goinkyo's, a brigade
+being closed, a pane the operator closed) takes the member off the stage and drops
+the wake with it, and so do leaving the brigade and unstaging. The next pane then
+starts with no wake and no attempts, and what keeps it from waking a thread whose
+earlier message is still queued is the 5 s start guard below. Mail that
+arrives while a member is held changes nothing. A held member's mail does not hold
+the brigade-quiet bell; a wake that is out (asked for, or inside its window) does,
+and the quit question counts it as a nudge (`QuitReason::Nudged`).
+
+A second wake for the same unread mail waits until the member has read idle for a
+whole window with no break since its last not-idle reading (a message queued behind
+a turn of the operator's starts when that turn ends, and a member seen idle for a
+couple of ticks in between is not one the first wake missed), as well as the
+cooldown and the attempt cap. The first needs the usual idle ticks only. A Codex
+process younger than 5 s (`CODEX_WAKE_START_GUARD`) is not counted idle: a message
+queued earlier flows about 1.5 s after the thread loads. That guard does not cover a
+dialog that is up when a pane is reopened (a queued message then flows when it is
+answered, however long that takes) or a thread that was interrupted before it
+exited; neither is measured.
+
+How an unsuccessful `codex queue` is treated depends on what is known. A non-zero
+exit queued nothing, so the wake may be asked for again under the same limits, and
+the status line says the exit code and what Codex said. A process killed at its 5 s
+timeout, an exit 0 with output banto does not recognise (Codex probably queued it),
+and a `codex` that cannot be started at all each put the member on hold with a notice
+that says which it was: the first two may or may not be queued, and a retry could
+deliver twice; the last cannot be helped by trying again. None falls back to typing.
+An answer that never comes puts the member on hold after 30 s
+(`CODEX_QUEUE_ANSWER_GIVE_UP`), so a lost answer ends. The queue's `message_id`,
+`client_id` and `turn_trigger` are not read back.
 
 **Settled (found 2026-11-14 by reading and by a test that tripped on it, not seen in
 the field):** a nudge's delayed submitting Enter still queued when its pane was

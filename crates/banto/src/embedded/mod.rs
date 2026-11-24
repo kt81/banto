@@ -12,6 +12,7 @@
 mod convert;
 mod emporium;
 mod paste_accum;
+mod queue_worker;
 mod quiet_writes;
 mod session;
 

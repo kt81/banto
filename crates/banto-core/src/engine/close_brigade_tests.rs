@@ -767,9 +767,6 @@ fn closing_drops_the_queued_and_counted_state_of_its_panes_and_only_theirs() {
     }
     for brigade_id in [1, 2] {
         state
-            .prompt_held_since
-            .insert((brigade_id, "worker-1".to_string()), t);
-        state
             .unreadable_since
             .insert((brigade_id, "worker-1".to_string()), t);
         state
@@ -812,9 +809,14 @@ fn closing_drops_the_queued_and_counted_state_of_its_panes_and_only_theirs() {
         "a pane that is gone cannot take its first turn, and its watch would hold the relay and tell the operator about it"
     );
     assert!(state.codex_opens_awaiting_catalog.is_empty());
-    for map in [&state.prompt_held_since, &state.unreadable_since] {
-        assert_eq!(map.keys().map(|(id, _)| *id).collect::<Vec<_>>(), vec![2]);
-    }
+    assert_eq!(
+        state
+            .unreadable_since
+            .keys()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
     assert_eq!(
         state
             .unreadable_noticed

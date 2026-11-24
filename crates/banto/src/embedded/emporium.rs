@@ -45,7 +45,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::app::{App, Mode};
-use banto_core::codex_queue::{CodexQueueResult, read_queue_run};
 use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
 use banto_core::engine::{
     self, Axis, BellCause, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
@@ -70,7 +69,7 @@ use banto_io::codex_activity;
 use banto_io::codex_catalog::{CodexCatalogSource, CodexCli};
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::SysinfoStartTime;
-use banto_io::codex_queue::{CodexQueueCli, CodexQueueSender};
+use banto_io::codex_queue::CodexQueueCli;
 use banto_io::data_dir::DataDir;
 use banto_io::file_identity::DirectorySpellings;
 use banto_io::input::{CrosstermInputReader, InputReader, StampedEvent};
@@ -95,6 +94,7 @@ use banto_io::watch::LiveWatch;
 
 use super::convert;
 use super::paste_accum::{PasteAccumulator, is_in_scope};
+use super::queue_worker::{CodexQueue, CodexQueueWorker, QueueRequest};
 use super::session::{PtyHandle, PtyPoll, wait_for_exit_or_deadline};
 
 type Tui = Terminal<TimedBackend<CrosstermBackend<FrameWriter<Stdout>>>>;
@@ -452,6 +452,7 @@ pub fn run(
             .collect(),
     );
 
+    let codex_queue = CodexQueueWorker::spawn(Box::new(CodexQueueCli));
     let deps = Deps {
         claude_home,
         codex_home,
@@ -464,7 +465,7 @@ pub fn run(
         agent_binaries,
         enabled_agents,
         codex_catalog: &CodexCli,
-        codex_queue: &CodexQueueCli,
+        codex_queue: &codex_queue,
         child: Some(settings.child),
         exe: settings.exe,
     };
@@ -566,8 +567,9 @@ struct Deps<'a> {
     /// run, a mock in a test — an external process like the PTY host, so no
     /// test of the emporium runs Codex.
     codex_catalog: &'a dyn CodexCatalogSource,
-    /// What runs `codex queue`: `&CodexQueueCli` in a real run, a mock in a test.
-    codex_queue: &'a dyn CodexQueueSender,
+    /// What runs `codex queue`, off the loop's thread: the worker in a real run,
+    /// a stand-in in a test (see [`CodexQueue`]).
+    codex_queue: &'a dyn CodexQueue,
     /// What a brigade member's banto children are told to resolve (see
     /// [`EmporiumSettings::child`]); `None` in a test, which then builds the
     /// argv and environment a hand-started child would get.
@@ -748,6 +750,10 @@ fn event_loop(
                 }
             }
         }
+
+        // This call cannot be tested: `run` needs a terminal, and the tests reach
+        // the collection only through `collect_codex_answers` itself.
+        collect_codex_answers(deps, &mut events);
 
         // Discovery: poll for the ids Claude assigns to freshly-launched
         // sessions still awaiting one. `claimed` — the ids already spoken
@@ -1274,7 +1280,7 @@ fn execute_cmd(
             key,
             session_id,
             message,
-        } => execute_queue_codex_message(key, session_id, &message, deps),
+        } => execute_queue_codex_message(key, session_id, message, deps),
         Cmd::SweepDataDir => execute_sweep_data_dir(deps),
         Cmd::OpenCodexTrustPane { key } => execute_open_codex_trust_pane(key, deps, handles),
         Cmd::Store(intent) => execute_store_intent(intent, deps.store),
@@ -1432,26 +1438,23 @@ fn execute_read_codex_catalog(round: u64, deps: &Deps) -> Vec<Event> {
     }]
 }
 
-/// Put a message on a Codex session's queue (`banto_io::codex_queue`), through
-/// the same binary a launch would use. The process's answer is read into an
-/// outcome here (`banto_core::codex_queue`) and handed to the core; a process
-/// that could not be started is an outcome of its own, not an error to swallow.
+/// Hand a message for a Codex session's queue (`banto_io::codex_queue`) to the
+/// thread that runs it, through the same binary a launch would use. Nothing is
+/// answered here: the answer comes back through [`CodexQueue::answers`], read at
+/// the top of a later iteration, so the process never holds the screen still.
 fn execute_queue_codex_message(
     key: SessionKey,
     session_id: String,
-    message: &str,
+    message: String,
     deps: &Deps,
 ) -> Vec<Event> {
     let binary = launch::agent_binary(AgentKind::Codex, deps.agent_binaries);
-    let result = match deps.codex_queue.queue(&binary, &session_id, message) {
-        Ok(run) => read_queue_run(&run),
-        Err(reason) => CodexQueueResult::NotLaunched { reason },
-    };
-    vec![Event::CodexMessageQueued {
+    deps.codex_queue.submit(QueueRequest {
         key,
         session_id,
-        result,
-    }]
+        binary,
+        message,
+    })
 }
 
 /// Spawn Codex's own trust-review startup (`crate::codex_trust::trust_argv`
@@ -5124,6 +5127,15 @@ fn interrupt_facts(
     )
 }
 
+/// What the thread that runs `codex queue` finished since the last pass: events
+/// of this iteration like any other, applied by the same drain as the rest, and
+/// never in the iteration that asked. A function of its own so that a test can
+/// reach the one place the answers enter the loop; nothing else would notice them
+/// stop coming, since a wake with no answer is only held by the clock, 30 s later.
+fn collect_codex_answers(deps: &Deps, events: &mut VecDeque<Event>) {
+    events.extend(deps.codex_queue.answers());
+}
+
 fn pump_pty_handles(handles: &mut HashMap<SessionKey, PtyHandle>, events: &mut VecDeque<Event>) {
     for (key, handle) in handles {
         // Whatever an interrupting Esc held back leaves on the first turn of the
@@ -5239,7 +5251,6 @@ mod tests {
     use ratatui::widgets::Widget as _;
 
     use super::*;
-    use banto_core::codex_queue::QueueRun;
 
     /// A Codex that is not there: what every test of the emporium that is not
     /// about the catalog gets, so none of them can run the real one.
@@ -5251,30 +5262,35 @@ mod tests {
         }
     }
 
-    /// A `codex queue` that is not there: no test of the emporium can run the
-    /// real one.
+    /// A `codex queue` that is not there: what every test of the emporium that is
+    /// not about the queue gets, so none of them can run the real one. Requests
+    /// are dropped and nothing ever answers.
     struct NoQueue;
 
-    impl CodexQueueSender for NoQueue {
-        fn queue(&self, _: &str, _: &str, _: &str) -> Result<QueueRun, String> {
-            Err("no Codex in tests".to_string())
+    impl CodexQueue for NoQueue {
+        fn submit(&self, _: QueueRequest) -> Vec<Event> {
+            Vec::new()
+        }
+
+        fn answers(&self) -> Vec<Event> {
+            Vec::new()
         }
     }
 
-    /// A `codex queue` that answers from a script and records what it was asked.
-    struct ScriptedQueue {
-        answer: Result<QueueRun, String>,
-        asked: RefCell<Vec<(String, String, String)>>,
+    /// A queue that records what the loop handed it.
+    #[derive(Default)]
+    struct RecordingQueue {
+        submitted: RefCell<Vec<QueueRequest>>,
     }
 
-    impl CodexQueueSender for ScriptedQueue {
-        fn queue(&self, binary: &str, thread: &str, message: &str) -> Result<QueueRun, String> {
-            self.asked.borrow_mut().push((
-                binary.to_string(),
-                thread.to_string(),
-                message.to_string(),
-            ));
-            self.answer.clone()
+    impl CodexQueue for RecordingQueue {
+        fn submit(&self, request: QueueRequest) -> Vec<Event> {
+            self.submitted.borrow_mut().push(request);
+            Vec::new()
+        }
+
+        fn answers(&self) -> Vec<Event> {
+            Vec::new()
         }
     }
 
@@ -17717,20 +17733,11 @@ mod tests {
         );
     }
 
-    fn run_of(exit_code: Option<i32>, stdout: &str, stderr: &str) -> QueueRun {
-        QueueRun {
-            exit_code,
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            timed_out: false,
-        }
-    }
-
-    /// Runs one `Cmd::QueueCodexMessage` against `queue` and returns the one
-    /// event it answers with.
-    fn queue_once(queue: &ScriptedQueue, binaries: &AgentBinaries) -> Event {
+    /// Runs one `Cmd::QueueCodexMessage` against `queue`; the events it answers
+    /// with at once.
+    fn queue_once(queue: &RecordingQueue, binaries: &AgentBinaries) -> Vec<Event> {
         let fixture = SpawnFixture::new(PathBuf::from("/nonexistent"));
-        let mut events = execute_cmd(
+        execute_cmd(
             Cmd::QueueCodexMessage {
                 key: SessionKey::from_id("thread-9"),
                 session_id: "thread-9".to_string(),
@@ -17745,44 +17752,25 @@ second line"
             },
             &mut HashMap::new(),
             &mut Vec::new(),
-        );
-        assert_eq!(events.len(), 1, "one answer per request: {events:?}");
-        events.remove(0)
+        )
     }
 
     #[test]
-    fn queueing_a_codex_message_asks_the_binary_a_launch_would_use_and_answers_with_the_ids_codex_named()
+    fn queueing_a_codex_message_hands_the_binary_a_launch_would_use_to_the_queue_and_answers_nothing()
      {
-        let queue = ScriptedQueue {
-            answer: Ok(run_of(
-                Some(0),
-                "Queued message m-1 for thread thread-9.
-",
-                "",
-            )),
-            asked: RefCell::new(Vec::new()),
-        };
-        let event = queue_once(&queue, &AgentBinaries::default());
+        let queue = RecordingQueue::default();
+        let events = queue_once(&queue, &AgentBinaries::default());
+        assert!(events.is_empty(), "the answer comes later: {events:?}");
         assert_eq!(
-            event,
-            Event::CodexMessageQueued {
+            *queue.submitted.borrow(),
+            [QueueRequest {
                 key: SessionKey::from_id("thread-9"),
                 session_id: "thread-9".to_string(),
-                result: CodexQueueResult::Queued {
-                    message_id: "m-1".to_string(),
-                    thread_id: "thread-9".to_string(),
-                },
-            }
-        );
-        assert_eq!(
-            *queue.asked.borrow(),
-            [(
-                "codex".to_string(),
-                "thread-9".to_string(),
-                "first line
+                binary: "codex".to_string(),
+                message: "first line
 second line"
-                    .to_string()
-            )],
+                    .to_string(),
+            }],
             "the bare name by default, the message whole"
         );
 
@@ -17791,76 +17779,137 @@ second line"
             claude: None,
             codex: Some(PathBuf::from("C:/tools/codex.exe")),
         };
-        let queue = ScriptedQueue {
-            answer: Ok(run_of(
-                Some(0),
-                "Queued message m-2 for thread thread-9.",
-                "",
-            )),
-            asked: RefCell::new(Vec::new()),
-        };
+        let queue = RecordingQueue::default();
         queue_once(&queue, &binaries);
-        assert_eq!(queue.asked.borrow()[0].0, "C:/tools/codex.exe");
+        assert_eq!(queue.submitted.borrow()[0].binary, "C:/tools/codex.exe");
     }
 
-    #[test]
-    fn a_refused_codex_queue_answers_with_the_exit_code_and_what_it_said() {
-        let queue = ScriptedQueue {
-            answer: Ok(run_of(
-                Some(1),
-                "",
-                "Error: failed to queue session message: no rollout found for thread id thread-9
-",
-            )),
-            asked: RefCell::new(Vec::new()),
-        };
-        match queue_once(&queue, &AgentBinaries::default()) {
-            Event::CodexMessageQueued {
-                result:
-                    CodexQueueResult::Failed {
-                        exit_code: Some(1),
-                        summary,
-                    },
-                ..
-            } => assert!(summary.contains("no rollout found"), "{summary}"),
-            other => panic!("expected a failure carrying the reason, got {other:?}"),
+    /// A `codex queue` that refuses, whatever it is asked.
+    struct RefusingSender;
+
+    impl banto_io::codex_queue::CodexQueueSender for RefusingSender {
+        fn queue(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<banto_core::codex_queue::QueueRun, String> {
+            Ok(banto_core::codex_queue::QueueRun {
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "Error: no rollout found
+"
+                .to_string(),
+                timed_out: false,
+            })
         }
     }
 
     #[test]
-    fn a_codex_that_cannot_be_started_answers_not_launched_and_one_that_prints_something_else_says_so()
-     {
-        let missing = ScriptedQueue {
-            answer: Err("could not run codex: not found".to_string()),
-            asked: RefCell::new(Vec::new()),
+    fn a_wake_the_core_asked_for_is_answered_through_the_loops_collection_back_into_the_core() {
+        // The whole path, short of the real `codex`: two idle ticks make the core
+        // ask for a wake, the command runs on the queue's thread, and its answer
+        // reaches the core only by the loop's collection. With that line gone the
+        // core would hear nothing for 30 s and then hold the member, which no
+        // other test sees.
+        let (mut state, mut app, config) = staged_brigade_of_two_workers();
+        let worker = CodexQueueWorker::spawn(Box::new(RefusingSender));
+        let fixture = SpawnFixture::new(PathBuf::from("/nonexistent"));
+        let deps = Deps {
+            codex_queue: &worker,
+            ..fixture.deps()
         };
-        assert_eq!(
-            queue_once(&missing, &AgentBinaries::default()),
-            Event::CodexMessageQueued {
-                key: SessionKey::from_id("thread-9"),
-                session_id: "thread-9".to_string(),
-                result: CodexQueueResult::NotLaunched {
-                    reason: "could not run codex: not found".to_string()
+        let start = Instant::now();
+        let mut events: VecDeque<Event> = VecDeque::new();
+        let mut asked = false;
+        // Past the start guard: the staged Director's process began a moment ago.
+        for second in [10, 11] {
+            let cmds = engine::update(
+                &mut state,
+                &mut app,
+                &config,
+                Event::Tick {
+                    relay: vec![engine::RelayObservation {
+                        brigade_id: 1,
+                        token: "director".to_string(),
+                        key: SessionKey::from_id("dir"),
+                        has_unseen: true,
+                        is_idle_this_tick: Some(true),
+                        agent: Some(AgentKind::Codex),
+                        glance: None,
+                        live: None,
+                        briefed_since_launch: None,
+                    }],
+                    brigades: Vec::new(),
                 },
+                start + Duration::from_secs(second),
+            );
+            for cmd in cmds {
+                if matches!(cmd, Cmd::QueueCodexMessage { .. }) {
+                    asked = true;
+                    events.extend(execute_cmd(
+                        cmd,
+                        &deps,
+                        &mut HashMap::new(),
+                        &mut Vec::new(),
+                    ));
+                }
             }
+        }
+        assert!(asked, "two idle ticks with mail ask for a wake");
+        assert!(
+            events.is_empty(),
+            "the answer is not ready in the iteration that asked"
         );
 
-        let odd = ScriptedQueue {
-            answer: Ok(run_of(
-                Some(0),
-                "ok, noted
-",
-                "",
-            )),
-            asked: RefCell::new(Vec::new()),
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while events.is_empty() && Instant::now() < deadline {
+            collect_codex_answers(&deps, &mut events);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(events.len(), 1, "{events:?}");
+        for event in events {
+            engine::update(
+                &mut state,
+                &mut app,
+                &config,
+                event,
+                start + Duration::from_secs(12),
+            );
+        }
+        let status = state.displayed_status().unwrap_or_default();
+        assert!(
+            status.contains("failed (exit 1)") && status.contains("no rollout found"),
+            "the core heard the refusal: {status}"
+        );
+    }
+
+    #[test]
+    fn the_loops_collection_takes_every_answer_that_has_piled_up() {
+        let (sender, third_started, release) = super::super::queue_worker::PausesOnThird::new();
+        let worker = CodexQueueWorker::spawn(Box::new(sender));
+        let fixture = SpawnFixture::new(PathBuf::from("/nonexistent"));
+        let deps = Deps {
+            codex_queue: &worker,
+            ..fixture.deps()
         };
-        assert!(matches!(
-            queue_once(&odd, &AgentBinaries::default()),
-            Event::CodexMessageQueued {
-                result: CodexQueueResult::UnexpectedOutput { .. },
-                ..
-            }
-        ));
+        for thread in ["a", "b", "c"] {
+            let at_once = deps.codex_queue.submit(QueueRequest {
+                key: SessionKey::from_id(thread),
+                session_id: thread.to_string(),
+                binary: "codex".to_string(),
+                message: "wake".to_string(),
+            });
+            assert!(at_once.is_empty());
+        }
+        third_started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the third request started");
+
+        let mut events: VecDeque<Event> = VecDeque::new();
+        collect_codex_answers(&deps, &mut events);
+        assert_eq!(events.len(), 2, "{events:?}");
+        release.send(()).unwrap();
     }
 
     // --- sweeping the data directory --------------------------------------

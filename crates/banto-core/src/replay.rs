@@ -253,8 +253,8 @@ mod tests {
             parse_stream(&stream(&events)).expect("a freshly serialized stream must parse");
         assert_eq!(parsed, events);
 
-        // Nothing emits the Cmd yet, so the answer changes nothing and asks for
-        // nothing.
+        // Replayed on its own, with no wake out for it to answer, the answer
+        // changes nothing and asks for nothing.
         let outcome = replay(&parsed, &BrigadeConfig::default(), test_instant());
         assert!(outcome.cmds.is_empty(), "{:?}", outcome.cmds);
     }

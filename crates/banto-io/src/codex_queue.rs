@@ -16,9 +16,10 @@
 //! and this process use the other, so a queued message is not found where banto
 //! looks for it.
 //!
-//! One process takes about 0.2 s, measured on Windows with Codex 0.171.0. It is
-//! run on the event loop's thread, like the catalog read, so the timeout is also
-//! how long the screen can stand still.
+//! One process takes about 0.2 s, measured on Windows with Codex 0.171.0. The
+//! shell runs it on a worker thread, one request at a time (`banto`'s
+//! `embedded::queue_worker`), so the timeout bounds how long a wake waits, not
+//! how long the screen stands still.
 
 use std::io::Read;
 use std::path::Path;

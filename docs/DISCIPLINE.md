@@ -108,22 +108,15 @@ jsonl mtime. When enumerating `Event`s, hunt for these specifically.
 pane's screen may be read for a fact the agent publishes nowhere else, only at
 the moment a decision needs it, and only so that it closes when unsure: a
 shape it does not recognise answers `Unrecognized`, and the caller does what
-it did before it could read — except for the Codex relay rule below, where there
-was no "before" worth keeping. It is never used to estimate or keep track of
+it did before it could read. It is never used to estimate or keep track of
 state — that is the disguised input above in a new coat. The input-line
 reader (`banto_core::input_line`) is one instance: it reads Claude's line for
-text and recognises one bounded empty-looking Codex prompt shape. Its only
-caller is the relay. The relay reads a Claude member's line on every tick
-it runs (relay `auto`, the member's brigade not closing: the line is judged for a
-draft whether or not a nudge is due), through one verdict per pane per tick that
-the interrupt refinement shares (below), and a Codex member's only on a tick
-otherwise eligible to nudge; for a Codex member it does not fall back when
-unsure: a Codex pane is
-typed into only when quiet, not `blocked`, and reading `Empty`; otherwise banto
-does not type, holds the mail with no attempt spent, and tells the operator once
-(approved 2026-11-19: on Codex 0.169.0 a nudge typed into an open picker moved its
-selection and applied it, while the pane's own report said `idle`). A Codex match is not proof of
-semantic emptiness; its limits are in `docs/REQUIREMENTS.md`, "Auto-relay".
+text. Its only caller is the relay, which reads a Claude member's line on every
+tick it runs (relay `auto`, the member's brigade not closing: the line is judged
+for a draft whether or not a nudge is due), through one verdict per pane per tick
+that the interrupt refinement shares (below). A Codex member is not read at all:
+it is woken through `codex queue`, not typed into (`docs/REQUIREMENTS.md`,
+"Waking a Codex member").
 Reading sends nothing; the operator approved the principle on 2026-11-10. The
 next shortcut that wants the screen cites this paragraph's conditions, not the
 instance.
@@ -219,6 +212,15 @@ choice only for what `Cmd`s cannot express.
    whose matches have no wildcard arm: a new Event or Cmd variant does not
    compile until someone has placed it in the written or the unwritten bucket.
    Writing a line never feeds anything back into `update`.
+3. **A slow process may run off the loop's thread.** `codex queue` takes about
+   0.2 s and is bounded at five, and the loop that runs it also draws the screen,
+   so it runs on one worker thread (`banto`'s `embedded::queue_worker`). The
+   thread never touches state: it turns a request into an `Event` and hands it
+   back through a channel, and the loop applies it in a later iteration like any
+   other event. The core owns what the request means: the mark that one is out,
+   and the give-up when its answer never comes, so a replay that lacks the answer
+   still ends. (`Cmd::HangUpPty` is the earlier case of the shell doing a slow
+   thing away from the loop.) The catalog read stays on the loop's thread.
 
 ## 7. Multi-process reality
 
