@@ -104,47 +104,18 @@ like an input but is actually derived from internal state — e.g. estimating
 a session's last-update time from "when I last read it" instead of the
 jsonl mtime. When enumerating `Event`s, hunt for these specifically.
 
-**Reading the painted screen is allowed in one narrow form.** A hosted
-pane's screen may be read for a fact the agent publishes nowhere else, only at
-the moment a decision needs it, and only so that it closes when unsure: a
-shape it does not recognise answers `Unrecognized`, and the caller does what
-it did before it could read. It is never used to estimate or keep track of
-state — that is the disguised input above in a new coat. The input-line
-reader (`banto_core::input_line`) is one instance: it reads Claude's line for
-text. Its only caller is the relay, which reads a Claude member's line on every
-tick it runs (relay `auto`, the member's brigade not closing: the line is judged
-for a draft whether or not a nudge is due), through one verdict per pane per tick
-(below). A Codex member is not read at all:
-it is woken through `codex queue`, not typed into (`docs/REQUIREMENTS.md`,
-"Waking a Codex member").
-Reading sends nothing; the operator approved the principle on 2026-11-10. The
-next shortcut that wants the screen cites this paragraph's conditions, not the
-instance.
-
-**One reading per Claude pane per tick.** The relay's verdict on a Claude pane (what
-the line reads, whether the unsent-draft fence holds a nudge, whether the reading
-releases the operator's mark) is taken the first time anyone asks in a tick and handed
-back unchanged to every later asker in that tick. The map holding it is built at the
-start of the tick's relay work and dropped at its end, so a reading is never kept: it
-is a reading, not state. The relay loop is its one asker today. It used to have a
-second, the interrupt refinement that followed an Esc banto wrote for the Director's
-`interrupt_worker`; that Esc is gone (a keystroke typed for the operator is the thing
-this section forbids, and `interrupt_worker` now refuses the Worker's next tool calls
-from a hook instead; "Auto-relay" in `docs/REQUIREMENTS.md`), and with it the second
-asker. The verdict is still taken once per pane per tick, so a second asker added later
-gets the same value. What crosses ticks is a set of members: no screen content. "The
-relay is the one reader" is true of the relay, not of the whole engine: Codex reads the
-line on its own.
+**Reading the painted screen is allowed in one narrow form.** A hosted pane's
+screen may be read for a fact the agent publishes nowhere else, only when a
+decision needs it. An unrecognised shape must fall back to the previous rule.
+It must never estimate or track state. No relay or interrupt decision currently
+reads the painted screen.
 
 Reading a program's own state report out of its output stream is not a read of
 the painted screen: it is the child's explicit announcement (OSC 7501, for a
 hosted Codex pane), arriving in an event that already exists (`PtyOutput`),
 recorded and replayed like the rest, and it closes to the previous rule whenever
 it is unsure (no report, or `clear`, and the earlier signal decides). It is not an
-instance of the paragraph above, so a shortcut must not cite it for one. The Codex
-relay gate reads it as one of its two conditions (a report that is not `blocked`,
-and an empty prompt), and there a pane that has reported nothing is never at its
-prompt: it holds, under the same exception as above. A pane's `done` or `error` is also latched
+instance of the paragraph above, so a shortcut must not cite it for one. A pane's `done` or `error` is also latched
 (`codex_turn_ran`) to say that a turn ran, which the notice for a first prompt
 that was never identified reads. `working` is never latched or used that way:
 Codex reports it while it starts as well.

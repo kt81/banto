@@ -53,7 +53,7 @@ the child with `0xC000013A` (3221225786), which is not an error.
 
 Put a file in `<ctl>/in/`; its content is written to the PTY and the file is
 deleted. Files go in ascending file-name order, at least `--gap-ms` apart (300 by
-default, banto's `RELAY_SUBMIT_DELAY`), so a body and its Enter as two files are
+default), so a body and its Enter as two files are
 two PTY writes 300 ms apart:
 
 ```powershell
@@ -84,9 +84,7 @@ Inherited from the parent, except what banto's own spawn strips
 (`CLAUDE_CODE_CHILD_SESSION`, which makes a Claude write no `sessions/<pid>.json`)
 and every variable starting `BANTO_`. The second is this tool's own need and not
 banto's: a child started from a Worker's pane would otherwise carry that Worker's
-brigade, member and role. `CLAUDE_CODE_NO_FLICKER` is never added. banto sets
-`CLAUDE_CODE_NATIVE_CURSOR=1` on a Claude pane; pass `--env
-CLAUDE_CODE_NATIVE_CURSOR=1` to match it.
+brigade, member and role. `CLAUDE_CODE_NO_FLICKER` is never added.
 
 ## Limits
 

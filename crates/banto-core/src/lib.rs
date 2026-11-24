@@ -21,7 +21,6 @@
 //! - [`display_text`] the one policy for someone else's text shown on a banto line
 //! - [`member_name`] the rule for a brigade member's display name
 //! - [`consultation`] the rule for a Goinkyo consultation's title, and how the list shows it
-//! - [`input_line`] reading a hosted Claude pane's input line off its screen
 //! - [`screen`] the emporium's per-pane `vt100` terminal model
 //! - [`key_encode`] key-event -> PTY-child-stdin byte encoding
 //! - [`replay`] the record/replay event-stream format (`docs/DISCIPLINE.md` §8)
@@ -34,7 +33,6 @@ pub mod consultation;
 pub mod display_text;
 pub mod engine;
 pub mod input;
-pub mod input_line;
 pub mod key_encode;
 pub mod layout;
 pub mod member_name;

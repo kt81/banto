@@ -544,19 +544,11 @@ working tree" is gone.
 
 ## Decision (2026-11-14): work given to a session is a key or a paste, not every event forwarded to it
 
-Two records of operator input exist since 2026-11-14, because one notion was doing
-two jobs.
-
-- *Forwarded to the pane:* every key, paste and mouse report the child received, a
-  wheel turn, a drag, a press and a release included. Its reader is the relay, which
-  keeps out of the operator's way: every forwarded event, mouse included, still
-  holds a nudge (see "Auto-relay" and "Mail on the way") and feeds its judgement of
-  unsent input.
-- *Work given to the session:* a key forwarded to the pane (one that encodes to no
-  bytes included, and the prefix sent through literally) or a paste. No mouse event
-  is work given: a press, a release, a drag and a wheel turn are not in it (a bare
-  pointer move was never forwarded). Its readers are the quit question's
-  recent-input window and the quiet watch's "was given work".
+Work given to a session is a key forwarded to the pane (one that encodes to no
+bytes included, and the prefix sent through literally) or a paste. No mouse event
+is work given: a press, release, drag or wheel turn is excluded. The quit
+question's recent-input window and the quiet watch read `last_given_input`.
+Forwarded input does not hold a relay wake.
 
 *The incidents, in order.* (a) The operator reads a pane's history with the mouse
 wheel. Having scrolled the Director's pane, he clicked the list and pressed Esc, and
@@ -581,7 +573,7 @@ relaunch under the same key gets a new grace, and on `Spawned` the stamps of wor
 given to the previous process under that key (the operator's keys and pastes,
 banto's own nudges and first prompts) are dropped, so work given to a process that was
 replaced never counts for the new one, including when both fall in the same
-event-loop drain (the relay's record of forwarded input is kept); a rename keeps the
+event-loop drain; a rename keeps the
 process's start; the Director is covered like any member; a pane with no recorded
 start has no grace to wait out.
 
@@ -805,7 +797,7 @@ of his for it is recorded here.
 4. **Unchanged.** The list row is still busy (the green dot) and so is `banto
    list`'s tag; the marks, counts and bells; the quiet watch and a request's
    spending of it, which treat `shell` as they treat busy; a shell member is still
-   nudgeable; the input-line notice; and Codex, which has no such value.
+   nudgeable; and Codex, which has no such value.
 
 *What the code does.* The quit question's fact gains a value,
 `Quiescence::Background`, beside idle, not idle and unknown; it is a kind of not
@@ -2088,9 +2080,8 @@ brigade bell alike.
   still counts) or a paste forwarded to it; no mouse event is work given (a press, a
   release, a drag, a wheel turn: all are forwarded to the child as before, but
   clicking into a pane or reading its history is not an instruction to the agent) —
-  or something banto wrote itself to start or continue a turn: the relay's nudge
-  line and its delayed submitting Enter, and the first prompt a Codex Worker or a
-  Goinkyo is created with, which counts from the moment its process spawned —
+  or a relay wake or the first prompt a Codex Worker or a Goinkyo is created
+  with, which counts from the moment its process spawned —
   whatever its sample says.
   The prompt names the first kind `(input)` and the second `(nudged)`, so a pane the
   operator never typed into does not read as typed into; when both are inside the
@@ -2301,27 +2292,13 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   `waitingFor`, a dialog the product opens by itself (it would read the same), a
   dialog opened over a running turn (busy wins).
 
-- *Mail on the way:* a brigade is not quiet while one of its hosted members has
-  unread brigade mail that the relay will still deliver on its own — the relay is
-  automatic (`[brigade].relay = "auto"`) and has not used up its nudge attempts (3,
-  `RELAY_MAX_ATTEMPTS`) on that batch. While such mail is pending, a member whose
-  sample reads idle counts like an unknown one (blocks firing, breaks the stretch),
-  however long the nudge is held back, whatever the hold reason (an unsent draft in
-  the recipient, the operator's recent input in the pane, the idle streak, the
-  cooldown, a member that is not idle). Why (reversed after the operator's trial on
-  2026-11-13): he had scrolled and clicked in the Director's pane, so the relay held
-  the nudge for a Worker's report for about 30 s (its input quiet period — wheel and
-  mouse events forwarded to a Claude pane count as operator input), every member
-  sampled idle meanwhile, and the bell rang 5 s in with the report still unread; to
-  him the work was not finished. Mail the relay will not deliver — relay not
-  automatic, attempts exhausted, or a member whose wake is held (see "Waking a
-  Codex member") — does not hold the bell: the brigade is then waiting on the
-  operator. An operator's draft left in a Worker's pane holds that Worker's mail
-  and so the bell. An issued Claude wake holds the bell until received or held;
-  an unreceived wake is held after 10 seconds. Switching the relay to manual ends the hold, and
-  the brigade rings after a normal settle from then. Mail counts as pending only if
-  *this tick's* observation of that member says it has some (relay automatic,
-  attempts not used up); nothing is carried over from an earlier tick, and a member
+- *Mail on the way:* a brigade is not quiet while a hosted member has unread
+  mail the automatic relay can still deliver, including an issued Claude wake
+  awaiting receipt. The idle streak, cooldown, and attempt cap govern delivery.
+  A wake held after its receipt window, exhausted attempts, or manual relay leaves
+  the brigade waiting on the operator and does not hold the bell. Mail counts as
+  pending only if *this tick's* observation of that member says it has some;
+  nothing is carried over from an earlier tick, and a member
   the tick did not observe has no mail as far as the bell knows.
 - *A first turn still expected:* only a freshly added Codex Worker and a freshly
   summoned Goinkyo are given a first prompt by banto, on their command line (see
@@ -3796,11 +3773,7 @@ identity — `BANTO_PARENT_CONFIG` (or `BANTO_PARENT_NO_CONFIG`) and
 directory, so it is not told one; the one other file it reads, a Codex session's
 rollout, is named by Codex on the hook's own stdin, and is only read). A hook without them (one an
 older banto launched) resolves for itself, as does a child started by hand or from
-an MCP config written by an older banto. Only banto's own variables are set, with
-one exception: every Claude Code pane (not a Codex one) also gets
-`CLAUDE_CODE_NATIVE_CURSOR=1`, which fixes how Claude draws its caret so that the
-input line stays readable (the relay draft guard's account of reading the input
-line has why). `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the like are never touched —
+an MCP config written by an older banto. Only banto's own variables are set; `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the like are never touched —
 where an agent keeps its home is not banto's to decide. The cost is that a home
 banto lists by `--claude-home`/`--codex-home` or the config's `claude_home`/`codex_home`
 can differ from the one the agent in a pane reads, which is only its variable or its
@@ -4241,8 +4214,8 @@ relay in `auto`, unread mail can wake an idle recipient for a turn over its
 whole context. Claude is woken by an asyncRewake hook and Codex through
 `codex queue`; neither wake types into a pane. The relay observes every hosted
 brigade pane, including off-stage panes. It requires consecutive idle samples,
-observes a cooldown and an attempt cap, and holds a Claude wake behind its draft
-fence and a first-turn watch. A wake can fail or be held, so a send is not proof
+observes a cooldown and an attempt cap, and holds a wake while its first-turn
+watch is active. A wake can fail or be held, so a send is not proof
 that the recipient read the message. The busy Worker's interrupt is described
 under "Interrupting a Worker's turn" below.
 
@@ -4268,38 +4241,23 @@ the member to check its messages. A late receipt or the mail being read releases
 the hold; a not-idle reading does not. Retries for still-unread mail remain
 subject to the relay cooldown and attempt cap.
 
-A time window cannot protect a draft, so the operator's unsent text is
-tracked as a fact instead (`EmporiumState::has_unsent_operator_input`): a
-pane is marked when banto forwards something that may add text to its input
-line — a printable key, a paste, Tab, or Shift+Enter — and unmarked only when
-an Enter that reaches the child as a `\r` (plain, Alt, Ctrl) is forwarded, the
-pane goes away, or a settled
-screen reading recognises an empty Claude input line. While a pane is
-marked, a nudge to it is suppressed whatever the focus and however long ago
-the operator last typed, the status line says the nudge is being held
-(re-shown every 30s, never over another message). A member whose first turn is
-still expected is not nudged either, for a nudge would be a turn of its own and
-hide whether its first prompt started one; the hold lasts as long as its watch
-(for a Codex member until its session is discovered, for a Goinkyo until its row
-shows a first user message or its live file reads `busy`), the notice
-notwithstanding.
+A member whose first turn is still expected is not woken: a wake would start a
+turn of its own and hide whether the first prompt started one. The hold lasts as
+long as the first-turn watch, including after its notice.
 
 When a known Codex pane has enabled Win32 input mode (`CSI ? 9001 h`), banto
 forwards exactly Shift+Enter and Ctrl+J as Win32 key
-press and release records. Both count as adding text, including for the draft
-mark. The pane's own mode is tracked
+press and release records. The pane's own mode is tracked
 until `CSI ? 9001 l`; this is not inferred from another pane. The spawn event
 records the launched agent even before a new session is indexed. Its agent field
 is optional for older replays; an unconflicted session row or member fact can
 also establish identity. Conflicting known identities disable this encoding.
 Without that
 mode, for non-Codex panes, and for other modifier
-combinations, the existing key encoding and input effects apply. In particular,
-the legacy Shift+Enter encoding is a line feed, and legacy Ctrl+J does not gain
-the special path's text-adding effect.
+combinations, the existing key encoding applies. In particular, the legacy
+Shift+Enter encoding is a line feed.
 
-Every status that names a brigade member — this one, the nudge notice, the
-unreadable-input notice and the first-turn notices — names the brigade the way the
+Every status that names a brigade member — the wake and first-turn notices — names the brigade the way the
 operator knows it, by its Director's *current* session title in quotes:
 `relay: nudged worker-2 of "Fix the relay draft guard"`. The title is reduced
 first — control characters, escape sequences and invisible format characters
@@ -4322,92 +4280,6 @@ the relay draft guard" ← worker-3: stage 2 is done`. The line is cut to at mos
 the short form, never an arrow with nothing after it. Only the nudge notice
 carries this; how often and how long a status shows is unchanged.
 
-The mark is blunt on purpose — it does not model which keys an agent binds to
-clearing its line — so for a Claude pane it is backed by reading the input line off
-the pane's own screen (`banto_core::input_line`), at the moment relay decides and
-never otherwise, under the fence in `docs/DISCIPLINE.md` §3. The reader recognises
-Claude's framed input block (a top border and a full-width rule below, `❯` and a
-no-break space on the first row) and answers `Empty`, `HasText` or `Unrecognized`.
-The top border, the row above the prompt row, is either the plain full-width rule or
-the rule with a label in it: a leading run of rule cells of at least half the pane's
-width, one blank, a label region, one blank, and exactly one rule cell in the last
-column. The label region starts and ends with a non-blank cell, holds no rule cell,
-and may hold single blanks between words and wide characters (their second cells
-identified from the terminal model, not inferred from an empty cell), but not two
-blanks in a row; a label longer than half the width minus three cells (wide
-characters count two), or a label the terminal model lays out wider than the
-application reserved (a joined emoji sequence: it fails closed and brings back the
-old notice, no worse), reads `Unrecognized`, as does a row of text, a blank or
-mostly blank row, a dialog border with its title at the left or in the middle, two
-label segments, and anything else. The bottom rule must still be full width (a
-labelled bottom row is not an input box), and the label is never part of the text
-the reader returns. Its content is not examined, so any short text in that position
-reads the same as a name (a hint, a count, a mode name); this is an accepted
-consequence, named by both reviewers, and the nudge is protected by the rest of the
-reader's conditions (the prompt glyph in column 0 of the cursor row, the full-width
-rule below, the cursor inside the block) and by the member being idle and not
-waiting. What is measured and what is not: one plain word of 7 cells, a blank on
-each side and the single trailing rule cell, at widths 81 and 84, is measured;
-blanks between words and wide characters are extension by construction (the one
-other session on the measuring machine with a label of this shape has a name with a
-space in it; the label is the session name given with `/rename`, free text in any
-script, and the second name the operator gave contains wide characters, so a
-wide-character label exists on a real pane: on 2026-11-15 the session renamed to
-that name showed the label, and its member then idled for two minutes without the
-"cannot read the input line" notice, which is due after 60 s
-(`INPUT_LINE_UNREADABLE_AFTER`) of an idle, unrecognised reading, so it is observed
-to be read; the screen itself was not replayed against the reader, so it is still
-not a cell-by-cell measurement); the half-width floor is margin (the label sat in
-the last eighth, and half keeps a dialog title at the left or in the middle out).
-A blank prompt row with the cursor hidden and not in the empty column is
-`Unrecognized`, not `HasText`: when a server-side flag (`tengu_native_cursor`,
-cached in the Claude home's `.claude.json`, so off in a home with no cache) is off,
-Claude hides the terminal cursor and parks it in the footer or on the prompt row
-depending on focus reports, so its position says nothing about the line (measured
-2026-11-18, Claude Code 2.1.327, a fresh Claude home, a 40x130 pane). banto also
-launches every Claude pane with `CLAUDE_CODE_NATIVE_CURSOR=1`, which the binary
-checks before the flag; set on the claude process directly, it kept the cursor
-visible at column 2 through focus changes, typing and erasing, and every reading
-was right. The rule only guards a pane where that did not take. Not measured: a home
-with the flag cached on plus the variable (read from the code to behave the same),
-other pane sizes, a modal at the prompt.
-`HasText` holds the nudge even with no mark (recalled history is text no keystroke
-announced); `Empty` clears the mark, but only `INPUT_ECHO_SETTLE` (3s) after banto
-last forwarded input to the pane, because a pane's screen lags its keys (36–108ms
-measured on 2026-11-10) and an `Empty` read inside that window is not yet true;
-`Unrecognized` leaves the mark in charge. A Claude pane that stays idle yet `Unrecognized` for
-`INPUT_LINE_UNREADABLE_AFTER` (60s) is reported once on the status line, since
-Claude's layout can change without notice and a reader that stopped recognising it
-would look like one that works; waiting (a permission dialog) is not counted.
-
-*Incident (2026-11-15): a renamed session's label in its input-box border.* The
-operator kept seeing `relay: cannot read the input line of director of "<brigade>" —
-unsent-draft detection is back to keystroke tracking` for a brigade he had only
-opened. Measured by replaying a 100-minute recording against the reader: one
-Director's pane read `Unrecognized` on essentially every tick of its life, always
-for "no full-width rule above the prompt row" and nothing else; stage, focus,
-scrolling and size made no difference. That pane's top border was, at width 81, rule
-× 71, blank, 7 non-rule non-blank cells, blank, rule × 1 (at width 84: rule × 74,
-…): a label right-aligned inside the box's top border. The pane belonged to the only
-session in the run whose transcript carries `agent-name` records (the link is by
-structure, character count and class, and by record types only; nobody read the
-label or the transcript's content). A session with only a `/rename` title
-(`custom-title` records) kept the plain border: the other brigade's Director, also
-renamed with `/rename`, was always readable. Observed on 2026-11-15, Claude Code
-2.1.325: the operator ran `/rename` on a long-lived session whose transcript until
-then held only `custom-title` records (it had been renamed under an earlier Claude
-Code); the transcript gained `agent-name` records and the label appeared at the top
-right of that session's input box at once, and he confirmed by eye that the
-originally measured pane has the label there. So the current `/rename` writes
-`agent-name` and draws the label, while an earlier version's `/rename` wrote only
-`custom-title` and drew none, which is why two Directors, both renamed, differed
-(his own explanation, offered before the check: the readable session was long-lived
-and had been renamed before Claude's behaviour changed). The notice fires about 61 s
-after the member first idles, once per member, whatever the stage; it looked like an
-off-stage brigade's only because that is where he was not looking. The reader now
-accepts the labelled border (above), so such a member reads `Empty` or `HasText` and
-its draft protection works.
-
 **Waking a Codex member (through its queue; replaces the Codex gate of 2026-11-19).**
 A Codex member is never typed into by the relay. When the relay would nudge it
 (idle for `RELAY_IDLE_STREAK_REQUIRED` ticks with mail waiting, subject to the
@@ -4416,11 +4288,7 @@ cooldown and the attempt cap), banto runs `codex queue --thread <session id>
 off the event loop, on one thread, one request at a time
 (`Cmd::QueueCodexMessage`; the answer comes back as `Event::CodexMessageQueued` in
 a later loop iteration). Codex then starts a turn with the sentence by itself, so a
-picker, a dialog or a draft in the composer is not touched, which is what the old
-gate (the painted-prompt reading, the 60 s hold and its "not at its prompt"
-notice) existed to protect and why none of it remains; the operator's unsent mark
-and the focus quiet period do not apply to a Codex member either, since nothing is
-typed into its pane. A queued message starts its turn up to 10 s after the queue is
+picker, a dialog or a draft in the composer is not touched. A queued message starts its turn up to 10 s after the queue is
 made (a 10 s beat; measured, `docs/notes/codex-wake-spike-2026-11-23.md`), at once
 after a turn of the operator's ends (about 12 ms after an Esc-interrupted one), about
 0.3 s after a start-up dialog is answered, and about 1.5 s after `codex resume`
@@ -4474,9 +4342,6 @@ deliver twice; the last cannot be helped by trying again. None falls back to typ
 An answer that never comes puts the member on hold after 30 s
 (`CODEX_QUEUE_ANSWER_GIVE_UP`), so a lost answer ends. The queue's `message_id`,
 `client_id` and `turn_trigger` are not read back.
-
-**Past incident (2026-11-14):** the former typed relay could leave a delayed Enter
-queued across a relaunch. The wake hook no longer queues an Enter.
 
 `[brigade].relay` in config.toml (`RelayMode`, default `Auto`) toggles this
 off (`Manual`) for an operator who would rather prompt `check_messages`

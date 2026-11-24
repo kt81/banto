@@ -424,7 +424,7 @@ fn tools_list_result() -> Value {
                                 recipient to read the message, which costs \
                                 it a turn over its whole context; it reads the text with \
                                 check_messages. A wake is not guaranteed (the relay can be off, or \
-                                held back by a draft in the pane), so do not take a send as a \
+                                held while the recipient is busy), so do not take a send as a \
                                 read. Optionally set `to` to address one \
                                 specific member instead of broadcasting — the only way a \
                                 Director reaches a Goinkyo, since a broadcast never does.",

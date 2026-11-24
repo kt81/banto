@@ -37,7 +37,6 @@ fn negotiated_codex_shift_enter_is_a_newline_record() {
         now,
     );
     assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::WritePty { key, bytes } if key == &pane && bytes == b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_")), "{cmds:?}");
-    assert!(state.has_unsent_operator_input(&pane));
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -89,14 +88,14 @@ fn send_key(state: &mut EmporiumState, app: &mut App, key: KeyEvent, now: Instan
 }
 
 #[test]
-fn fresh_codex_before_discovery_encodes_ctrl_j_and_marks_draft() {
-    let (mut state, mut app, pane, now) = fresh(Some(AgentKind::Codex), true);
+fn fresh_codex_before_discovery_encodes_ctrl_j() {
+    let (mut state, mut app, _pane, now) = fresh(Some(AgentKind::Codex), true);
     let ctrl_j = KeyEvent::new(KeyCode::Char('j'), Modifiers::CONTROL);
     assert_eq!(
         send_key(&mut state, &mut app, ctrl_j, now),
         b"\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_"
     );
-    assert!(state.has_unsent_operator_input(&pane));
+
     assert_eq!(
         send_key(
             &mut state,
@@ -106,7 +105,6 @@ fn fresh_codex_before_discovery_encodes_ctrl_j_and_marks_draft() {
         ),
         b"\r"
     );
-    assert!(!state.has_unsent_operator_input(&pane));
 }
 
 #[test]
@@ -116,7 +114,7 @@ fn unknown_claude_disabled_and_conflicting_agent_keep_legacy_input() {
         (Some(AgentKind::ClaudeCode), true),
         (Some(AgentKind::Codex), false),
     ] {
-        let (mut state, mut app, pane, now) = fresh(agent, mode);
+        let (mut state, mut app, _pane, now) = fresh(agent, mode);
         assert_eq!(
             send_key(
                 &mut state,
@@ -126,7 +124,6 @@ fn unknown_claude_disabled_and_conflicting_agent_keep_legacy_input() {
             ),
             b"\n"
         );
-        assert!(!state.has_unsent_operator_input(&pane));
     }
     let (mut state, mut app, pane, now) = fresh(Some(AgentKind::Codex), true);
     state.member_brigades.insert(pane.clone(), 7);
@@ -152,8 +149,8 @@ fn unknown_claude_disabled_and_conflicting_agent_keep_legacy_input() {
 }
 
 #[test]
-fn literal_prefix_uses_the_same_encoding_and_draft_effect() {
-    let (mut state, mut app, pane, now) = fresh(Some(AgentKind::Codex), true);
+fn literal_prefix_uses_the_same_encoding() {
+    let (mut state, mut app, _pane, now) = fresh(Some(AgentKind::Codex), true);
     state.prefix = PrefixKey::parse("C-j");
     let key = KeyEvent::new(KeyCode::Char('j'), Modifiers::CONTROL);
     let first = update(
@@ -168,7 +165,6 @@ fn literal_prefix_uses_the_same_encoding_and_draft_effect() {
         send_key(&mut state, &mut app, key, now),
         b"\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_"
     );
-    assert!(state.has_unsent_operator_input(&pane));
 }
 
 #[test]

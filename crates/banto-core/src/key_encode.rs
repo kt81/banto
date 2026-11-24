@@ -51,62 +51,18 @@ pub fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
     out
 }
 
-/// What forwarding a key does to the text waiting in a child's input line, as
-/// far as banto can tell from the key alone. banto cannot see the child's
-/// input line, so this is a classification of intent made from the encoding
-/// above, not a model of any agent's key bindings — an agent that binds a key
-/// differently changes nothing here.
+/// Whether a key submits the child's input, for the request watch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEffect {
-    /// May put characters into the input line (a printable key, a newline
-    /// insertion, a completion). When unsure, a key lands here: a wrongly
-    /// kept mark only delays a relay nudge, a missed one lets the nudge
-    /// splice into what the operator typed.
-    AddsText,
-    /// Plain Enter — the one key that sends what was typed.
     Submits,
-    /// Moves, deletes or cancels without adding anything, so it neither
-    /// proves nor disproves that unsent text exists.
     Neutral,
 }
 
-/// What the operator's input is, as handed to [`input_effect`].
-#[derive(Debug, Clone, Copy)]
-pub enum ForwardedInput<'a> {
-    Key(&'a KeyEvent),
-    Paste(&'a str),
-}
-
-/// The one place that decides what forwarding `input` to a pane means for
-/// whether unsent operator text is waiting there (see [`InputEffect`]) —
-/// every caller that forwards operator input asks here, so the rule can
-/// change without touching them.
-///
-/// Enter is classified by the bytes [`key_to_bytes`] actually sends, not by
-/// which key was pressed: the child sees only bytes. A `\r` sends; any other
-/// Enter encoding (Shift+Enter is a `\n`, a newline) puts text into the line
-/// instead. A change to the encoding changes the classification by itself,
-/// with no change to this function.
-pub fn input_effect(input: ForwardedInput<'_>) -> InputEffect {
-    let key = match input {
-        ForwardedInput::Key(key) => key,
-        // Whatever it holds, it was put there by the operator.
-        ForwardedInput::Paste(text) => {
-            return if text.is_empty() {
-                InputEffect::Neutral
-            } else {
-                InputEffect::AddsText
-            };
-        }
-    };
-    match key.code {
-        KeyCode::Enter if key_to_bytes(key) == b"\r" => InputEffect::Submits,
-        KeyCode::Enter => InputEffect::AddsText,
-        // A Ctrl chord with a control byte writes no character; one without
-        // (`Ctrl+1`) falls through `key_to_bytes` as the plain character.
-        KeyCode::Char(c) if key.modifiers.ctrl && ctrl_byte(c).is_some() => InputEffect::Neutral,
-        KeyCode::Char(_) | KeyCode::Tab | KeyCode::BackTab => InputEffect::AddsText,
-        _ => InputEffect::Neutral,
+fn input_effect(key: &KeyEvent) -> InputEffect {
+    if key.code == KeyCode::Enter && key_to_bytes(key) == b"\r" {
+        InputEffect::Submits
+    } else {
+        InputEffect::Neutral
     }
 }
 
@@ -125,10 +81,10 @@ pub fn key_to_encoded_input(key: &KeyEvent, win32_codex: bool) -> (Vec<u8>, Inpu
             _ => None,
         };
         if let Some(bytes) = bytes {
-            return (bytes.to_vec(), InputEffect::AddsText);
+            return (bytes.to_vec(), InputEffect::Neutral);
         }
     }
-    (key_to_bytes(key), input_effect(ForwardedInput::Key(key)))
+    (key_to_bytes(key), input_effect(key))
 }
 
 /// Normalize a pasted string's line endings for a PTY child: CRLF and a lone
@@ -191,9 +147,7 @@ fn ctrl_byte(c: char) -> Option<u8> {
 mod tests {
     #[test]
     fn win32_codex_encoded_newlines_preserve_effect_and_other_keys() {
-        use super::{
-            ForwardedInput, InputEffect, input_effect, key_to_bytes, key_to_encoded_input,
-        };
+        use super::{InputEffect, input_effect, key_to_bytes, key_to_encoded_input};
         use crate::input::{KeyCode, KeyEvent, Modifiers};
         let shift_enter = KeyEvent::new(KeyCode::Enter, Modifiers::SHIFT);
         let ctrl_j = KeyEvent::new(KeyCode::Char('j'), Modifiers::CONTROL);
@@ -201,7 +155,7 @@ mod tests {
             key_to_encoded_input(&shift_enter, true),
             (
                 b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_".to_vec(),
-                InputEffect::AddsText
+                InputEffect::Neutral
             )
         );
         for c in ['j', 'J'] {
@@ -210,7 +164,7 @@ mod tests {
                 key_to_encoded_input(&key, true),
                 (
                     b"\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_".to_vec(),
-                    InputEffect::AddsText
+                    InputEffect::Neutral
                 )
             );
         }
@@ -222,7 +176,7 @@ mod tests {
         ] {
             assert_eq!(
                 key_to_encoded_input(&key, false),
-                (key_to_bytes(&key), input_effect(ForwardedInput::Key(&key)))
+                (key_to_bytes(&key), input_effect(&key))
             );
         }
         let plain_enter = KeyEvent::new(KeyCode::Enter, Modifiers::NONE);
@@ -241,7 +195,7 @@ mod tests {
                         if !special {
                             assert_eq!(
                                 key_to_encoded_input(&key, true),
-                                (key_to_bytes(&key), input_effect(ForwardedInput::Key(&key))),
+                                (key_to_bytes(&key), input_effect(&key)),
                                 "{key:?}"
                             );
                         }
@@ -253,8 +207,7 @@ mod tests {
     use crate::input::{KeyCode, KeyEvent, Modifiers};
 
     use super::{
-        ForwardedInput, InputEffect, input_effect, key_to_bytes, normalize_paste_line_endings,
-        wrap_bracketed_paste,
+        InputEffect, input_effect, key_to_bytes, normalize_paste_line_endings, wrap_bracketed_paste,
     };
 
     fn bytes(code: KeyCode, mods: Modifiers) -> Vec<u8> {
@@ -324,23 +277,6 @@ mod tests {
             b"\x1b[200~hello\x1b[201~".to_vec()
         );
     }
-    #[test]
-    fn printable_keys_add_text_including_alt_and_shift_and_ctrl_without_a_control_byte() {
-        for (code, mods) in [
-            (KeyCode::Char('a'), Modifiers::NONE),
-            (KeyCode::Char('A'), Modifiers::SHIFT),
-            (KeyCode::Char(' '), Modifiers::NONE),
-            (KeyCode::Char('あ'), Modifiers::NONE),
-            (KeyCode::Char('x'), Modifiers::ALT),
-            (KeyCode::Char('1'), Modifiers::CONTROL),
-        ] {
-            assert_eq!(
-                input_effect(ForwardedInput::Key(&KeyEvent::new(code, mods))),
-                InputEffect::AddsText,
-                "{code:?} {mods:?}"
-            );
-        }
-    }
 
     #[test]
     fn an_enter_submits_exactly_when_it_is_sent_as_a_carriage_return() {
@@ -357,7 +293,7 @@ mod tests {
             (both, true),
         ] {
             let key = KeyEvent::new(KeyCode::Enter, mods);
-            let effect = input_effect(ForwardedInput::Key(&key));
+            let effect = input_effect(&key);
             assert_eq!(
                 effect == InputEffect::Submits,
                 key_to_bytes(&key) == b"\r",
@@ -368,13 +304,10 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_sends_a_line_feed_and_so_adds_text() {
+    fn shift_enter_sends_a_line_feed_without_submitting() {
         let key = KeyEvent::new(KeyCode::Enter, Modifiers::SHIFT);
         assert_eq!(key_to_bytes(&key), b"\n");
-        assert_eq!(
-            input_effect(ForwardedInput::Key(&key)),
-            InputEffect::AddsText
-        );
+        assert_eq!(input_effect(&key), InputEffect::Neutral);
     }
 
     #[test]
@@ -391,16 +324,6 @@ mod tests {
         // Only Shift alone is told apart; anything else is a plain send.
         for mods in [Modifiers::NONE, Modifiers::ALT, Modifiers::CONTROL] {
             assert_eq!(bytes(KeyCode::Enter, mods), b"\r", "{mods:?}");
-        }
-    }
-
-    #[test]
-    fn tab_and_backtab_lean_to_adding_text() {
-        for code in [KeyCode::Tab, KeyCode::BackTab] {
-            assert_eq!(
-                input_effect(ForwardedInput::Key(&KeyEvent::new(code, Modifiers::NONE))),
-                InputEffect::AddsText
-            );
         }
     }
 
@@ -422,27 +345,13 @@ mod tests {
             KeyCode::F(5),
         ] {
             assert_eq!(
-                input_effect(ForwardedInput::Key(&KeyEvent::new(code, Modifiers::NONE))),
+                input_effect(&KeyEvent::new(code, Modifiers::NONE)),
                 InputEffect::Neutral,
                 "{code:?}"
             );
         }
         assert_eq!(
-            input_effect(ForwardedInput::Key(&KeyEvent::new(
-                KeyCode::Char('c'),
-                Modifiers::CONTROL
-            ))),
-            InputEffect::Neutral
-        );
-    }
-    #[test]
-    fn a_paste_adds_text_unless_it_is_empty() {
-        assert_eq!(
-            input_effect(ForwardedInput::Paste("hello")),
-            InputEffect::AddsText
-        );
-        assert_eq!(
-            input_effect(ForwardedInput::Paste("")),
+            input_effect(&KeyEvent::new(KeyCode::Char('c'), Modifiers::CONTROL)),
             InputEffect::Neutral
         );
     }

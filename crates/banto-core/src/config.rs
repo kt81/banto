@@ -618,9 +618,10 @@ delegate.
 Workers cannot see this conversation. Every instruction must carry its own \
 context and say what you want back. Set `to` to address one Worker; omit it \
 to broadcast. With banto's relay on, which is the default, a message wakes \
-an idle recipient for a turn over its whole context, and a wake is not \
-guaranteed (the operator can turn the relay off, and a draft in a pane holds \
-it back), so a sent message is not a read one. Send a Worker only work, or a \
+an idle recipient for a turn over its whole context. A wake waits while the \
+member is busy; one nobody takes is shown as held. A wake is not guaranteed: \
+the relay can be off, so \
+a sent message is not a read one. Send a Worker only work, or a \
 correction to work in flight, and a stop whenever its work may still be \
 running (for a Claude Worker, interrupt_worker has banto refuse its next \
 tool calls until it reads such a correction or stop, instead of leaving it \
@@ -2240,9 +2241,11 @@ goinkyo_agent = 5
         );
         // And it is not guaranteed, so a sent message is not a read one.
         assert!(
-            prompt.contains("a wake is not guaranteed"),
+            prompt.to_lowercase().contains("a wake is not guaranteed"),
             "no promise of delivery: {prompt}"
         );
+        assert!(prompt.contains("member is busy; one nobody takes is shown as held"));
+        assert!(!prompt.contains("a draft in a pane holds"));
         assert!(
             prompt.contains("only work, or a correction to work in flight"),
             "{prompt}"

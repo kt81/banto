@@ -761,18 +761,6 @@ fn closing_drops_the_queued_and_counted_state_of_its_panes_and_only_theirs() {
                 told: false,
             },
         );
-        state.pending_submits.push(PendingSubmit {
-            key: pane,
-            nudged_at: t,
-        });
-    }
-    for brigade_id in [1, 2] {
-        state
-            .unreadable_since
-            .insert((brigade_id, "worker-1".to_string()), t);
-        state
-            .unreadable_noticed
-            .insert((brigade_id, "worker-1".to_string()));
     }
     let held = open_worker(
         &mut state,
@@ -796,36 +784,11 @@ fn closing_drops_the_queued_and_counted_state_of_its_panes_and_only_theirs() {
     close_staged(&mut state, &mut app, t);
 
     assert_eq!(
-        state
-            .pending_submits
-            .iter()
-            .map(|pending| pending.key.clone())
-            .collect::<Vec<_>>(),
-        vec![other.clone()],
-        "a nudge's delayed Enter would be written into a dead pane"
-    );
-    assert_eq!(
         state.first_turn_watch.keys().cloned().collect::<Vec<_>>(),
         vec![other],
         "a pane that is gone cannot take its first turn, and its watch would hold the relay and tell the operator about it"
     );
     assert!(state.codex_opens_awaiting_catalog.is_empty());
-    assert_eq!(
-        state
-            .unreadable_since
-            .keys()
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>(),
-        vec![2]
-    );
-    assert_eq!(
-        state
-            .unreadable_noticed
-            .iter()
-            .map(|(id, _)| *id)
-            .collect::<Vec<_>>(),
-        vec![2]
-    );
 }
 
 #[test]

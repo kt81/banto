@@ -1784,7 +1784,7 @@ fn execute_open_embedded(
         &launch::agent_binary(target.agent, deps.agent_binaries),
         snapshot_off,
     );
-    let env = pane_env(target.agent, brigade.as_ref(), deps.child);
+    let env = brigade_env(brigade.as_ref(), deps.child);
     let discovery_since = SystemTime::now();
     let mut codex_log_scan = (target.agent == AgentKind::Codex && target.id.is_empty())
         .then(|| {
@@ -3868,29 +3868,6 @@ pub(crate) fn brigade_env(
     // the hook's command line can hold neither a path (it is hashed, and cannot
     // be quoted) nor a flag, so it reads them from here.
     env.extend(child.map(|child| child.child_env()).unwrap_or_default());
-    env
-}
-
-/// Everything added to the environment of a pane's child, decided here by agent
-/// kind so that no launch path can forget it: the brigade variables
-/// ([`brigade_env`]) plus, for Claude Code, `CLAUDE_CODE_NATIVE_CURSOR=1`.
-///
-/// Without it Claude draws its input caret by a server-side flag
-/// (`tengu_native_cursor`) that it caches in the Claude home's `.claude.json`.
-/// A home with no cache has the flag off, and Claude then hides the terminal
-/// cursor: `banto_core::input_line` read an empty prompt as `HasText` and held
-/// every nudge to that pane for good. The operator's home caches the flag on,
-/// which can change any day. Claude Code 2.1.327 checks this variable before the
-/// flag, so setting it removes the dependence on the home.
-fn pane_env(
-    agent: AgentKind,
-    brigade: Option<&(BrigadeId, MemberToken, BrigadeRole)>,
-    child: Option<&crate::startup::Resolved>,
-) -> Vec<(String, String)> {
-    let mut env = brigade_env(brigade, child);
-    if agent == AgentKind::ClaudeCode {
-        env.push(("CLAUDE_CODE_NATIVE_CURSOR".to_string(), "1".to_string()));
-    }
     env
 }
 
@@ -16741,67 +16718,6 @@ mod tests {
                     .map(|name| name.to_string())
                     .collect::<Vec<_>>()
             ]
-        );
-    }
-
-    #[test]
-    fn a_claude_pane_is_launched_with_the_native_cursor_and_a_codex_pane_is_not() {
-        // The variable is what keeps the input line readable (see `pane_env`), and
-        // no gate notices a launch that loses it.
-        let dir = tempfile::tempdir().unwrap();
-        for (agent, id) in [
-            (AgentKind::ClaudeCode, ""),
-            (AgentKind::ClaudeCode, "resumed"),
-            (AgentKind::Codex, ""),
-        ] {
-            let fixture = SpawnFixture::new(PathBuf::from("/nonexistent"));
-            let mut handles = HashMap::new();
-            let mut discovery = Vec::new();
-
-            execute_cmd(
-                open_embedded_cmd(agent, id, dir.path()),
-                &fixture.deps(),
-                &mut handles,
-                &mut discovery,
-            );
-
-            let launches = fixture.launches();
-            assert_eq!(launches.len(), 1, "{agent:?} {id:?}");
-            let native_cursor: Vec<_> = launches[0]
-                .env
-                .iter()
-                .filter(|(name, _)| name == "CLAUDE_CODE_NATIVE_CURSOR")
-                .collect();
-            if agent == AgentKind::ClaudeCode {
-                assert_eq!(
-                    native_cursor,
-                    [&("CLAUDE_CODE_NATIVE_CURSOR".to_string(), "1".to_string())],
-                    "{id:?}"
-                );
-            } else {
-                assert!(native_cursor.is_empty(), "{:?}", launches[0].env);
-            }
-        }
-    }
-
-    #[test]
-    fn a_brigade_members_claude_pane_keeps_its_identity_beside_the_native_cursor() {
-        let brigade = (7, "worker-1".to_string(), BrigadeRole::Worker);
-        assert_eq!(
-            pane_env(AgentKind::ClaudeCode, Some(&brigade), None),
-            [
-                brigade_env(Some(&brigade), None),
-                vec![("CLAUDE_CODE_NATIVE_CURSOR".to_string(), "1".to_string())]
-            ]
-            .concat()
-        );
-        assert_eq!(
-            pane_env(AgentKind::Codex, Some(&brigade), None),
-            brigade_env(Some(&brigade), None)
-        );
-        assert_eq!(
-            pane_env(AgentKind::ClaudeCode, None, None),
-            [("CLAUDE_CODE_NATIVE_CURSOR".to_string(), "1".to_string())]
         );
     }
 

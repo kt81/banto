@@ -1735,7 +1735,7 @@ fn first_nudge_when_read_as(read_as: Quiescence) -> Option<u64> {
         &[(&director, Idle), (&worker, read_as)],
         at,
     );
-    (0..=RELAY_INPUT_QUIET_PERIOD.as_secs() + 5).find(|secs| {
+    (0..=35).find(|secs| {
         let cmds = send(
             &mut state,
             &mut app,
@@ -4293,7 +4293,7 @@ fn first_nudge_after(kind: Option<MouseEventKind>) -> Option<u64> {
             &worker
         ));
     }
-    (0..=RELAY_INPUT_QUIET_PERIOD.as_secs() + 5).find(|secs| {
+    (0..=35).find(|secs| {
         let cmds = send(
             &mut state,
             &mut app,
@@ -4308,10 +4308,8 @@ fn first_nudge_after(kind: Option<MouseEventKind>) -> Option<u64> {
 }
 
 #[test]
-fn every_pointer_report_forwarded_to_a_pane_still_holds_the_relays_nudge() {
-    // The relay stays out of a pane the operator is doing something in, and
-    // reading a transcript with the wheel is doing something. That is unlike the quit question, which asks
-    // about work given and does not count the wheel.
+fn pointer_reports_do_not_hold_the_relays_wake() {
+    // Mouse input does not delay an automatic wake.
     let free = first_nudge_after(None).expect("with no input the nudge goes out");
     assert!(free < 5, "{free}");
     for kind in [
@@ -4321,13 +4319,13 @@ fn every_pointer_report_forwarded_to_a_pane_still_holds_the_relays_nudge() {
         MouseEventKind::Up(MouseButton::Left),
         MouseEventKind::Down(MouseButton::Left),
     ] {
-        let at = first_nudge_after(Some(kind)).expect("it goes out once the quiet period ends");
-        assert!(at >= RELAY_INPUT_QUIET_PERIOD.as_secs(), "{kind:?}: {at}");
+        let at = first_nudge_after(Some(kind)).expect("the wake goes out");
+        assert!(at < 5, "{kind:?}: {at}");
     }
 }
 
 #[test]
-fn the_relay_and_the_quit_question_read_two_different_records_of_pointer_traffic() {
+fn pointer_traffic_does_not_count_as_work_given() {
     let (mut state, mut app, a, _b, at) = typing_fixture();
     state.size = (120, 40);
     said(&mut state, &mut app, &a, MOUSE_REPORTING_ON, at);
@@ -4339,13 +4337,11 @@ fn the_relay_and_the_quit_question_read_two_different_records_of_pointer_traffic
         MouseEventKind::Drag(MouseButton::Left),
     ] {
         mouse(&mut state, &mut app, kind, over, at);
-        assert!(state.last_forwarded_input.contains_key(&a), "{kind:?}");
+
         assert!(!state.last_given_input.contains_key(&a), "{kind:?}");
-        state.last_forwarded_input.clear();
     }
-    // A key is both.
+    // A key counts as work given.
     press(&mut state, &mut app, KeyCode::Char('x'), at);
-    assert!(state.last_forwarded_input.contains_key(&a));
     assert!(state.last_given_input.contains_key(&a));
 }
 
@@ -4654,7 +4650,7 @@ fn what_the_operator_or_banto_gave_a_process_arms_the_watch_inside_the_grace() {
     }
     assert!(rang_at.is_some(), "a key arms inside the grace");
 
-    // A nudge banto typed into a Worker, which then reads busy.
+    // A wake banto issued to a Worker, which then reads busy.
     let (mut state, mut app, director, worker, at) = quiet_fixture();
     state.process_started.insert(worker.clone(), at);
     sample(
@@ -4728,7 +4724,7 @@ fn a_relaunched_pane_gets_a_new_grace() {
 }
 
 #[test]
-fn a_relay_nudge_just_typed_into_a_pane_counts_it() {
+fn a_recent_relay_wake_counts_the_pane() {
     let (mut state, mut app, director, worker, at) = quiet_fixture();
     sample(
         &mut state,
@@ -4765,10 +4761,6 @@ fn a_relay_nudge_just_typed_into_a_pane_counts_it() {
         issued_to(&cmds, 1, "worker-1"),
         "the nudge went out: {cmds:?}"
     );
-    // The operator's own input record is not touched by it: the relay reads
-    // that one to stay out of the way, and a nudge must not silence the next.
-    assert!(!state.last_forwarded_input.contains_key(&worker));
-
     // Both samples say idle; the nudge is a second old.
     sample(
         &mut state,
@@ -4824,9 +4816,9 @@ fn a_panes_input_record_follows_its_key_and_goes_with_the_pane() {
     assert!(state.took_input_recently(&renamed, at));
     assert!(!state.took_input_recently(&a, at));
     assert!(state.was_given_work(&renamed));
-    assert!(state.last_forwarded_input.contains_key(&renamed));
+
     state.unstage(&renamed);
-    assert!(!state.last_forwarded_input.contains_key(&renamed));
+
     assert!(!state.last_given_input.contains_key(&renamed));
 
     // And banto's own write.
@@ -5213,41 +5205,6 @@ fn a_wake_on_the_tick_that_would_complete_the_stretch_does_not_ring_on_that_tick
 }
 
 #[test]
-fn a_nudge_held_back_by_a_draft_holds_the_ring_for_as_long_as_it_is_held() {
-    // The recipient has an unsent draft: the relay holds the nudge and nothing
-    // is written, but the mail is still to be delivered, so the brigade is not
-    // quiet however long that takes.
-    let (mut state, mut app, director, worker, at) = quiet_fixture();
-    let idle_from = busy_then_idle(&mut state, &mut app, &[&worker, &director], at);
-    let all_idle = [(&director, Idle), (&worker, Idle)];
-    state.unsent_operator_input.insert(director.clone());
-    let mail = || vec![mail_for(1, DIRECTOR_TOKEN, &director)];
-
-    for secs in 0..BRIGADE_QUIET_SETTLE.as_secs() as u32 {
-        let cmds = sample_with_relay(
-            &mut state,
-            &mut app,
-            &all_idle,
-            mail(),
-            idle_from + secs * SECOND,
-        );
-        assert!(
-            !issued_to(&cmds, 1, DIRECTOR_TOKEN),
-            "held at +{secs}s: {cmds:?}"
-        );
-    }
-    let cmds = sample_with_relay(
-        &mut state,
-        &mut app,
-        &all_idle,
-        mail(),
-        idle_from + BRIGADE_QUIET_SETTLE,
-    );
-    assert!(!issued_to(&cmds, 1, DIRECTOR_TOKEN));
-    assert!(!rang(&cmds), "mail is still waiting: {cmds:?}");
-}
-
-#[test]
 fn a_nudge_in_one_brigade_does_not_restart_the_other() {
     let (mut state, mut app, d1, w1, at) = quiet_fixture();
     let d2 = host(&mut state, 2, DIRECTOR_TOKEN, "dir2");
@@ -5290,7 +5247,7 @@ fn a_successful_wake_is_stamped_when_issued() {
     assert!(issued_to(&cmds, 1, DIRECTOR_TOKEN));
     assert_eq!(state.last_prompted.get(&director), Some(&nudged_at));
 
-    let enter_at = nudged_at + RELAY_SUBMIT_DELAY;
+    let enter_at = nudged_at + Duration::from_millis(300);
     let cmds = tick(&mut state, &mut app, enter_at);
     assert!(!typed_into(&cmds, &director), "{cmds:?}");
     assert_eq!(state.last_prompted.get(&director), Some(&nudged_at));
@@ -6252,9 +6209,6 @@ fn a_key_in_the_same_drain_as_the_relaunch_is_not_work_given_to_the_new_process(
         at,
     );
     assert!(!run.state.was_given_work(&key("c1")));
-    // The relay's own record of the operator's input is as it was: a nudge is
-    // still held back for a pane the operator was just typing into.
-    assert!(run.state.last_forwarded_input.contains_key(&key("c1")));
     assert!(
         !rang_after_the_relaunched_worker_reads_busy(&mut run, 30_000),
         "its start-up reading is not armed by a key meant for the old pane"
@@ -6284,7 +6238,7 @@ fn what_banto_wrote_to_the_old_process_in_the_same_drain_is_not_work_given_to_th
         issued_to(&nudged, 1, "worker-2"),
         "the nudge went to the old process"
     );
-    // Its delayed submitting Enter goes out in the tick at the very instant the
+    // The wake and the quiet decision share the tick at the instant the
     // process is replaced.
     let submitted = mail(&mut run, at);
     assert!(!typed_into(&submitted, &c1), "{submitted:?}");
@@ -6321,85 +6275,6 @@ fn director_mail(unread: bool, director: &SessionKey) -> Vec<RelayObservation> {
     let mut observation = mail_for(1, DIRECTOR_TOKEN, director);
     observation.has_unseen = unread;
     vec![observation]
-}
-
-#[test]
-fn a_brigade_with_unread_mail_held_back_by_the_operator_does_not_ring_until_it_is_delivered() {
-    // The trial's sequence: a Worker's report is waiting for the Director, every
-    // member reads idle, and the nudge is held for thirty seconds because the
-    // operator is at the Director's pane.
-    let (mut state, mut app, director, worker, at) = quiet_fixture();
-    let all_idle = [(&director, Idle), (&worker, Idle)];
-    sample_with_relay(
-        &mut state,
-        &mut app,
-        &[(&director, Idle), (&worker, NotIdle)],
-        director_mail(true, &director),
-        at,
-    );
-    state.unsent_operator_input.insert(director.clone());
-    for secs in 1..=30 {
-        let cmds = sample_with_relay(
-            &mut state,
-            &mut app,
-            &all_idle,
-            director_mail(true, &director),
-            at + secs * SECOND,
-        );
-        assert!(
-            !issued_to(&cmds, 1, DIRECTOR_TOKEN),
-            "held at +{secs}s: {cmds:?}"
-        );
-        assert!(
-            !rang(&cmds),
-            "mail is waiting, not quiet: at +{secs}s: {cmds:?}"
-        );
-    }
-
-    // The hold ends and the wake is issued ...
-    state.unsent_operator_input.remove(&director);
-    let mut typed_at = None;
-    for secs in 31..=34 {
-        let cmds = sample_with_relay(
-            &mut state,
-            &mut app,
-            &all_idle,
-            director_mail(true, &director),
-            at + secs * SECOND,
-        );
-        assert!(!rang(&cmds), "at +{secs}s: {cmds:?}");
-        if typed_at.is_none() && issued_to(&cmds, 1, DIRECTOR_TOKEN) {
-            typed_at = Some(secs);
-        }
-    }
-    assert!(typed_at.is_some(), "the nudge was delivered");
-    // ... the Director reads its mail and works, then goes idle again.
-    let working = [(&director, NotIdle), (&worker, Idle)];
-    sample_with_relay(
-        &mut state,
-        &mut app,
-        &working,
-        director_mail(false, &director),
-        at + 35 * SECOND,
-    );
-    let idle_from = at + 37 * SECOND;
-    let mut rang_at = None;
-    let mut when = idle_from;
-    while when <= idle_from + 2 * BRIGADE_QUIET_SETTLE {
-        let cmds = sample_with_relay(
-            &mut state,
-            &mut app,
-            &all_idle,
-            director_mail(false, &director),
-            when,
-        );
-        if rang(&cmds) {
-            rang_at = Some(when);
-            break;
-        }
-        when += SECOND;
-    }
-    assert_eq!(rang_at, Some(idle_from + BRIGADE_QUIET_SETTLE));
 }
 
 #[test]
@@ -6493,9 +6368,15 @@ fn unread_mail_in_another_brigade_or_for_a_member_nobody_hosts_does_not_hold_thi
     let idle_from = at + SECOND;
     let all_idle = [(&d1, Idle), (&w1, Idle), (&d2, Idle), (&w2, Idle)];
 
-    // Brigade 2's Director has mail waiting (held by a draft); a member that is
+    // Brigade 2's Director has mail waiting during its first-turn watch; a member that is
     // not hosted at all also has some.
-    state.unsent_operator_input.insert(d2.clone());
+    state.first_turn_watch.insert(
+        d2.clone(),
+        FirstTurnWatch {
+            agent: AgentKind::ClaudeCode,
+            told: true,
+        },
+    );
     let ghost = key("ghost");
     let mail = || {
         let mut ghost_mail = mail_for(1, "worker-9", &ghost);
@@ -6836,8 +6717,14 @@ fn mail_observed_before_an_outage_holds_nothing_afterwards_unless_it_is_observed
         let (mut state, mut app, director, worker, at) = quiet_fixture();
         let idle_from = busy_then_idle(&mut state, &mut app, &[&worker, &director], at);
         let all_idle = [(&director, Idle), (&worker, Idle)];
-        // Mail is waiting and the nudge is held by a draft.
-        state.unsent_operator_input.insert(director.clone());
+        // Mail is waiting while the first-turn watch holds the wake.
+        state.first_turn_watch.insert(
+            director.clone(),
+            FirstTurnWatch {
+                agent: AgentKind::ClaudeCode,
+                told: true,
+            },
+        );
         sample_with_relay(
             &mut state,
             &mut app,
@@ -6928,7 +6815,13 @@ fn switching_the_relay_to_manual_in_the_middle_of_a_hold_releases_the_ring_after
     let (mut state, mut app, director, worker, at) = quiet_fixture();
     let idle_from = busy_then_idle(&mut state, &mut app, &[&worker, &director], at);
     let all_idle = [(&director, Idle), (&worker, Idle)];
-    state.unsent_operator_input.insert(director.clone());
+    state.first_turn_watch.insert(
+        director.clone(),
+        FirstTurnWatch {
+            agent: AgentKind::ClaudeCode,
+            told: true,
+        },
+    );
     for secs in 0..20 {
         let cmds = sample_with_relay(
             &mut state,
@@ -7155,7 +7048,13 @@ fn switching_the_relay_back_to_automatic_resumes_the_hold_on_pending_mail() {
     let (mut state, mut app, director, worker, at) = quiet_fixture();
     let idle_from = busy_then_idle(&mut state, &mut app, &[&worker, &director], at);
     let all_idle = [(&director, Idle), (&worker, Idle)];
-    state.unsent_operator_input.insert(director.clone());
+    state.first_turn_watch.insert(
+        director.clone(),
+        FirstTurnWatch {
+            agent: AgentKind::ClaudeCode,
+            told: true,
+        },
+    );
     let manual = BrigadeConfig {
         relay: crate::config::RelayMode::Manual,
         ..BrigadeConfig::default()
