@@ -79,6 +79,20 @@ The binary is unsigned.
 | The same exe started from a terminal and double-clicked in Explorer | Defender and SmartScreen silent |
 | The draft's `install.ps1` run as `Get-Content -Raw .\install.ps1 \| iex` on the browser-downloaded files, with `BANTO_INSTALL_DIR` set to a scratch directory | it found the existing install in `~\.local\bin`, ignored `BANTO_INSTALL_DIR` (one banto per machine) and upgraded that one in place, 0.1.0 to 0.3.0; nothing from Defender or SmartScreen |
 
+## 2026-11-24: v0.4.0
+
+Nothing flagged it. SmartScreen warned on the double-click, as for v0.1.0. The binary
+is unsigned.
+
+| Step | What Windows said |
+|---|---|
+| Workflow scan of the freshly built exe (run 45399545495, hosted runner), definitions 1.463.448.0 | no threats, exit 0 |
+| The draft's zip fetched with `gh release download` (no web mark), `banto.exe` (sha256 `4b01019a894f2df67a2a0cc17c927bbcdb8e38e7221878d6e08de87e717c1261`) scanned with the command above, definitions 1.463.440.0 | no threats, exit 0 |
+| The operator's machine: the draft's zip downloaded with a browser, extracted, the exe scanned explicitly | no threats |
+| The same exe double-clicked in Explorer | SmartScreen warned; Defender silent |
+| The same exe started from a terminal | unknown |
+| The draft's `install.ps1` | unknown |
+
 ## How to record the next one
 
 Add a section like the ones above, with a heading of the date. Copy this table and fill
