@@ -89,6 +89,7 @@ mod tests {
                 session: None,
                 child_args: Vec::new(),
             }),
+            first_prompt: None,
         };
 
         // Found by content, not position: the notification overrides now

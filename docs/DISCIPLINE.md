@@ -108,12 +108,12 @@ jsonl mtime. When enumerating `Event`s, hunt for these specifically.
 pane's screen may be read for a fact the agent publishes nowhere else, only at
 the moment a decision needs it, and only so that it closes when unsure: a
 shape it does not recognise answers `Unrecognized`, and the caller does what
-it did before it could read — except where there was no "before" worth keeping,
-see the kickoff below. It is never used to estimate or keep track of
+it did before it could read — except for the Codex relay rule below, where there
+was no "before" worth keeping. It is never used to estimate or keep track of
 state — that is the disguised input above in a new coat. The input-line
 reader (`banto_core::input_line`) is one instance: it reads Claude's line for
-text and recognises one bounded empty-looking Codex prompt shape. Its callers are
-the relay and the kickoffs. The relay reads a Claude member's line on every tick
+text and recognises one bounded empty-looking Codex prompt shape. Its only
+caller is the relay. The relay reads a Claude member's line on every tick
 it runs (relay `auto`, the member's brigade not closing: the line is judged for a
 draft whether or not a nudge is due), through one verdict per pane per tick that
 the interrupt refinement shares (below), and a Codex member's only on a tick
@@ -122,26 +122,7 @@ unsure: a Codex pane is
 typed into only when quiet, not `blocked`, and reading `Empty`; otherwise banto
 does not type, holds the mail with no attempt spent, and tells the operator once
 (approved 2026-11-19: on Codex 0.169.0 a nudge typed into an open picker moved its
-selection and applied it, while the pane's own report said `idle`). The kickoff of a Codex
-Worker, and of a Goinkyo whose live file does not yet name its pane, asks it on
-each tick the first line is due, because the alternative witness (the product's
-trust registry) was wrong both ways and a typed first line into a screen that is
-not a prompt answers whatever that screen is asking. Both kickoffs also ask it
-whether the operator's unsent mark still stands, on the ticks a line is due, by
-the relay's rule (the mark, overruled by an `Empty` read after the settle time:
-`unsent_verdict`), which closes to the mark when the read is unsure. They read the
-line themselves and do not go through the relay's per-tick verdict. There an unsure read does
-**not** fall back to what the caller did before: banto does not type, and tells
-the operator once so that they can answer the pane or type the line themselves
-(approved 2026-11-18, a departure from "the caller does what it did before it
-could read"). Nothing is dropped and nothing fails: the kickoff is typed on the
-tick the prompt reads `Empty`, and stays owed until a line banto typed has had its
-acknowledgement window and the pane is still not at a prompt, when banto tells the
-operator once and stops counting it as owed (it is typed again the moment the
-prompt reads `Empty`). The Goinkyo kickoff reads the line for two more
-decisions of its own: whether the only text on it is its own sentence still
-waiting for its Enter, and whether the line reads `Empty` (asked when its live
-file names no pane yet, and on a retry always). A Codex match is not proof of
+selection and applied it, while the pane's own report said `idle`). A Codex match is not proof of
 semantic emptiness; its limits are in `docs/REQUIREMENTS.md`, "Auto-relay".
 Reading sends nothing; the operator approved the principle on 2026-11-10. The
 next shortcut that wants the screen cites this paragraph's conditions, not the
@@ -167,19 +148,20 @@ sentence (`restored_nudge_line`) only after a read of `HasText`, and only the
 comparison's result is used or recorded. What crosses ticks is a watch
 (message ids and a tick count) and a set of members: no screen content. "The relay
 is the one reader" is therefore true of the relay and the interrupt, not of the
-whole engine: the kickoff paths above, and Codex, read the line on their own.
+whole engine: Codex reads the line on its own.
 
 Reading a program's own state report out of its output stream is not a read of
 the painted screen: it is the child's explicit announcement (OSC 7501, for a
 hosted Codex pane), arriving in an event that already exists (`PtyOutput`),
 recorded and replayed like the rest, and it closes to the previous rule whenever
 it is unsure (no report, or `clear`, and the earlier signal decides). It is not an
-instance of the paragraph above, so a shortcut must not cite it for one. The
-Codex kickoff reads it too, as one of its two conditions (`idle` and an empty
-prompt), and for that decision no report is not an `idle`: it holds, under the same
-exception as above. After the line is typed it reads the report once more, only to
-see that a turn ran (`working`, `done` or `error`) and so never type the line again; no
-report there is no turn seen, and the retry rules decide.
+instance of the paragraph above, so a shortcut must not cite it for one. The Codex
+relay gate reads it as one of its two conditions (a report that is not `blocked`,
+and an empty prompt), and there a pane that has reported nothing is never at its
+prompt: it holds, under the same exception as above. A pane's `done` or `error` is also latched
+(`codex_turn_ran`) to say that a turn ran, which the notice for a first prompt
+that was never identified reads. `working` is never latched or used that way:
+Codex reports it while it starts as well.
 
 ## 4. The core signature
 

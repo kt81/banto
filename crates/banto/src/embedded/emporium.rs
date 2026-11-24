@@ -45,6 +45,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::app::{App, Mode};
+use banto_core::codex_queue::{CodexQueueResult, read_queue_run};
 use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
 use banto_core::engine::{
     self, Axis, BellCause, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
@@ -69,6 +70,7 @@ use banto_io::codex_activity;
 use banto_io::codex_catalog::{CodexCatalogSource, CodexCli};
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::SysinfoStartTime;
+use banto_io::codex_queue::{CodexQueueCli, CodexQueueSender};
 use banto_io::data_dir::DataDir;
 use banto_io::file_identity::DirectorySpellings;
 use banto_io::input::{CrosstermInputReader, InputReader, StampedEvent};
@@ -462,6 +464,7 @@ pub fn run(
         agent_binaries,
         enabled_agents,
         codex_catalog: &CodexCli,
+        codex_queue: &CodexQueueCli,
         child: Some(settings.child),
         exe: settings.exe,
     };
@@ -506,12 +509,11 @@ struct DiscoveryTracker {
     /// set the first time `claude_directory_trust_in` reports `NotTrusted`, so
     /// the status line states it once instead of restamping the same notice
     /// every poll (~every loop iteration, not just once a second). The
-    /// kickoffs' own once-only bit (`PendingKickoff::notified_not_at_prompt`)
-    /// lives in `engine.rs` instead, because that one belongs to the core's
-    /// own typing decision; this one only ever gates a notice, and this
-    /// tracker — already the shell's own discovery bookkeeping, never seen by
-    /// the core (see this struct's own doc) — is exactly where that one bit
-    /// belongs.
+    /// first-turn notice's own once-only bit (`FirstTurnWatch::told`) lives in
+    /// `engine.rs` instead, because the core decides that notice; this one only
+    /// ever gates a notice, and this tracker — already the shell's own discovery
+    /// bookkeeping, never seen by the core (see this struct's own doc) — is
+    /// exactly where that one bit belongs.
     notified_untrusted: bool,
 }
 
@@ -564,6 +566,8 @@ struct Deps<'a> {
     /// run, a mock in a test — an external process like the PTY host, so no
     /// test of the emporium runs Codex.
     codex_catalog: &'a dyn CodexCatalogSource,
+    /// What runs `codex queue`: `&CodexQueueCli` in a real run, a mock in a test.
+    codex_queue: &'a dyn CodexQueueSender,
     /// What a brigade member's banto children are told to resolve (see
     /// [`EmporiumSettings::child`]); `None` in a test, which then builds the
     /// argv and environment a hand-started child would get.
@@ -1247,6 +1251,7 @@ fn execute_cmd(
             permission_mode,
             disallowed_tools,
             autocompact,
+            first_prompt,
         } => execute_open_embedded(
             OpenEmbeddedRequest {
                 key,
@@ -1257,6 +1262,7 @@ fn execute_cmd(
                 permission_mode,
                 disallowed_tools,
                 autocompact,
+                first_prompt,
             },
             deps,
             handles,
@@ -1264,6 +1270,11 @@ fn execute_cmd(
         ),
         Cmd::CheckCodexTrust => execute_check_codex_trust(deps),
         Cmd::ReadCodexCatalog { round } => execute_read_codex_catalog(round, deps),
+        Cmd::QueueCodexMessage {
+            key,
+            session_id,
+            message,
+        } => execute_queue_codex_message(key, session_id, &message, deps),
         Cmd::SweepDataDir => execute_sweep_data_dir(deps),
         Cmd::OpenCodexTrustPane { key } => execute_open_codex_trust_pane(key, deps, handles),
         Cmd::Store(intent) => execute_store_intent(intent, deps.store),
@@ -1421,6 +1432,28 @@ fn execute_read_codex_catalog(round: u64, deps: &Deps) -> Vec<Event> {
     }]
 }
 
+/// Put a message on a Codex session's queue (`banto_io::codex_queue`), through
+/// the same binary a launch would use. The process's answer is read into an
+/// outcome here (`banto_core::codex_queue`) and handed to the core; a process
+/// that could not be started is an outcome of its own, not an error to swallow.
+fn execute_queue_codex_message(
+    key: SessionKey,
+    session_id: String,
+    message: &str,
+    deps: &Deps,
+) -> Vec<Event> {
+    let binary = launch::agent_binary(AgentKind::Codex, deps.agent_binaries);
+    let result = match deps.codex_queue.queue(&binary, &session_id, message) {
+        Ok(run) => read_queue_run(&run),
+        Err(reason) => CodexQueueResult::NotLaunched { reason },
+    };
+    vec![Event::CodexMessageQueued {
+        key,
+        session_id,
+        result,
+    }]
+}
+
 /// Spawn Codex's own trust-review startup (`crate::codex_trust::trust_argv`
 /// — the exact same argv a real brigade launch's hook override would carry,
 /// see that function's own doc) under `key`, staged as a solo pane
@@ -1508,6 +1541,7 @@ fn build_open_launch(
     flags: RoleFlags<'_>,
     briefing: Option<&str>,
     ctx: &launch::OpenContext,
+    first_prompt: Option<&str>,
 ) -> Option<launch::AgentLaunch> {
     let start = if target.id.is_empty() {
         launch::SessionStart::Create {
@@ -1531,6 +1565,7 @@ fn build_open_launch(
             autocompact: flags.autocompact.map(str::to_string),
             append_system_prompt: briefing.map(str::to_string),
             mcp_config: None,
+            first_prompt: first_prompt.map(str::to_string),
         },
         // `briefing` is deliberately unused here: Codex has no
         // `--append-system-prompt`, so a Codex member's briefing is rendered
@@ -1548,6 +1583,7 @@ fn build_open_launch(
             cwd: target.cwd.clone(),
             autocompact: flags.autocompact.map(str::to_string),
             brigade: None,
+            first_prompt: first_prompt.map(str::to_string),
         },
     })
 }
@@ -1579,6 +1615,7 @@ struct OpenEmbeddedRequest {
     permission_mode: Option<String>,
     disallowed_tools: Option<String>,
     autocompact: Option<String>,
+    first_prompt: Option<String>,
 }
 
 /// Spawn `target` under `key`, enforcing the no-double-resume guard
@@ -1607,6 +1644,7 @@ fn execute_open_embedded(
         permission_mode,
         disallowed_tools,
         autocompact,
+        first_prompt,
     } = request;
     if target.agent == AgentKind::Codex
         && !target.id.is_empty()
@@ -1653,6 +1691,7 @@ fn execute_open_embedded(
         },
         briefing.as_deref(),
         &open_ctx,
+        first_prompt.as_deref(),
     ) else {
         return vec![Event::SpawnFailed {
             key,
@@ -2263,15 +2302,15 @@ fn poll_solo_codex_discovery(
 /// Claude, nothing Codex writes to disk names a session before its first
 /// turn (measured 2026-08-02 — no live-state file, no session file, no
 /// `threads` row, nothing), so this is that same fact reaching the store
-/// instead, once `crate::engine`'s kickoff mechanism has forced that first
-/// turn to happen.
+/// instead, once the first prompt `crate::engine` gives a Codex Worker has
+/// started that first turn.
 ///
 /// Only a briefing recorded at or after `since`, the moment this pane's child
 /// was spawned. Nothing clears the column, so a member that was resumed or
 /// re-staged still carries the id of its previous process; taking that one
 /// identified the fresh pane as the old session on the first poll, before the
 /// new process had taken a turn, and the pane was then rekeyed to the old id
-/// with its kickoff dropped as acknowledged. A row with no `briefed_at` cannot
+/// with its first-turn watch dropped as confirmed. A row with no `briefed_at` cannot
 /// show it is newer, so it is not used either.
 fn codex_briefed_session_id(
     store: &RefCell<Store>,
@@ -2361,23 +2400,22 @@ fn note_briefed_since_launch(
 ///
 /// No tracker gives up: each lives until it resolves or its pane's screen is
 /// gone (the loop prunes trackers against `state.screens`). A Codex Worker's
-/// used to be dropped 90 s after spawn — even when the kickoff had never been
-/// typed because its pane was still not at its prompt — so a first turn taken
-/// later (banto's retry, or one the operator typed) fired the hook into a store
-/// nobody was reading, and the pane stayed unidentified, with
-/// `unresolved_codex` set, until it exited. Whether the kickoff was typed at
-/// all is the core's to report (`PendingKickoff`'s attempts), not this poll's.
+/// used to be dropped 90 s after spawn — even when the first prompt had started
+/// no turn because the pane was stopped at a dialog — so a first turn taken
+/// later (once the operator had answered it, or typed one themselves) fired the
+/// hook into a store nobody was reading, and the pane stayed unidentified, with
+/// `unresolved_codex` set, until it exited. Whether the first prompt started a
+/// turn is the core's to report (`FirstTurnWatch`), not this poll's.
 ///
 /// A Claude tracker still unresolved (regardless of how long) whose own cwd
 /// reads as definitively [`banto_io::directory_trust::DirectoryTrust::NotTrusted`]
 /// reports [`Event::ClaudeWorkerDirectoryUntrusted`] once — this pane isn't
 /// silent because anything is broken, it's sitting behind an unanswered
 /// trust prompt, and nothing *here* is held back by it: `poll_discovery`
-/// itself never types into a pane — a Worker's own first turn is always the
-/// operator's, and a Goinkyo's kickoff decides for itself, from its live file
-/// or its painted input line, whether the pane is at its prompt (the registry
-/// read here gates no keystroke anywhere) — so this report is only ever a
-/// silence to explain, never an action to hold back. (Not true of banto as a
+/// itself never types into a pane — a Claude Worker's own first turn is always
+/// the operator's, and a first prompt banto gives travels on the command line,
+/// so the registry read here gates no keystroke anywhere — so this report is
+/// only ever a silence to explain, never an action to hold back. (Not true of banto as a
 /// whole: an already-*discovered* Claude Worker's pane does get typed into, by
 /// the relay nudge — but this paragraph is about a tracker that never got that
 /// far.)
@@ -2689,8 +2727,11 @@ fn gather_relay_observations_from(
             sampled.insert(key.clone());
             // What the same live file says the member is doing, classified as the
             // session list classifies it, for the tile of a member that has no
-            // row yet (no transcript before its first turn). Display only: the
-            // relay and the watch read the file through the two functions above.
+            // row yet (no transcript before its first turn). Its `status_busy`
+            // is also read by two decisions in the core, neither of which can
+            // use the two functions above: the interrupt (is a turn running, so
+            // that an Esc cuts something) and a Claude Goinkyo's first-turn
+            // watch (has the first prompt started one).
             let live_status = match agent {
                 Some(AgentKind::ClaudeCode) => live_activity(live, &session_id.0, alive_claude)
                     .map(|activity| LiveStatus {
@@ -5198,6 +5239,7 @@ mod tests {
     use ratatui::widgets::Widget as _;
 
     use super::*;
+    use banto_core::codex_queue::QueueRun;
 
     /// A Codex that is not there: what every test of the emporium that is not
     /// about the catalog gets, so none of them can run the real one.
@@ -5206,6 +5248,33 @@ mod tests {
     impl CodexCatalogSource for NoCatalog {
         fn bundled_catalog(&self, _binary: &str) -> Result<String, String> {
             Err("no Codex in tests".to_string())
+        }
+    }
+
+    /// A `codex queue` that is not there: no test of the emporium can run the
+    /// real one.
+    struct NoQueue;
+
+    impl CodexQueueSender for NoQueue {
+        fn queue(&self, _: &str, _: &str, _: &str) -> Result<QueueRun, String> {
+            Err("no Codex in tests".to_string())
+        }
+    }
+
+    /// A `codex queue` that answers from a script and records what it was asked.
+    struct ScriptedQueue {
+        answer: Result<QueueRun, String>,
+        asked: RefCell<Vec<(String, String, String)>>,
+    }
+
+    impl CodexQueueSender for ScriptedQueue {
+        fn queue(&self, binary: &str, thread: &str, message: &str) -> Result<QueueRun, String> {
+            self.asked.borrow_mut().push((
+                binary.to_string(),
+                thread.to_string(),
+                message.to_string(),
+            ));
+            self.answer.clone()
         }
     }
 
@@ -10650,6 +10719,7 @@ mod tests {
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
             codex_catalog: &NoCatalog,
+            codex_queue: &NoQueue,
             child: None,
             exe: crate::exe::test_support::current(),
         };
@@ -10718,6 +10788,7 @@ mod tests {
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
             codex_catalog: &NoCatalog,
+            codex_queue: &NoQueue,
             child: None,
             exe: crate::exe::test_support::current(),
         };
@@ -10770,6 +10841,7 @@ mod tests {
                 agent_binaries: &agent_binaries,
                 enabled_agents: &enabled_agents,
                 codex_catalog: &NoCatalog,
+                codex_queue: &NoQueue,
                 child: None,
                 exe: crate::exe::test_support::current(),
             };
@@ -11029,6 +11101,7 @@ mod tests {
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
             codex_catalog: &NoCatalog,
+            codex_queue: &NoQueue,
             child: None,
             exe: crate::exe::test_support::current(),
         };
@@ -11051,10 +11124,10 @@ mod tests {
     fn write_pty_against_a_key_with_no_live_handle_reports_it_instead_of_vanishing() {
         // The regression this pins: before `Event::PtyWriteDropped` existed,
         // this branch returned `Vec::new()` — a `Cmd::WritePty` whose
-        // target had already been renamed or closed (the exact shape of
-        // the Goinkyo kickoff bug `pending_goinkyo_kickoffs`'s own rename
-        // fix addresses) simply vanished, with nothing left to say a write
-        // was ever attempted.
+        // target had already been renamed or closed (the shape of a line
+        // once queued for a Goinkyo that was renamed before it was written)
+        // simply vanished, with nothing left to say a write was ever
+        // attempted.
         let key = SessionKey::from_id("gone");
         let mut handles = HashMap::new();
         let mut discovery = Vec::new();
@@ -11079,6 +11152,7 @@ mod tests {
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
             codex_catalog: &NoCatalog,
+            codex_queue: &NoQueue,
             child: None,
             exe: crate::exe::test_support::current(),
         };
@@ -11709,8 +11783,8 @@ mod tests {
     #[test]
     fn a_codex_worker_is_identified_however_long_after_spawn() {
         // The hook records the session id when the first turn happens — which may
-        // be long after spawn (the kickoff held behind a trust prompt, or the
-        // operator typing the first turn themselves) — so no amount of waiting
+        // be long after spawn (the first prompt held behind a trust prompt, or
+        // the operator typing the first turn themselves) — so no amount of waiting
         // without it drops the tracker.
         let mut store = Store::open_in_memory().unwrap();
         let brigade_id = store.create_brigade("cell").unwrap();
@@ -14194,6 +14268,7 @@ mod tests {
             RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14210,6 +14285,7 @@ mod tests {
             RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap()
         .argv("codex");
@@ -14237,12 +14313,63 @@ mod tests {
             RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap()
         .argv("codex");
         assert_eq!(&argv[..3], ["codex", "-m", "gpt-6.1-terra"]);
         assert!(argv.contains(&"model_reasoning_effort=\"high\"".to_string()));
         assert!(!argv.contains(&"resume".to_string()));
+    }
+
+    #[test]
+    fn build_open_launch_carries_a_first_prompt_into_a_creation_and_not_into_a_resume() {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+            let binary = if agent == AgentKind::Codex {
+                "codex"
+            } else {
+                "claude"
+            };
+            let mut fresh = open_target("");
+            fresh.agent = agent;
+            let created = build_open_launch(
+                &fresh,
+                None,
+                None,
+                RoleFlags::default(),
+                None,
+                &test_ctx(&probe, &[]),
+                Some("the first prompt"),
+            )
+            .unwrap()
+            .argv(binary);
+            assert_eq!(
+                created.last().map(String::as_str),
+                Some("the first prompt"),
+                "{agent:?}: {created:?}"
+            );
+
+            let mut known = open_target("sess-1");
+            known.agent = agent;
+            let resumed = build_open_launch(
+                &known,
+                None,
+                None,
+                RoleFlags::default(),
+                None,
+                &test_ctx(&probe, &[]),
+                Some("the first prompt"),
+            )
+            .unwrap()
+            .argv(binary);
+            assert!(
+                !resumed.iter().any(|arg| arg == "the first prompt"),
+                "{agent:?}: {resumed:?}"
+            );
+        }
     }
 
     #[test]
@@ -14257,6 +14384,7 @@ mod tests {
             RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14271,6 +14399,7 @@ mod tests {
             RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14294,6 +14423,7 @@ mod tests {
             },
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14317,6 +14447,7 @@ mod tests {
             RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14342,6 +14473,7 @@ mod tests {
             },
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14370,6 +14502,7 @@ mod tests {
             },
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14399,6 +14532,7 @@ mod tests {
             RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14419,6 +14553,7 @@ mod tests {
             RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14451,6 +14586,7 @@ mod tests {
                 RoleFlags::default(),
                 None,
                 &test_ctx(&probe, &live),
+                None,
             )
             .is_none()
         );
@@ -14482,6 +14618,7 @@ mod tests {
                 RoleFlags::default(),
                 None,
                 &test_ctx(&probe, &live),
+                None,
             )
             .is_some()
         );
@@ -14617,6 +14754,7 @@ mod tests {
             // module doc), never through argv at all.
             Some("you are the Director"),
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14659,6 +14797,7 @@ mod tests {
             },
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert!(
@@ -14684,6 +14823,7 @@ mod tests {
             RoleFlags::default(),
             Some("you are the Director"),
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14705,6 +14845,7 @@ mod tests {
             RoleFlags::default(),
             Some("you are the Director"),
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14732,6 +14873,7 @@ mod tests {
             RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
+            None,
         )
         .unwrap();
         match launch {
@@ -14877,6 +15019,7 @@ mod tests {
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
             codex_catalog: &NoCatalog,
+            codex_queue: &NoQueue,
             child: None,
             exe: crate::exe::test_support::current(),
         };
@@ -14956,6 +15099,7 @@ mod tests {
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
             codex_catalog: &NoCatalog,
+            codex_queue: &NoQueue,
             child: None,
             exe: crate::exe::test_support::current(),
         };
@@ -16344,6 +16488,7 @@ mod tests {
                 agent_binaries: &self.agent_binaries,
                 enabled_agents: &self.enabled_agents,
                 codex_catalog: &NoCatalog,
+                codex_queue: &NoQueue,
                 child: None,
                 exe: crate::exe::test_support::current(),
             }
@@ -16373,6 +16518,7 @@ mod tests {
             permission_mode: None,
             disallowed_tools: None,
             autocompact: None,
+            first_prompt: None,
         }
     }
 
@@ -16734,6 +16880,7 @@ mod tests {
             permission_mode,
             disallowed_tools,
             autocompact: autocompact.map(str::to_string),
+            first_prompt: None,
         }
     }
 
@@ -16835,6 +16982,7 @@ mod tests {
                 },
                 None,
                 &test_ctx(&probe, &[]),
+                None,
             )
             .unwrap();
             assert!(
@@ -16871,6 +17019,7 @@ mod tests {
             permission_mode,
             disallowed_tools,
             autocompact,
+            first_prompt: None,
         }
     }
 
@@ -17032,6 +17181,7 @@ mod tests {
                     permission_mode,
                     disallowed_tools,
                     autocompact,
+                    first_prompt: None,
                 },
                 &deps,
                 &mut HashMap::new(),
@@ -17106,6 +17256,7 @@ mod tests {
                     permission_mode,
                     disallowed_tools,
                     autocompact,
+                    first_prompt: None,
                 },
                 &deps,
                 &mut HashMap::new(),
@@ -17564,6 +17715,152 @@ mod tests {
                     .collect::<Vec<_>>()
             ]
         );
+    }
+
+    fn run_of(exit_code: Option<i32>, stdout: &str, stderr: &str) -> QueueRun {
+        QueueRun {
+            exit_code,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            timed_out: false,
+        }
+    }
+
+    /// Runs one `Cmd::QueueCodexMessage` against `queue` and returns the one
+    /// event it answers with.
+    fn queue_once(queue: &ScriptedQueue, binaries: &AgentBinaries) -> Event {
+        let fixture = SpawnFixture::new(PathBuf::from("/nonexistent"));
+        let mut events = execute_cmd(
+            Cmd::QueueCodexMessage {
+                key: SessionKey::from_id("thread-9"),
+                session_id: "thread-9".to_string(),
+                message: "first line
+second line"
+                    .to_string(),
+            },
+            &Deps {
+                codex_queue: queue,
+                agent_binaries: binaries,
+                ..fixture.deps()
+            },
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(events.len(), 1, "one answer per request: {events:?}");
+        events.remove(0)
+    }
+
+    #[test]
+    fn queueing_a_codex_message_asks_the_binary_a_launch_would_use_and_answers_with_the_ids_codex_named()
+     {
+        let queue = ScriptedQueue {
+            answer: Ok(run_of(
+                Some(0),
+                "Queued message m-1 for thread thread-9.
+",
+                "",
+            )),
+            asked: RefCell::new(Vec::new()),
+        };
+        let event = queue_once(&queue, &AgentBinaries::default());
+        assert_eq!(
+            event,
+            Event::CodexMessageQueued {
+                key: SessionKey::from_id("thread-9"),
+                session_id: "thread-9".to_string(),
+                result: CodexQueueResult::Queued {
+                    message_id: "m-1".to_string(),
+                    thread_id: "thread-9".to_string(),
+                },
+            }
+        );
+        assert_eq!(
+            *queue.asked.borrow(),
+            [(
+                "codex".to_string(),
+                "thread-9".to_string(),
+                "first line
+second line"
+                    .to_string()
+            )],
+            "the bare name by default, the message whole"
+        );
+
+        // The operator's own `[agent_binaries]` entry, as for a launch.
+        let binaries = AgentBinaries {
+            claude: None,
+            codex: Some(PathBuf::from("C:/tools/codex.exe")),
+        };
+        let queue = ScriptedQueue {
+            answer: Ok(run_of(
+                Some(0),
+                "Queued message m-2 for thread thread-9.",
+                "",
+            )),
+            asked: RefCell::new(Vec::new()),
+        };
+        queue_once(&queue, &binaries);
+        assert_eq!(queue.asked.borrow()[0].0, "C:/tools/codex.exe");
+    }
+
+    #[test]
+    fn a_refused_codex_queue_answers_with_the_exit_code_and_what_it_said() {
+        let queue = ScriptedQueue {
+            answer: Ok(run_of(
+                Some(1),
+                "",
+                "Error: failed to queue session message: no rollout found for thread id thread-9
+",
+            )),
+            asked: RefCell::new(Vec::new()),
+        };
+        match queue_once(&queue, &AgentBinaries::default()) {
+            Event::CodexMessageQueued {
+                result:
+                    CodexQueueResult::Failed {
+                        exit_code: Some(1),
+                        summary,
+                    },
+                ..
+            } => assert!(summary.contains("no rollout found"), "{summary}"),
+            other => panic!("expected a failure carrying the reason, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_codex_that_cannot_be_started_answers_not_launched_and_one_that_prints_something_else_says_so()
+     {
+        let missing = ScriptedQueue {
+            answer: Err("could not run codex: not found".to_string()),
+            asked: RefCell::new(Vec::new()),
+        };
+        assert_eq!(
+            queue_once(&missing, &AgentBinaries::default()),
+            Event::CodexMessageQueued {
+                key: SessionKey::from_id("thread-9"),
+                session_id: "thread-9".to_string(),
+                result: CodexQueueResult::NotLaunched {
+                    reason: "could not run codex: not found".to_string()
+                },
+            }
+        );
+
+        let odd = ScriptedQueue {
+            answer: Ok(run_of(
+                Some(0),
+                "ok, noted
+",
+                "",
+            )),
+            asked: RefCell::new(Vec::new()),
+        };
+        assert!(matches!(
+            queue_once(&odd, &AgentBinaries::default()),
+            Event::CodexMessageQueued {
+                result: CodexQueueResult::UnexpectedOutput { .. },
+                ..
+            }
+        ));
     }
 
     // --- sweeping the data directory --------------------------------------

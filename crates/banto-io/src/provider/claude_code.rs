@@ -563,7 +563,7 @@ fn extract_head_fields(head: &str) -> HeadFields {
 /// (`<command-name>/clear</command-name>...`); a command that prints something
 /// adds a `<local-command-stdout>` one. Read as the first user message they gave
 /// the list a title of `<local-command-caveat...`, and made a Goinkyo whose
-/// operator had run `/clear` before its kickoff look as if it had been spoken to.
+/// operator had run `/clear` before its first prompt look as if it had been spoken to.
 fn is_local_command_record(record: &Value) -> bool {
     record.get("isMeta").and_then(Value::as_bool) == Some(true)
 }

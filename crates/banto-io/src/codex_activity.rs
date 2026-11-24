@@ -187,6 +187,12 @@ fn rollout_path_for(codex_home: &CodexHome, session_id: &str) -> Option<PathBuf>
 /// a real `task_complete`) does not shadow it, since this scans backward
 /// for the marker specifically rather than trusting the literal last line.
 fn tail_turn_marker(path: &Path) -> Option<TurnMarker> {
+    tail_find(path, last_turn_marker_in)
+}
+
+/// The growing-window tail read [`tail_turn_marker`] describes, for any scan of
+/// the tail that either finds its answer in a window or says to widen it.
+fn tail_find<T>(path: &Path, scan: fn(&[u8], bool) -> Option<T>) -> Option<T> {
     let mut file = File::open(path).ok()?;
     let size = file.metadata().ok()?.len();
     let mut window = TAIL_START_BYTES;
@@ -195,8 +201,8 @@ fn tail_turn_marker(path: &Path) -> Option<TurnMarker> {
         file.seek(SeekFrom::Start(size - read_size)).ok()?;
         let mut buf = vec![0u8; read_size as usize];
         file.read_exact(&mut buf).ok()?;
-        if let Some(marker) = last_turn_marker_in(&buf, read_size < size) {
-            return Some(marker);
+        if let Some(found) = scan(&buf, read_size < size) {
+            return Some(found);
         }
         if read_size >= size || window >= TAIL_MAX_BYTES {
             return None;

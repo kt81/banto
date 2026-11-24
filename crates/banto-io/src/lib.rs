@@ -11,6 +11,7 @@
 //! - [`codex_catalog`] the model catalog compiled into the installed Codex (`codex debug models --bundled`)
 //! - [`codex_home`] the root the Codex CLI stores its state under: threads/logs db, rollout tree
 //! - [`codex_liveness`] Codex session liveness via `logs_2.sqlite` (the Codex-side double-resume guard)
+//! - [`codex_queue`] `codex queue`, which puts a message on a Codex session's queue without typing it into the pane
 //! - [`codex_trust`] advisory-only read of whether Codex has trusted banto's own SessionStart hook
 //! - [`data_dir`] banto's own data directory: where the database, MCP configs, consultation
 //!   requests and message logs live, and the sweep of working files nobody owns any more
@@ -35,6 +36,7 @@ pub mod codex_briefing;
 pub mod codex_catalog;
 pub mod codex_home;
 pub mod codex_liveness;
+pub mod codex_queue;
 pub mod codex_trust;
 pub mod config;
 pub mod data_dir;

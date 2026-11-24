@@ -216,6 +216,7 @@ pub fn event_name(ev: &Event) -> &'static str {
         Event::StartupNotices { .. } => "StartupNotices",
         Event::CodexTrustChecked { .. } => "CodexTrustChecked",
         Event::CodexCatalogRead { .. } => "CodexCatalogRead",
+        Event::CodexMessageQueued { .. } => "CodexMessageQueued",
         Event::BrigadeFormed { .. } => "BrigadeFormed",
         Event::WorkerAdded { .. } => "WorkerAdded",
         Event::Disbanded { .. } => "Disbanded",
@@ -260,6 +261,7 @@ pub fn pane_facts_key(ev: &Event) -> Option<&SessionKey> {
         | Event::StartupNotices { .. }
         | Event::CodexTrustChecked { .. }
         | Event::CodexCatalogRead { .. }
+        | Event::CodexMessageQueued { .. }
         | Event::BrigadeFormed { .. }
         | Event::WorkerAdded { .. }
         | Event::Disbanded { .. }
@@ -441,6 +443,7 @@ pub fn event_lines(ev: &Event, facts: &PaneFacts) -> Vec<Line> {
         | Event::StartupNotices { .. }
         | Event::CodexTrustChecked { .. }
         | Event::CodexCatalogRead { .. }
+        | Event::CodexMessageQueued { .. }
         | Event::MemberSessionRecorded { .. }
         | Event::Tick { .. }
         | Event::QuiescenceSampled { .. }
@@ -467,6 +470,7 @@ pub fn cmd_handle_key(cmd: &Cmd) -> Option<&SessionKey> {
         | Cmd::CheckNewSessionCwd { .. }
         | Cmd::CheckCodexTrust
         | Cmd::ReadCodexCatalog { .. }
+        | Cmd::QueueCodexMessage { .. }
         | Cmd::SweepDataDir
         | Cmd::ForwardClipboardToHost { .. }
         | Cmd::RingHostBell { .. }
@@ -492,6 +496,7 @@ pub fn is_logged_cmd(cmd: &Cmd) -> bool {
         | Cmd::CheckNewSessionCwd { .. }
         | Cmd::CheckCodexTrust
         | Cmd::ReadCodexCatalog { .. }
+        | Cmd::QueueCodexMessage { .. }
         | Cmd::SweepDataDir
         | Cmd::ForwardClipboardToHost { .. }
         | Cmd::RingHostBell { .. }
@@ -562,6 +567,7 @@ pub fn cmd_line(cmd: &Cmd, by: &'static str, facts: CmdFacts) -> Option<Line> {
         | Cmd::CheckNewSessionCwd { .. }
         | Cmd::CheckCodexTrust
         | Cmd::ReadCodexCatalog { .. }
+        | Cmd::QueueCodexMessage { .. }
         | Cmd::SweepDataDir
         | Cmd::ForwardClipboardToHost { .. }
         | Cmd::RingHostBell { .. }

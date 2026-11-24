@@ -1,7 +1,7 @@
 //! What a consultation is called, in one place. Pure.
 //!
-//! A Goinkyo's session would otherwise be listed under banto's own kickoff
-//! sentence, or Claude's generated title, which is the same for every
+//! A Goinkyo's session would otherwise be listed under banto's own first
+//! prompt, or Claude's generated title, which is the same for every
 //! consultation. The Director that files one gives it a short title
 //! (`consult_goinkyo`'s `title`), and the list shows that, behind a fixed label,
 //! once the consultation has ended. The rule for the title is here so that the

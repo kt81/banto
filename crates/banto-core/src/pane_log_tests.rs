@@ -148,6 +148,7 @@ fn every_text_carrying_variant_leaves_its_marker_out() {
         permission_mode: Some(MARKER.to_string()),
         disallowed_tools: Some(MARKER.to_string()),
         autocompact: Some(MARKER.to_string()),
+        first_prompt: None,
     };
     let cmds = vec![
         open,

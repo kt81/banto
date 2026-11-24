@@ -19,9 +19,9 @@
 //! Codex Worker and a Goinkyo, and that failed both ways: Claude never records
 //! trust for the home directory, and Codex was seen to write no trust key outside a
 //! git repository, so an already-trusted pane waited for ever, while a stale
-//! `true` typed into a screen that was not a prompt. Those kickoffs now ask the
-//! pane (the agent's own report and the painted input line, DISCIPLINE.md §3)
-//! and do not read this registry. A registry like this is internal state banto
+//! `true` typed into a screen that was not a prompt. That first line is now a
+//! command-line argument, which waits for nothing, so this registry gates no
+//! keystroke. A registry like this is internal state banto
 //! reads over the product's shoulder, not an API: it can say nothing about the
 //! pane in front of the operator, so nothing may type on its word.
 //!

@@ -426,7 +426,6 @@ fn an_answer_that_is_no_member_to_dismiss_says_so_instead_of_doing_nothing() {
 fn a_worker_that_never_spoke_leaves_the_brigade_when_it_ends_on_its_own() {
     // No session row for w1: nothing to resume.
     let (mut state, mut app) = brigade(&[]);
-    state.pending_kickoffs.clear();
     let t = now();
 
     let cmds = without_resizes(exits(&mut state, &mut app, "w1", t));

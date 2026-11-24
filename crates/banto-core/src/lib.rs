@@ -8,6 +8,8 @@
 //! - [`input`]  pure key/mouse/paste/resize event types (no terminal backend)
 //! - [`codex_model`] resolving a Codex model family word to a catalog slug (the
 //!   catalog itself is read by `banto_io::codex_catalog`)
+//! - [`codex_queue`] reading what `codex queue` answered into the outcomes the engine can act on (the process is
+//!   run by `banto_io::codex_queue`)
 //! - [`config`] config.toml's types (loading them from disk is `banto_io::config`)
 //! - [`status`] activity age-bucketing math (live-process state is `banto_io::status`)
 //! - [`search`] nucleo fuzzy search
@@ -26,6 +28,7 @@
 
 pub mod app;
 pub mod codex_model;
+pub mod codex_queue;
 pub mod config;
 pub mod consultation;
 pub mod display_text;

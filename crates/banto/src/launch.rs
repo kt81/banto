@@ -137,6 +137,12 @@ pub(crate) enum AgentLaunch {
         autocompact: Option<String>,
         append_system_prompt: Option<String>,
         mcp_config: Option<PathBuf>,
+        /// The positional prompt of `claude [flags] -- "<prompt>"`: the first
+        /// user message of a session being created, which starts its first turn
+        /// with no key typed. Rendered only for a [`SessionStart::Create`], and
+        /// last, past a `--` that follows every flag; a resume never carries
+        /// one, whatever is set here.
+        first_prompt: Option<String>,
     },
     /// Codex takes its working directory as `-C <dir>` in argv itself
     /// (measured against Codex 0.145: unlike Claude, which only ever gets a
@@ -161,6 +167,10 @@ pub(crate) enum AgentLaunch {
         /// `Some` adds the `-c` overrides that make this launch a brigade
         /// member — see [`CodexBrigade`].
         brigade: Option<CodexBrigade>,
+        /// The positional prompt of `codex [flags] "<prompt>"`, as
+        /// [`Self::Claude`]'s `first_prompt`: rendered for a
+        /// [`SessionStart::Create`] only.
+        first_prompt: Option<String>,
     },
 }
 
@@ -520,6 +530,7 @@ impl AgentLaunch {
                 autocompact,
                 append_system_prompt,
                 mcp_config,
+                first_prompt,
             } => {
                 match start {
                     SessionStart::Resume(id) => {
@@ -561,12 +572,24 @@ impl AgentLaunch {
                     argv.push("--mcp-config".to_string());
                     argv.push(path.to_string_lossy().into_owned());
                 }
+                // `--mcp-config` and `--disallowedTools` take a variable number
+                // of values, so a prompt right behind them is read as one more
+                // of those: measured, `claude` exits 1 with "was read as a value
+                // of --mcp-config, not as a prompt · put a prompt before
+                // --mcp-config or after --". `--` after every flag works (and so
+                // does a prompt placed first), so this must stay the last thing
+                // pushed.
+                if let (SessionStart::Create { .. }, Some(prompt)) = (start, first_prompt) {
+                    argv.push("--".to_string());
+                    argv.push(prompt.clone());
+                }
             }
             AgentLaunch::Codex {
                 start,
                 cwd,
                 autocompact,
                 brigade,
+                first_prompt,
             } => {
                 let mut effort_override = None;
                 match start {
@@ -607,6 +630,14 @@ impl AgentLaunch {
                 }
                 argv.push("-C".to_string());
                 argv.push(cwd.to_string_lossy().into_owned());
+                // After `-C <cwd>`, whose one value cannot take it. Measured:
+                // Codex reads it as the first prompt, it survives the first-run
+                // dialogs (folder trust, hook trust) and runs once they are
+                // answered, and banto's SessionStart hook fires on that turn
+                // as on any other.
+                if let (SessionStart::Create { .. }, Some(prompt)) = (start, first_prompt) {
+                    argv.push(prompt.clone());
+                }
             }
         }
         argv
@@ -777,6 +808,7 @@ mod tests {
             autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
+            first_prompt: None,
         }
     }
 
@@ -800,6 +832,7 @@ mod tests {
             autocompact: None,
             append_system_prompt: None,
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-worker-1.json")),
+            first_prompt: None,
         };
         assert_eq!(
             launch.argv("claude"),
@@ -824,6 +857,7 @@ mod tests {
             autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
+            first_prompt: None,
         };
         assert_eq!(
             launch.argv("claude"),
@@ -840,6 +874,7 @@ mod tests {
             autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
+            first_prompt: None,
         };
         assert_eq!(
             no_effort.argv("claude"),
@@ -859,6 +894,7 @@ mod tests {
             autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
+            first_prompt: None,
         };
         assert_eq!(
             launch.argv("claude"),
@@ -884,6 +920,7 @@ mod tests {
             autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
+            first_prompt: None,
         };
         assert_eq!(
             no_permission_mode.argv("claude"),
@@ -900,6 +937,7 @@ mod tests {
             autocompact: Some("250000".to_string()),
             append_system_prompt: Some("you are a Worker".to_string()),
             mcp_config: Some(PathBuf::from("/tmp/mcp.json")),
+            first_prompt: None,
         };
         assert_eq!(
             launch.argv("claude"),
@@ -930,6 +968,7 @@ mod tests {
             autocompact: Some("auto".to_string()),
             append_system_prompt: None,
             mcp_config: None,
+            first_prompt: None,
         };
         assert_eq!(
             create.argv("claude"),
@@ -946,6 +985,7 @@ mod tests {
             autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
+            first_prompt: None,
         };
         assert_eq!(
             launch.argv("claude"),
@@ -965,6 +1005,7 @@ mod tests {
             autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
+            first_prompt: None,
         };
         assert_eq!(
             launch.argv("claude"),
@@ -992,6 +1033,7 @@ mod tests {
             autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
+            first_prompt: None,
         };
         assert_eq!(
             no_disallowed_tools.argv("claude"),
@@ -1016,6 +1058,7 @@ mod tests {
             autocompact: None,
             append_system_prompt: Some("you are the Director".to_string()),
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-director.json")),
+            first_prompt: None,
         }
     }
 
@@ -1128,6 +1171,7 @@ mod tests {
             autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
+            first_prompt: None,
         };
         assert_eq!(
             no_briefing.argv_with_snapshot_off("claude", true),
@@ -1138,6 +1182,7 @@ mod tests {
             cwd: PathBuf::from("/work/alpha"),
             autocompact: None,
             brigade: None,
+            first_prompt: None,
         };
         assert_eq!(
             codex.argv_with_snapshot_off("codex", true),
@@ -1160,6 +1205,7 @@ mod tests {
                 cwd: PathBuf::from("/work/alpha"),
                 autocompact: Some("250000".to_string()),
                 brigade: None,
+                first_prompt: None,
             }
             .argv("codex");
             let at = argv
@@ -1195,6 +1241,7 @@ mod tests {
                 session: Some("codex-uuid-1".to_string()),
                 child_args: Vec::new(),
             }),
+            first_prompt: None,
         };
         let argv = launch.argv("codex");
         let limit = argv
@@ -1215,6 +1262,7 @@ mod tests {
             cwd: PathBuf::from("/work/alpha"),
             autocompact: None,
             brigade: None,
+            first_prompt: None,
         }
         .argv("codex");
         assert!(
@@ -1233,6 +1281,7 @@ mod tests {
             cwd: PathBuf::from("/work/alpha"),
             autocompact: None,
             brigade: None,
+            first_prompt: None,
         };
         assert_eq!(
             launch.argv("codex"),
@@ -1258,6 +1307,7 @@ mod tests {
             cwd: PathBuf::from("/work/alpha"),
             autocompact: None,
             brigade: None,
+            first_prompt: None,
         };
         let argv = launch.argv("codex");
         assert_eq!(
@@ -1297,6 +1347,7 @@ mod tests {
             cwd: PathBuf::from("/work/alpha"),
             autocompact: None,
             brigade: None,
+            first_prompt: None,
         };
         assert_eq!(
             launch.argv("codex"),
@@ -1337,6 +1388,7 @@ mod tests {
                 session: None,
                 child_args: Vec::new(),
             }),
+            first_prompt: None,
         };
         let argv = launch.argv("codex");
         let effort_at = argv
@@ -1362,6 +1414,7 @@ mod tests {
             cwd: PathBuf::from("/work/alpha"),
             autocompact: None,
             brigade: None,
+            first_prompt: None,
         };
         let quoted = launch(Some("hi\"gh")).argv("codex");
         assert!(quoted.contains(&"model_reasoning_effort=\"hi\\\"gh\"".to_string()));
@@ -1391,6 +1444,7 @@ mod tests {
                 session: None,
                 child_args: Vec::new(),
             }),
+            first_prompt: None,
         };
         assert_eq!(
             launch.argv("codex"),
@@ -1437,6 +1491,7 @@ mod tests {
                 session: None,
                 child_args: Vec::new(),
             }),
+            first_prompt: None,
         };
         let argv = launch.argv("codex");
         for expected in [
@@ -1465,6 +1520,7 @@ mod tests {
                 session: None,
                 child_args: Vec::new(),
             }),
+            first_prompt: None,
         }
     }
 
@@ -1523,6 +1579,7 @@ mod tests {
             cwd: PathBuf::from("/work/alpha"),
             autocompact: None,
             brigade: None,
+            first_prompt: None,
         }
         .argv("codex");
         assert_eq!(read_only_and_never(&plain), (false, false));
@@ -1539,6 +1596,7 @@ mod tests {
             cwd: PathBuf::from("/work/alpha"),
             autocompact: None,
             brigade: None,
+            first_prompt: None,
         };
         let argv = launch.argv("codex");
         assert_eq!(
@@ -1698,6 +1756,7 @@ mod tests {
             cwd: PathBuf::from("/work/alpha"),
             autocompact: None,
             brigade: None,
+            first_prompt: None,
         };
         let argv = launch.argv(&agent_binary(AgentKind::Codex, &binaries));
         // The configured Codex binary, not the bare "codex" default.
@@ -1757,5 +1816,86 @@ mod tests {
             args[5..],
             ["--brigade", "1", "--member", "worker-1", "--role", "worker"]
         );
+    }
+
+    // --- first_prompt -------------------------------------------------------
+
+    const FIRST_PROMPT: &str = "[banto] This pane just started as a brigade member.";
+
+    fn claude_with_prompt(start: SessionStart, prompt: Option<&str>) -> AgentLaunch {
+        AgentLaunch::Claude {
+            start,
+            permission_mode: Some("auto".to_string()),
+            disallowed_tools: Some("Bash,Edit".to_string()),
+            autocompact: None,
+            append_system_prompt: Some("brief".to_string()),
+            mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-goinkyo.json")),
+            first_prompt: prompt.map(str::to_string),
+        }
+    }
+
+    /// Measured on a real `claude` with the real argv shape: a prompt straight
+    /// after `--mcp-config <path>` is refused ("was read as a value of
+    /// --mcp-config, not as a prompt"), while `--` after every flag starts the
+    /// first turn with exactly that text.
+    #[test]
+    fn a_created_claude_session_gets_its_first_prompt_after_a_double_dash_behind_every_flag() {
+        let argv = claude_with_prompt(create(), Some(FIRST_PROMPT)).argv("claude");
+        assert_eq!(&argv[argv.len() - 2..], ["--", FIRST_PROMPT]);
+        // Nothing else moved: the flags the prompt must not be mistaken for
+        // a value of still come before it.
+        let config = argv.iter().position(|arg| arg == "--mcp-config").unwrap();
+        assert_eq!(argv[config + 1], "C:/data/banto/mcp/1-goinkyo.json");
+        assert_eq!(config + 2, argv.len() - 2);
+    }
+
+    #[test]
+    fn a_resumed_claude_session_never_gets_a_first_prompt() {
+        let resume = SessionStart::Resume("sess-1".to_string());
+        let with = claude_with_prompt(resume.clone(), Some(FIRST_PROMPT)).argv("claude");
+        let without = claude_with_prompt(resume, None).argv("claude");
+        assert_eq!(with, without);
+        assert!(!with.iter().any(|arg| arg == "--" || arg == FIRST_PROMPT));
+    }
+
+    #[test]
+    fn a_created_claude_session_without_a_first_prompt_has_no_double_dash() {
+        let argv = claude_with_prompt(create(), None).argv("claude");
+        assert!(!argv.iter().any(|arg| arg == "--"));
+    }
+
+    #[test]
+    fn a_created_codex_session_gets_its_first_prompt_last_after_its_directory() {
+        let mut launch = codex_member_launch(create(), BrigadeRole::Worker);
+        let AgentLaunch::Codex { first_prompt, .. } = &mut launch else {
+            unreachable!();
+        };
+        *first_prompt = Some(FIRST_PROMPT.to_string());
+        let argv = launch.argv("codex");
+        assert_eq!(&argv[argv.len() - 3..], ["-C", "/work/alpha", FIRST_PROMPT]);
+    }
+
+    #[test]
+    fn a_created_codex_goinkyo_keeps_its_read_only_policy_before_the_prompt() {
+        let mut launch = codex_member_launch(create(), BrigadeRole::Goinkyo);
+        let AgentLaunch::Codex { first_prompt, .. } = &mut launch else {
+            unreachable!();
+        };
+        *first_prompt = Some(FIRST_PROMPT.to_string());
+        let argv = launch.argv("codex");
+        assert_eq!(&argv[argv.len() - 3..], ["-C", "/work/alpha", FIRST_PROMPT]);
+        assert_eq!(read_only_and_never(&argv), (true, true), "{argv:?}");
+    }
+
+    #[test]
+    fn a_resumed_codex_session_never_gets_a_first_prompt() {
+        let resume = SessionStart::Resume("sess-1".to_string());
+        let mut with = codex_member_launch(resume.clone(), BrigadeRole::Worker);
+        let AgentLaunch::Codex { first_prompt, .. } = &mut with else {
+            unreachable!();
+        };
+        *first_prompt = Some(FIRST_PROMPT.to_string());
+        let without = codex_member_launch(resume, BrigadeRole::Worker);
+        assert_eq!(with.argv("codex"), without.argv("codex"));
     }
 }

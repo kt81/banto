@@ -71,7 +71,7 @@ pub enum InterruptState {
 /// `brigade_id` — only the one named by `token` when given, every one when not —
 /// inside the transaction that deletes it. A dismissed consultation's session
 /// would otherwise return to the list as an ordinary row titled with banto's own
-/// kickoff sentence, and the operator's standing instruction (2026-11-20) is that
+/// first prompt, and the operator's standing instruction (2026-11-20) is that
 /// banto buries those itself; `D` restores any one of them.
 ///
 /// The role and the id are read from the row, here, in the transaction: the

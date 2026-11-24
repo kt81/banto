@@ -753,6 +753,13 @@ fn closing_drops_the_queued_and_counted_state_of_its_panes_and_only_theirs() {
     let other = host(&mut state, "other", "worker-1", 2);
     let t = now();
     for pane in [key("w1"), other.clone()] {
+        state.first_turn_watch.insert(
+            pane.clone(),
+            FirstTurnWatch {
+                agent: AgentKind::Codex,
+                told: false,
+            },
+        );
         state.pending_submits.push(PendingSubmit {
             key: pane,
             nudged_at: t,
@@ -796,8 +803,13 @@ fn closing_drops_the_queued_and_counted_state_of_its_panes_and_only_theirs() {
             .iter()
             .map(|pending| pending.key.clone())
             .collect::<Vec<_>>(),
-        vec![other],
+        vec![other.clone()],
         "a nudge's delayed Enter would be written into a dead pane"
+    );
+    assert_eq!(
+        state.first_turn_watch.keys().cloned().collect::<Vec<_>>(),
+        vec![other],
+        "a pane that is gone cannot take its first turn, and its watch would hold the relay and tell the operator about it"
     );
     assert!(state.codex_opens_awaiting_catalog.is_empty());
     for map in [&state.prompt_held_since, &state.unreadable_since] {
@@ -837,7 +849,7 @@ fn a_spawn_reported_after_the_close_is_ended_at_once_and_holds_the_brigade_closi
         worker.clone(),
         PendingOpen::BrigadeMember {
             brigade_id: 1,
-            needs_codex_kickoff: false,
+            first_turn: None,
         },
     );
     let director = key("dir-new");

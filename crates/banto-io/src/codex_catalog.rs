@@ -63,7 +63,11 @@ impl CodexCatalogSource for CodexCli {
 /// Codex installed by npm is `codex.cmd`, which a bare `Command::new("codex")`
 /// would not find (it only adds `.exe`). Nothing found returns the name
 /// unchanged, so the spawn fails with its own message.
-fn resolve_program(name: &str, path: Option<&OsStr>, pathext: Option<&OsStr>) -> PathBuf {
+pub(crate) fn resolve_program(
+    name: &str,
+    path: Option<&OsStr>,
+    pathext: Option<&OsStr>,
+) -> PathBuf {
     let given = Path::new(name);
     if given.components().count() > 1 || given.is_absolute() {
         return given.to_path_buf();

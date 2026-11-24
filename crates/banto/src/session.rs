@@ -276,7 +276,7 @@ fn activity_from_observations(
 
 /// Names the sessions of ended consultations: each one the store holds a title
 /// for is listed as "Goinkyo: <title>" ([`consultation::list_title`]) instead of
-/// whatever the provider derived — banto's own kickoff sentence, or Claude's
+/// whatever the provider derived — banto's own first prompt, or Claude's
 /// generated title, which read alike for every consultation.
 ///
 /// Precedence is the operator's `/rename` first

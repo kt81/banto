@@ -377,7 +377,10 @@ pub fn live_activity(
 /// [`claude_nudgeable`] can answer that. The first reads `shell` (a background
 /// command after the turn ended) as [`Activity::Busy`] too, and an Esc written
 /// then would cut nothing; the second says only "not nudgeable", which `waiting`
-/// is as well. The interrupt acts on this reading and no other.
+/// is as well. The interrupt acts on this reading and no other, and so does the
+/// confirmation that a Claude Goinkyo's first prompt started a turn (the other
+/// confirmation, a first user message in its session row, is not a reading of
+/// this file).
 pub fn live_reports_busy(
     live: &[LiveSession],
     session_id: &str,

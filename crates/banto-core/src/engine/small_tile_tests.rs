@@ -398,7 +398,7 @@ fn a_held_move_ends_when_pane_arrivals_leave_the_dragged_tile_with_no_rows() {
             arriving.clone(),
             PendingOpen::BrigadeMember {
                 brigade_id: 1,
-                needs_codex_kickoff: false,
+                first_turn: None,
             },
         );
         state.screens.insert(arriving.clone(), Screen::new(24, 80));
@@ -487,7 +487,7 @@ fn a_held_resize_ends_when_pane_arrivals_leave_a_neighbour_with_no_rows() {
             arriving.clone(),
             PendingOpen::BrigadeMember {
                 brigade_id: 1,
-                needs_codex_kickoff: false,
+                first_turn: None,
             },
         );
         state.screens.insert(arriving.clone(), Screen::new(24, 80));

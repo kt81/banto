@@ -215,6 +215,51 @@ mod tests {
     }
 
     #[test]
+    fn every_outcome_of_a_codex_queue_survives_a_recording_and_replays_to_no_commands() {
+        use crate::codex_queue::CodexQueueResult;
+        let key = engine::SessionKey::from_id("thread-1");
+        let events: Vec<TimedEvent> = [
+            CodexQueueResult::Queued {
+                message_id: "m-1".to_string(),
+                thread_id: "thread-1".to_string(),
+            },
+            CodexQueueResult::Failed {
+                exit_code: Some(1),
+                summary: "no rollout found".to_string(),
+            },
+            CodexQueueResult::Failed {
+                exit_code: None,
+                summary: "timed out".to_string(),
+            },
+            CodexQueueResult::UnexpectedOutput {
+                summary: "ok".to_string(),
+            },
+            CodexQueueResult::NotLaunched {
+                reason: "no such file".to_string(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(n, result)| TimedEvent {
+            offset_ms: n as u64,
+            event: Event::CodexMessageQueued {
+                key: key.clone(),
+                session_id: "thread-1".to_string(),
+                result,
+            },
+        })
+        .collect();
+        let parsed =
+            parse_stream(&stream(&events)).expect("a freshly serialized stream must parse");
+        assert_eq!(parsed, events);
+
+        // Nothing emits the Cmd yet, so the answer changes nothing and asks for
+        // nothing.
+        let outcome = replay(&parsed, &BrigadeConfig::default(), test_instant());
+        assert!(outcome.cmds.is_empty(), "{:?}", outcome.cmds);
+    }
+
+    #[test]
     fn an_empty_input_is_a_missing_header_error() {
         assert_eq!(parse_stream(""), Err(ReplayError::MissingHeader));
     }
@@ -347,6 +392,7 @@ mod tests {
             permission_mode,
             disallowed_tools,
             autocompact,
+            first_prompt,
         } = &open_embedded[0].1
         else {
             unreachable!("just matched OpenEmbedded above");
@@ -359,6 +405,7 @@ mod tests {
         assert!(permission_mode.is_none());
         assert!(disallowed_tools.is_none());
         assert!(autocompact.is_none());
+        assert!(first_prompt.is_none());
         assert!(
             matches!(&mid.state.stage, Stage::Solo(k) if k == &expected_key),
             "expected Solo({expected_key:?}), got {:?}",

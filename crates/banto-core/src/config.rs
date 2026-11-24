@@ -328,7 +328,7 @@ pub struct ClaudeBrigadeConfig {
     /// ordinary confirmation flow after repeated denials even under `auto`,
     /// and that flow stops the same way `manual` does. This only removes
     /// one specific stop, observed live 2026-08-05 — a Goinkyo that had
-    /// just started on its own (the kickoff fix above landing) then sat
+    /// just started on its own then sat
     /// waiting for an operator who wasn't watching to approve a tool call.
     pub goinkyo_permission_mode: Option<String>,
     /// `--disallowedTools <tools>` an auto-spawned Goinkyo launches with,
