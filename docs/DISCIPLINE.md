@@ -161,12 +161,13 @@ fn update(&mut self, ev: Event, now: Instant) -> Vec<Cmd>
   there is no second mechanism.
 
 Because *all* writes to a hosted session's stdin (key forwarding, mouse
-reports, paste, and the relay nudge and its delayed Enter) become `Cmd`-shaped
+reports and paste) become `Cmd`-shaped
 data executed in one place (`Cmd::WritePty`), the single-writer invariant stops
 being a convention and becomes structure. The Director's interrupt is not among
 them: it writes nothing to a pane, and the refusal of a Worker's tool calls
 that replaced the Esc is answered by that Worker's own `_mcp` process from a
-hook, outside the core and outside the UI process's writers. Type-level
+hook, outside the core and outside the UI process's writers. Relay wakes use
+the Claude hook or the Codex queue rather than pane input. Type-level
 enforcement (guard types with private constructors) remains the tool of
 choice only for what `Cmd`s cannot express.
 

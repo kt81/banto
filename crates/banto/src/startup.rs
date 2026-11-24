@@ -115,6 +115,18 @@ impl Env {
     }
 }
 
+/// The hook waiter is handed an absolute database path and loads no config.
+pub fn wake_db_path_safe(path: &Path) -> bool {
+    if !path.is_absolute() || path.as_os_str().is_empty() {
+        return false;
+    }
+    let env = Env::from_process();
+    let cwd = std::env::current_dir().ok();
+    let claude = env.default_home("CLAUDE_CONFIG_DIR", ".claude", cwd.as_deref());
+    let codex = env.default_home("CODEX_HOME", ".codex", cwd.as_deref());
+    inside_an_agent_home(path, claude.as_deref(), codex.as_deref()).is_none()
+}
+
 /// Where an agent in a pane keeps its home. banto sets neither agent's variable
 /// and passes no flag, so the pane's agent has only these two to go by.
 #[derive(Debug, PartialEq, Eq)]

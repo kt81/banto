@@ -542,7 +542,14 @@ fn extract_head_fields(head: &str) -> HeadFields {
                     .and_then(Value::as_str)
                     .map(str::to_string);
             }
-            Some("user") if fields.user_text.is_none() && !is_local_command_record(&record) => {
+            Some("user")
+                if fields.user_text.is_none()
+                    && !is_local_command_record(&record)
+                    && match record.as_object().and_then(|obj| obj.get("origin")) {
+                        None => true,
+                        Some(origin) => origin.get("kind").and_then(Value::as_str) == Some("human"),
+                    } =>
+            {
                 fields.user_text = message_text(&record).filter(|text| !is_command_wrapper(text));
             }
             _ => {}
@@ -613,6 +620,24 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn wake_rows_do_not_become_the_first_user_message() {
+        let head = concat!(
+            "{\"type\":\"user\",\"origin\":{\"kind\":\"task-notification\"},\"message\":{\"content\":\"[banto relay] check messages\"}}\n",
+            "{\"type\":\"user\",\"origin\":null,\"message\":{\"content\":\"Not a human question\"}}\n",
+            "{\"type\":\"user\",\"origin\":{\"kind\":\"human\"},\"message\":{\"content\":\"Actual question\"}}\n"
+        );
+        assert_eq!(
+            extract_head_fields(head).user_text.as_deref(),
+            Some("Actual question")
+        );
+        let old = "{\"type\":\"user\",\"message\":{\"content\":\"Old question\"}}\n";
+        assert_eq!(
+            extract_head_fields(old).user_text.as_deref(),
+            Some("Old question")
+        );
+    }
 
     fn provider(root: &TempDir) -> ClaudeCodeProvider {
         ClaudeCodeProvider::new(ClaudeHome::new(root.path().to_path_buf()))

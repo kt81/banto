@@ -380,6 +380,9 @@ pub(super) const MIGRATIONS: &[&str] = &[
     // a subset of this one and dropping it would be a change nobody asked for.
     "CREATE INDEX brigade_messages_interrupts ON brigade_messages (brigade_id, id)
         WHERE interrupt = 1;",
+    "ALTER TABLE brigade_members ADD COLUMN wake_issued INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE brigade_members ADD COLUMN wake_received INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE brigade_members ADD COLUMN wake_waiter INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// The schema version this build migrates to and knows how to read.
@@ -458,6 +461,38 @@ mod tests {
     use super::super::{Store, StoreError};
     use super::MIGRATIONS;
     use banto_core::model::SessionId;
+
+    #[test]
+    fn v22_member_has_no_pending_wake_until_one_is_issued() {
+        use banto_core::model::BrigadeRole;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v22.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..22] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.execute_batch("PRAGMA user_version = 22;
+                INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'synthetic', 0);
+                INSERT INTO brigade_members (brigade_id, member_token, role) VALUES (1, 'worker-1', 'worker');").unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        store
+            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, None, "synthetic")
+            .unwrap();
+        assert!(!store.wake_pending(1, "worker-1").unwrap());
+        let generation = store.arm_wake(1, "worker-1").unwrap().unwrap();
+        assert_eq!(
+            store.poll_wake(1, "worker-1", generation).unwrap(),
+            Some(false)
+        );
+        store.issue_wake(1, "worker-1").unwrap();
+        assert!(store.wake_pending(1, "worker-1").unwrap());
+        assert_eq!(
+            store.poll_wake(1, "worker-1", generation).unwrap(),
+            Some(true)
+        );
+    }
 
     /// Proves the bundled rusqlite build ships the FTS5 module.
     #[test]

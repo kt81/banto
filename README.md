@@ -102,8 +102,8 @@ Each member also gets a role briefing naming its brigade, token and peers (appen
 to the system prompt for Claude Code, delivered by banto's own `SessionStart` hook
 for Codex). A relayed message is labeled as coming from another AI, never as
 operator input. banto's **auto-relay** wakes idle members with unread messages by
-typing a short fixed nudge into a Claude Code pane's stdin, or by queuing it to a
-Codex thread with `codex queue` (nothing is typed into a Codex pane), so a
+using a Claude Code wake hook, or by queuing a short fixed nudge to a Codex thread
+with `codex queue`, so a
 Director→Worker→Director round trip needs no human in between. With
 `relay = "auto"` that wake starts a turn over the member's whole context, so a
 message can cost an idle member a turn even when it asks for nothing. This
@@ -314,8 +314,8 @@ hosted. Otherwise it asks first, and a second `q`/`Esc` within 3 seconds quits,
 since quitting ends every hosted process. The status bar names each session it
 counts and why, for example `Esc again to quit — 2 not idle: レビュー (unknown), 実装
 (busy)`: `unknown` (the pane could not be read, or it is on a dialog), `input` (typed
-to in the last 3 seconds), `nudged` (only banto wrote to it in the last 3 seconds:
-a relay nudge or a first prompt, not you; a Codex member also counts while banto waits
+to in the last 3 seconds), `nudged` (a recent relay wake or first prompt; a Claude
+member also counts until its wake is received or held, and a Codex member counts while banto waits
 for the answer to its `codex queue` wake, up to 30 seconds, and through the wake's
 20-second window), `busy` (working, waiting, or a state banto can't read),
 `bg` (a Claude Code turn has ended but a background command still runs). Each session is then closed in turn and

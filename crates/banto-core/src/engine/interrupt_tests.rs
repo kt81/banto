@@ -86,6 +86,7 @@ fn claude(rig: &Rig, live: Option<LiveStatus>) -> RelayObservation {
         brigade_id: BRIGADE,
         token: WORKER.to_string(),
         key: rig.worker.clone(),
+        wake_pending: false,
         has_unseen: true,
         is_idle_this_tick: Some(false),
         agent: Some(AgentKind::ClaudeCode),
@@ -426,18 +427,16 @@ fn at_rest(rig: &Rig) -> RelayObservation {
     }
 }
 
-/// Ticks of a Worker at rest with unread mail until something is written to it,
-/// at most `limit`.
-fn writes_within(rig: &mut Rig, limit: u32) -> Vec<Vec<u8>> {
+fn wake_within(rig: &mut Rig, limit: u32) -> bool {
     for _ in 0..limit {
         let obs = at_rest(rig);
         let cmds = tick(rig, vec![obs], Vec::new());
-        let written = typed_bytes(&cmds, &rig.worker);
-        if !written.is_empty() {
-            return written;
+        assert!(typed_bytes(&cmds, &rig.worker).is_empty());
+        if cmds.iter().any(|cmd| matches!(cmd, Cmd::Store(StoreIntent::IssueWake { brigade_id, token }) if *brigade_id == BRIGADE && token == WORKER)) {
+            return true;
         }
     }
-    Vec::new()
+    false
 }
 
 #[test]
@@ -460,8 +459,7 @@ fn a_worker_whose_turn_ends_without_a_tool_call_is_woken_without_waiting_out_the
     );
     let busy = claude(&rig, running_turn());
     tick(&mut rig, vec![busy], vec![request(1)]);
-    let written = writes_within(&mut rig, 6);
-    assert_eq!(written, [RELAY_NUDGE_LINE.as_bytes().to_vec()]);
+    assert!(wake_within(&mut rig, 6));
 }
 
 // --- an interrupt that sits unread while its Worker works -----------------------------------

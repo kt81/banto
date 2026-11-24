@@ -242,23 +242,8 @@ impl Stage {
 /// Consecutive relay ticks a member must be observed idle before it's
 /// eligible for a nudge.
 const RELAY_IDLE_STREAK_REQUIRED: u32 = 2;
-/// How long a focused pane's own recently-forwarded input suppresses a
-/// nudge. Was 3s, which is a *typing-gap* threshold (how long between two
-/// keystrokes before you'd call the operator "done typing"), not a
-/// *composing* one — a human writing even one sentence routinely pauses
-/// longer than that to think, re-read, or pick a word, so the old value let
-/// a nudge land mid-sentence: confirmed in the field, where it did exactly
-/// that, corrupting a message the operator was composing to a Worker (the
-/// nudge text landed inside it, then [`RELAY_SUBMIT_DELAY`] later submitted
-/// the mixed result before he could stop it — see [`update_key`]'s
-/// `cancel_pending_submit_on_input` call for the other half of that fix).
-/// 30s is chosen for the cost asymmetry, not a measured pause length: a
-/// nudge arriving late only delays how soon the Worker notices unread mail,
-/// while a nudge arriving mid-composition can destroy what the operator was
-/// actually typing — a much more expensive failure to guard a few extra
-/// seconds against. Nothing marks unread mail anywhere on screen; once the
-/// pane also holds an unsent draft, the held nudge is announced on the
-/// status line (see [`StatusReminder`]).
+/// How long recent operator input suppresses a Claude wake. This draft guard
+/// remains in place until the guard-removal change.
 const RELAY_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(30);
 /// How long after banto last forwarded operator input to a pane an `Empty`
 /// reading of its input line is not believed. A pane's screen lags its
@@ -282,11 +267,10 @@ const INPUT_LINE_UNREADABLE_AFTER: Duration = Duration::from_secs(60);
 const RELAY_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
 /// Give up nudging a member after this many attempts on one unseen batch.
 const RELAY_MAX_ATTEMPTS: u32 = 3;
-/// The fixed, ASCII-only line typed into a nudged member's stdin.
-const RELAY_NUDGE_LINE: &str =
+/// The fixed instruction delivered by either wake mechanism.
+pub const RELAY_NUDGE_LINE: &str =
     "[banto relay] Your brigade peer sent you a message. Call the check_messages tool now.";
-/// How long after the nudge text before its submitting `\r` is sent — see
-/// [`update_tick`].
+/// Delay for legacy pending submits retained until guard removal.
 const RELAY_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 /// How long a transient status message shows before [`update_tick`] clears it.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -480,8 +464,7 @@ pub struct RelayState {
     nudge: NudgeState,
 }
 
-/// Where one Codex member's wake stands, from the `codex queue` that carried it
-/// to what the member did with it. Kept for a member that has unread mail and
+/// Where one member's Claude or Codex wake stands, through receipt or hold. Kept for a member that has unread mail and
 /// dropped when the mail is read or the member unstages ([`EmporiumState::unstage`]).
 /// An exit that [`relaunch_member`] answers by reopening the pane never unstages,
 /// so a wake outlives that pane. Every other exit does (the Director's, a
@@ -491,7 +474,7 @@ pub struct RelayState {
 /// ([`CODEX_WAKE_START_GUARD`]), since a queued message flows about 1.5 s after
 /// the thread loads.
 #[derive(Debug, Default, Clone)]
-struct CodexWake {
+struct MemberWake {
     phase: WakePhase,
     /// Since when the member's own reading has been idle on every tick, unbroken.
     /// A second wake for the same unread mail waits for a window of this
@@ -506,18 +489,28 @@ enum WakePhase {
     /// Nothing is out for this member.
     #[default]
     Free,
+    Issuing {
+        key: SessionKey,
+    },
+    Issued {
+        since: Instant,
+    },
     /// `Cmd::QueueCodexMessage` is issued and unanswered. `session_id` is what
     /// finds this member again from the answer, which names the thread and not
     /// the member.
-    Asking { session_id: String, since: Instant },
+    Asking {
+        session_id: String,
+        since: Instant,
+    },
     /// Codex accepted the message at `since`. The member is expected to go not
     /// idle within [`CODEX_WAKE_WINDOW`] of it; when the window ends with no such
     /// reading, whether the member reads idle or cannot be read, the wake is held.
-    Watching { since: Instant },
-    /// Banto will not wake this member again for this unread mail. Left only by
-    /// a not-idle reading on a tick after `since`, or by the mail being read:
-    /// the member doing something is the evidence the queue is flowing, and a
-    /// second message sent before that would be a double.
+    Watching {
+        since: Instant,
+    },
+    /// Banto will not wake this member again for this unread mail. A Codex hold
+    /// ends on a later not-idle reading or when mail is read; a Claude hold ends
+    /// on receipt or when mail is read.
     Held {
         since: Instant,
         cause: HoldCause,
@@ -530,6 +523,7 @@ enum WakePhase {
 /// that was not observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HoldCause {
+    ClaudeNotTaken,
     /// The queue accepted the message and the member was still idle when the
     /// window ended.
     NotTakenUp,
@@ -751,6 +745,8 @@ pub struct RelayObservation {
     pub token: MemberToken,
     pub key: SessionKey,
     pub has_unseen: bool,
+    #[serde(default)]
+    pub wake_pending: bool,
     pub is_idle_this_tick: Option<bool>,
     /// Which product hosts this member, as the shell knows it (the store's
     /// recorded choice, else the member's row). Only a Claude pane has an
@@ -1006,30 +1002,13 @@ fn show_next_startup_notice(state: &mut EmporiumState, now: Instant) {
     }
 }
 
-/// A nudge awaiting its phase-two Enter (see [`update_tick`]).
+/// A legacy submit retained until the guard-removal change.
 struct PendingSubmit {
     key: SessionKey,
     nudged_at: Instant,
 }
 
-/// Drop `key`'s pending submitting `\r`, if one is waiting, because real
-/// operator input for that same pane just arrived. Widening
-/// [`RELAY_INPUT_QUIET_PERIOD`] narrows the window a nudge can start in
-/// while the operator is composing, but it cannot close it — the operator
-/// can still start typing in the [`RELAY_SUBMIT_DELAY`] gap between a
-/// nudge's text landing and its `\r` following. Left unguarded, that `\r`
-/// submits banto's nudge text spliced with whatever the operator has typed
-/// on top of it since, not what either of them meant to send. Called at
-/// every site that forwards real keystrokes to a pane (not the mouse path —
-/// an SGR report to the child isn't the operator composing text into it).
-///
-/// The nudge text already written to the pane is left alone: banto cannot
-/// un-type it without writing more bytes into the same line the operator is
-/// mid-edit on, and a guessed-at erase (backspaces sized to the nudge
-/// line's length) risks deleting the operator's own text instead if the
-/// child already reflowed or echoed something in between. Leaving a stray
-/// line the operator can see and clear themselves is the honest outcome
-/// here — silently submitting it early is the actual bug.
+/// Cancel a legacy pending submit when the operator types into that pane.
 fn cancel_pending_submit_on_input(pending_submits: &mut Vec<PendingSubmit>, key: &SessionKey) {
     pending_submits.retain(|pending| &pending.key != key);
 }
@@ -1368,7 +1347,7 @@ pub struct EmporiumState {
     /// a cooldown or attempt count across those cells is wrong.
     pub relay_states: HashMap<(BrigadeId, MemberToken), RelayState>,
     /// Each Codex member's wake, by the same identity as [`Self::relay_states`].
-    codex_wakes: HashMap<(BrigadeId, MemberToken), CodexWake>,
+    member_wakes: HashMap<(BrigadeId, MemberToken), MemberWake>,
     /// The `interrupt_worker` requests this run has decided, each with its
     /// brigade. A request is decided once, on the first tick that sees it, and the
     /// store's outcome column is what stops it being seen again; this is what stops
@@ -1980,7 +1959,7 @@ impl EmporiumState {
             status_set_at: None,
             startup_notices: VecDeque::new(),
             relay_states: HashMap::new(),
-            codex_wakes: HashMap::new(),
+            member_wakes: HashMap::new(),
             interrupt_decided: HashMap::new(),
             unread_interrupt_reminder: StatusReminder::default(),
             unread_interrupts_shown: HashMap::new(),
@@ -2244,7 +2223,7 @@ impl EmporiumState {
         if let (Some(token), Some(brigade_id)) = (token, brigade_id) {
             let member = (brigade_id, token);
             self.relay_states.remove(&member);
-            self.codex_wakes.remove(&member);
+            self.member_wakes.remove(&member);
         }
         self.last_forwarded_input.remove(key);
         self.last_given_input.remove(key);
@@ -3280,9 +3259,9 @@ impl EmporiumState {
     /// operator's recent input, the idle streak, the cooldown, a member that is
     /// not idle) does not matter — it will go out when that passes. Mail the
     /// relay will not deliver (relay off, attempts exhausted) is not counted: the
-    /// brigade is then waiting on the operator. Neither is mail for a Codex member
+    /// brigade is then waiting on the operator. Neither is mail for a member
     /// whose wake is held ([`WakePhase::Held`]): the operator has been told (see
-    /// [`say_codex_holds`]) and the mail waits on what they do. A wake still
+    /// [`say_member_holds`]) and the mail waits on what they do. A wake still
     /// inside its window is counted: the turn it starts begins up to ten seconds
     /// after the message is queued, which neither `last_prompted` nor the settle
     /// can cover. A member this tick did not observe has no mail as far as the
@@ -3296,30 +3275,38 @@ impl EmporiumState {
         relay_auto
             && observed.unread.get(key).is_some_and(|(brigade_id, token)| {
                 let member = (*brigade_id, token.clone());
-                self.relay_states
+                (self.member_wakes.get(&member).is_some_and(|wake| {
+                    matches!(
+                        wake.phase,
+                        WakePhase::Issuing { .. } | WakePhase::Issued { .. }
+                    )
+                }) || self
+                    .relay_states
                     .get(&member)
-                    .is_none_or(|relay| relay.nudge.attempts < RELAY_MAX_ATTEMPTS)
+                    .is_none_or(|relay| relay.nudge.attempts < RELAY_MAX_ATTEMPTS))
                     && !self
-                        .codex_wakes
+                        .member_wakes
                         .get(&member)
                         .is_some_and(|wake| matches!(wake.phase, WakePhase::Held { .. }))
             })
     }
 
-    /// Whether a Codex wake for `key`'s member is out and not yet judged: asked
-    /// of `codex queue` and unanswered, or accepted and inside its window.
-    fn codex_wake_waiting(&self, key: &SessionKey) -> bool {
+    /// Whether a wake for `key`'s member is out and not yet judged.
+    fn member_wake_waiting(&self, key: &SessionKey) -> bool {
         let (Some(brigade_id), Some(token)) =
             (self.member_brigades.get(key), self.member_tokens.get(key))
         else {
             return false;
         };
-        self.codex_wakes
+        self.member_wakes
             .get(&(*brigade_id, token.clone()))
             .is_some_and(|wake| {
                 matches!(
                     wake.phase,
-                    WakePhase::Asking { .. } | WakePhase::Watching { .. }
+                    WakePhase::Asking { .. }
+                        | WakePhase::Watching { .. }
+                        | WakePhase::Issuing { .. }
+                        | WakePhase::Issued { .. }
                 )
             })
     }
@@ -3351,14 +3338,13 @@ impl EmporiumState {
             .is_some_and(|at| now.saturating_duration_since(*at) < QUIT_RECENT_INPUT_WINDOW)
     }
 
-    /// banto's own write ([`Self::last_prompted`]) is inside
-    /// [`QUIT_RECENT_INPUT_WINDOW`], or a Codex wake for the pane is still waiting
-    /// for its answer or its window ([`Self::codex_wake_waiting`]: a queued message
-    /// starts its turn up to ten seconds later, long after the write): what the
+    /// banto's prompt or wake ([`Self::last_prompted`]) is inside
+    /// [`QUIT_RECENT_INPUT_WINDOW`], or a member wake is still waiting for its
+    /// answer or receipt ([`Self::member_wake_waiting`]): what the
     /// quit question calls [`QuitReason::Nudged`], unless the operator's input is
     /// also inside it.
     fn prompted_recently(&self, key: &SessionKey, now: Instant) -> bool {
-        self.codex_wake_waiting(key)
+        self.member_wake_waiting(key)
             || self
                 .last_prompted
                 .get(key)
@@ -3491,9 +3477,8 @@ enum QuitReason {
     /// It was given input within [`QUIT_RECENT_INPUT_WINDOW`], which the sample
     /// may not show yet.
     Input,
-    /// banto itself wrote into it within [`QUIT_RECENT_INPUT_WINDOW`] to start or
-    /// continue a turn (a relay nudge and its delayed Enter, a first prompt),
-    /// and the operator gave it nothing in that time. Counted for the
+    /// banto recently prompted or woke it, or its wake is still pending, and the
+    /// operator gave it nothing in that time. Counted for the
     /// same reason as `Input`, but named apart: with nobody having typed, the
     /// operator reads "input" as a fault in the question. `Input` wins when both
     /// are inside the window.
@@ -3924,6 +3909,10 @@ fn arrow_target(
 /// transactional functions — an intent, not a SQL statement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoreIntent {
+    IssueWake {
+        brigade_id: BrigadeId,
+        token: MemberToken,
+    },
     SetPin {
         id: String,
         pinned: bool,
@@ -4227,7 +4216,7 @@ pub enum Cmd {
     /// one banto reads), and answers with `Event::CodexMessageQueued`. It is how the
     /// relay wakes a Codex member: the core issues it from [`update_tick`] and
     /// judges what came of it from the answer and the member's own readings
-    /// (`CodexWake`). The shell runs it off the event loop, one at a time, so the
+    /// (`MemberWake`). The shell runs it off the event loop, one at a time, so the
     /// answer arrives in a later iteration than the request, never in the same
     /// one: the process takes about 0.2 s and is bounded at five, and the loop
     /// is what draws the screen. The core keeps the mark that a request is out
@@ -4647,6 +4636,11 @@ pub enum Event {
         session_id: String,
         result: crate::codex_queue::CodexQueueResult,
     },
+    ClaudeWakeIssued {
+        brigade_id: BrigadeId,
+        token: MemberToken,
+        ok: bool,
+    },
     BrigadeFormed {
         director_row_id: String,
         name: String,
@@ -5036,6 +5030,35 @@ pub fn update(
         Event::CodexMessageQueued {
             session_id, result, ..
         } => update_codex_message_queued(state, app, &session_id, result, now),
+        Event::ClaudeWakeIssued {
+            brigade_id,
+            token,
+            ok,
+        } => {
+            let member = (brigade_id, token);
+            let key = state
+                .member_wakes
+                .get(&member)
+                .and_then(|wake| match &wake.phase {
+                    WakePhase::Issuing { key } => Some(key.clone()),
+                    _ => None,
+                });
+            if let Some(key) = key {
+                if ok {
+                    state.last_prompted.insert(key, now);
+                    state.member_wakes.get_mut(&member).unwrap().phase =
+                        WakePhase::Issued { since: now };
+                    let nudge = &mut state.relay_states.entry(member).or_default().nudge;
+                    nudge.last_nudge = Some(now);
+                    nudge.attempts += 1;
+                } else {
+                    state.member_wakes.get_mut(&member).unwrap().phase = WakePhase::Free;
+                    let who = state.members_phrase(app, &[(Some(member.0), member.1)]);
+                    state.set_status(format!("failed to write wake for {who}"), now);
+                }
+            }
+            Vec::new()
+        }
         Event::BrigadeFormed {
             director_row_id,
             name,
@@ -5471,13 +5494,8 @@ struct QuietWatch {
 /// bell only, under the usual cooldown: a focused pane still carries no mark.
 ///
 /// The settle runs from the later of the stretch's start and the last time
-/// banto itself wrote into one of the brigade's hosted members to start or
-/// continue a turn (`last_prompted`: a relay nudge and its Enter, a first
-/// prompt when its process spawned). A Worker that reports ends its turn before the relay has typed
-/// the nudge into the Director, and the Director only reads busy in a later
-/// sample; counting from the write gives it the whole settle to be seen busy.
-/// This runs at the end of the tick, after the relay's decision, so a brigade is
-/// not called quiet in the very tick in which a nudge is typed into it.
+/// banto prompted or woke a hosted member (`last_prompted`). The wake may take
+/// time to start a turn, so the decision runs after the relay's tick.
 ///
 /// A member with unread brigade mail that the relay will still deliver by itself
 /// ([`EmporiumState::mail_pending`]) reads as unknown while it sits idle, however
@@ -11694,15 +11712,12 @@ fn update_tick(
         }
     }
 
-    // Panes banto wrote a line or an Enter into earlier in this very tick (the
-    // delayed Enter below). The relay loop at the end of the tick
-    // consults it; see `line_in_flight` there.
+    // Track legacy pending submits until the guard-removal change; the relay
+    // uses this to avoid counting an obsolete idle sample.
     let mut written_this_tick: HashSet<SessionKey> = HashSet::new();
 
-    // Phase two of a nudge: send the delayed submitting `\r` in its own PTY
-    // write. A chunk boundary can carry meaning for the embedded PTY, so
-    // bundling it with the nudge text risks the child reading both as one
-    // paste instead of text-then-submit (docs/REQUIREMENTS.md, "Auto-relay").
+    // Retain pending submits until the guard-removal change; new wakes do not
+    // create them.
     let mut i = 0;
     while i < state.pending_submits.len() {
         if now.saturating_duration_since(state.pending_submits[i].nudged_at) >= RELAY_SUBMIT_DELAY {
@@ -11755,19 +11770,15 @@ fn update_tick(
     let mut unreadable_due: Vec<(BrigadeId, MemberToken)> = Vec::new();
     // Before the relay below, and whether or not the relay is on: a wake whose
     // answer never came is given up on by the clock, not by an observation.
-    age_codex_wakes(state, now);
+    age_member_wakes(state, now);
     if brigade.relay == RelayMode::Auto {
         let focused = state.stage.focused_key().cloned();
         for obs in relay {
-            // A pane of a brigade being closed is not nudged and not read: its
-            // process was asked to end, and a line typed into it would only
-            // become another queued Enter for a pane that is gone.
+            // A pane of a brigade being closed is not woken or read.
             if state.closing.contains_key(&obs.brigade_id) {
                 continue;
             }
-            // A Codex member is woken through its queue, not typed into: none of
-            // what follows (the input line, the draft fence, the delayed Enter)
-            // applies to it.
+            // The Claude draft guard does not apply to Codex queue wakes.
             if obs.agent == Some(AgentKind::Codex) {
                 wake_codex_member(state, app, &obs, now, &mut cmds);
                 continue;
@@ -11789,19 +11800,13 @@ fn update_tick(
                 if now.saturating_duration_since(since) >= INPUT_LINE_UNREADABLE_AFTER
                     && !state.unreadable_noticed.contains(&member)
                 {
-                    unreadable_due.push(member);
+                    unreadable_due.push(member.clone());
                 }
             } else {
                 state.unreadable_since.remove(&member);
             }
-            // A pane banto has a line in is not nudged: a nudge typed behind a
-            // line that still waits for its Enter would be submitted with it by
-            // that one `\r`, as a single message, and an Enter that went out this
-            // tick has not shown in the pane's live file yet, so the idle reading
-            // in `obs` is from before the line. `should_nudge` sees neither (it
-            // knows only what its arguments say), so the relay is told here that
-            // the pane was not idle: its streak starts over and the pane has to be
-            // seen idle twice more, after the line, to be nudged. A member whose
+            // A first prompt in flight or a legacy pending submit means the
+            // sample may predate work already sent. A member whose
             // first prompt has not been confirmed as a turn
             // ([`EmporiumState::first_turn_watch`]) is held the same way, told
             // notice or not: it reads idle before that turn and after a prompt
@@ -11823,25 +11828,47 @@ fn update_tick(
                 last_forwarded,
                 has_unsent,
             };
+            if !obs.has_unseen {
+                state.member_wakes.remove(&member);
+            } else if let Some(wake) = state.member_wakes.get_mut(&member) {
+                match wake.phase {
+                    WakePhase::Issued { .. }
+                    | WakePhase::Held {
+                        cause: HoldCause::ClaudeNotTaken,
+                        ..
+                    } if !obs.wake_pending => wake.phase = WakePhase::Free,
+                    _ => {}
+                }
+            }
+            let free = state
+                .member_wakes
+                .get(&member)
+                .is_none_or(|wake| matches!(wake.phase, WakePhase::Free));
+            let previous_nudge = state
+                .relay_states
+                .get(&member)
+                .map_or_else(NudgeState::default, |s| s.nudge);
             let nudge = tick_relay_decision(
                 &mut state.relay_states,
                 obs.brigade_id,
                 &obs.token,
                 now,
                 idle_this_tick,
-                input,
+                PaneInput {
+                    has_unsent: has_unsent || !free,
+                    ..input
+                },
                 obs.has_unseen,
             );
             if nudge {
-                state.last_prompted.insert(obs.key.clone(), now);
-                cmds.push(Cmd::WritePty {
+                state.relay_states.get_mut(&member).unwrap().nudge = previous_nudge;
+                state.member_wakes.entry(member.clone()).or_default().phase = WakePhase::Issuing {
                     key: obs.key.clone(),
-                    bytes: RELAY_NUDGE_LINE.as_bytes().to_vec(),
-                });
-                state.pending_submits.push(PendingSubmit {
-                    key: obs.key,
-                    nudged_at: now,
-                });
+                };
+                cmds.push(Cmd::Store(StoreIntent::IssueWake {
+                    brigade_id: obs.brigade_id,
+                    token: obs.token.clone(),
+                }));
                 let member =
                     state.members_phrase(app, &[(Some(obs.brigade_id), obs.token.clone())]);
                 // What prompted it: the newest message to this member, as
@@ -11853,7 +11880,8 @@ fn update_tick(
                     .map(|inbound| nudge_prompt(state, obs.brigade_id, inbound))
                     .unwrap_or_default();
                 state.set_status(format!("relay: nudged {member}{prompt}"), now);
-            } else if input.has_unsent
+            } else if free
+                && input.has_unsent
                 && state
                     .relay_states
                     .get(&(obs.brigade_id, obs.token.clone()))
@@ -11908,7 +11936,7 @@ fn update_tick(
 
     say_unread_interrupt(state, app, &unread_interrupts, now);
 
-    say_codex_holds(state, app, now);
+    say_member_holds(state, app, now);
 
     // Said once per member, and only into a free status line: a member left
     // due stays due until it fits.
@@ -11934,8 +11962,7 @@ fn update_tick(
         state.prefix_armed = None;
     }
 
-    // Last, after everything above has typed what it was going to type this
-    // tick: a brigade is not called quiet in the second its relay wakes a member.
+    // A brigade is not called quiet in the second its relay wakes a member.
     cmds.extend(update_brigade_quiet(
         state,
         app,
@@ -11966,8 +11993,7 @@ fn update_tick(
 /// A second wake for mail the first did not clear waits a window of unbroken
 /// idle as well as the cooldown and the attempt cap the relay always had, and
 /// the first needs the usual two idle ticks. No part of a Codex pane is read
-/// and no key sent: the draft fence, the prompt gate and the delayed Enter are
-/// the typing path's.
+/// and no key sent; the draft fence and prompt gate apply to Claude wakes.
 fn wake_codex_member(
     state: &mut EmporiumState,
     app: &App,
@@ -11977,7 +12003,7 @@ fn wake_codex_member(
 ) {
     let member = (obs.brigade_id, obs.token.clone());
     if !obs.has_unseen {
-        state.codex_wakes.remove(&member);
+        state.member_wakes.remove(&member);
         state.relay_states.remove(&member);
         return;
     }
@@ -11996,7 +12022,7 @@ fn wake_codex_member(
     let not_counted = !state.past_codex_wake_guard(&obs.key, now)
         || state.first_turn_watch.contains_key(&obs.key);
     let counted_idle = if not_counted { Some(false) } else { reading };
-    let wake = state.codex_wakes.entry(member.clone()).or_default();
+    let wake = state.member_wakes.entry(member.clone()).or_default();
     wake.idle_since = match reading {
         Some(true) => Some(wake.idle_since.unwrap_or(now)),
         _ => None,
@@ -12040,7 +12066,7 @@ fn wake_codex_member(
     }
     let session_id = obs.key.as_str().to_string();
     state.last_prompted.insert(obs.key.clone(), now);
-    if let Some(wake) = state.codex_wakes.get_mut(&member) {
+    if let Some(wake) = state.member_wakes.get_mut(&member) {
         wake.phase = WakePhase::Asking {
             session_id: session_id.clone(),
             since: now,
@@ -12096,10 +12122,18 @@ fn tick_codex_wake_decision(
     wake
 }
 
-/// Hold the wakes whose answer never came, by the clock: not an observation's to
-/// notice, since a member the tick did not observe has none.
-fn age_codex_wakes(state: &mut EmporiumState, now: Instant) {
-    for wake in state.codex_wakes.values_mut() {
+/// Hold wakes that have waited too long, even without a member observation.
+fn age_member_wakes(state: &mut EmporiumState, now: Instant) {
+    for wake in state.member_wakes.values_mut() {
+        if let WakePhase::Issued { since } = wake.phase
+            && now.saturating_duration_since(since) >= Duration::from_secs(10)
+        {
+            wake.phase = WakePhase::Held {
+                since: now,
+                cause: HoldCause::ClaudeNotTaken,
+                told: false,
+            };
+        }
         if let WakePhase::Asking { since, .. } = wake.phase
             && now.saturating_duration_since(since) >= CODEX_QUEUE_ANSWER_GIVE_UP
         {
@@ -12128,7 +12162,7 @@ fn update_codex_message_queued(
     now: Instant,
 ) -> Vec<Cmd> {
     use crate::codex_queue::CodexQueueResult;
-    let Some(member) = state.codex_wakes.iter().find_map(|(member, wake)| {
+    let Some(member) = state.member_wakes.iter().find_map(|(member, wake)| {
         matches!(&wake.phase, WakePhase::Asking { session_id: asked, .. } if asked == session_id)
             .then(|| member.clone())
     }) else {
@@ -12158,7 +12192,7 @@ fn update_codex_message_queued(
         CodexQueueResult::NotLaunched { reason } => held(HoldCause::NotLaunched(reason)),
         CodexQueueResult::UnexpectedOutput { .. } => held(HoldCause::Unrecognised),
     };
-    if let Some(wake) = state.codex_wakes.get_mut(&member) {
+    if let Some(wake) = state.member_wakes.get_mut(&member) {
         wake.phase = phase;
     }
     Vec::new()
@@ -12183,19 +12217,18 @@ fn roster_rank(member: &(BrigadeId, MemberToken)) -> (BrigadeId, u8, u64, Member
     (*brigade_id, class, number, token.clone())
 }
 
-/// Tell the operator, once and into a free status line, about a Codex member
-/// whose wake is held. One member a tick, in roster order; a member left due stays
+/// Tell the operator, once and into a free status line, about a member whose
+/// wake is held. One member a tick, in roster order; a member left due stays
 /// due until the line is free.
 ///
 /// The text states what was seen and no cause: a wake that was accepted and not
-/// taken up looks the same whether the pane waits at a dialog, Codex is slow, or
-/// the queue is stuck, and the operator is the one who can look.
-fn say_codex_holds(state: &mut EmporiumState, app: &App, now: Instant) {
+/// taken up can have several causes, and the operator is the one who can look.
+fn say_member_holds(state: &mut EmporiumState, app: &App, now: Instant) {
     if state.status.is_some() {
         return;
     }
     let Some((member, cause)) = state
-        .codex_wakes
+        .member_wakes
         .iter()
         .filter_map(|(member, wake)| match &wake.phase {
             WakePhase::Held {
@@ -12210,6 +12243,9 @@ fn say_codex_holds(state: &mut EmporiumState, app: &App, now: Instant) {
     let who = state.members_phrase(app, &[(Some(member.0), member.1.clone())]);
     let look = "look at its pane, answer what it shows, or type it a word";
     let text = match cause {
+        HoldCause::ClaudeNotTaken => {
+            format!("relay: {who} did not take the wake — tell it to check its messages")
+        }
         HoldCause::NotTakenUp => format!("relay: woke {who} but nothing happened \u{2014} {look}"),
         HoldCause::TimedOut => format!(
             "relay: `codex queue` for {who} timed out, so the wake may or may not be queued \u{2014} {look}"
@@ -12226,7 +12262,7 @@ fn say_codex_holds(state: &mut EmporiumState, app: &App, now: Instant) {
     };
     state.set_status(text, now);
     if let Some(WakePhase::Held { told, .. }) = state
-        .codex_wakes
+        .member_wakes
         .get_mut(&member)
         .map(|wake| &mut wake.phase)
     {
@@ -17082,7 +17118,7 @@ mod tests {
     }
 
     #[test]
-    fn tick_nudges_then_flushes_the_delayed_submit() {
+    fn tick_issues_a_wake_without_writing_to_the_pty() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let director = SessionKey::from_id("dir");
         let worker = SessionKey::from_id("w1");
@@ -17104,6 +17140,7 @@ mod tests {
             brigade_id: 1,
             token: "worker-1".to_string(),
             key: worker.clone(),
+            wake_pending: false,
             has_unseen: true,
             is_idle_this_tick: Some(true),
             agent: None,
@@ -17135,8 +17172,7 @@ mod tests {
         );
         assert!(writes(&cmds).is_empty());
 
-        // Second consecutive idle tick: eligible — nudge text goes out, and
-        // the submitting `\r` is recorded as pending, not sent yet.
+        // Second consecutive idle tick: issue the wake, without a PTY write.
         now += Duration::from_secs(1);
         let cmds = update(
             &mut state,
@@ -17148,10 +17184,8 @@ mod tests {
             },
             now,
         );
-        assert_eq!(
-            writes(&cmds),
-            vec![(worker.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec())]
-        );
+        assert!(writes(&cmds).is_empty());
+        assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::Store(StoreIntent::IssueWake { brigade_id: 1, token }) if token == "worker-1")));
         assert!(
             state
                 .status
@@ -17160,7 +17194,7 @@ mod tests {
                 .contains("nudged worker-1 of brigade 1")
         );
 
-        // A tick before the submit delay has elapsed: nothing flushed yet.
+        // No delayed Enter is queued.
         now += Duration::from_millis(50);
         let cmds = update(
             &mut state,
@@ -17172,11 +17206,8 @@ mod tests {
             },
             now,
         );
-        assert!(writes(&cmds).is_empty(), "submit not due yet");
+        assert!(writes(&cmds).is_empty());
 
-        // Once RELAY_SUBMIT_DELAY has passed, the next tick flushes the
-        // lone submitting `\r` — in its own chunk, per the relay engine's
-        // whole reason for existing (see `update_tick`'s doc).
         now += RELAY_SUBMIT_DELAY;
         let cmds = update(
             &mut state,
@@ -17188,7 +17219,7 @@ mod tests {
             },
             now,
         );
-        assert_eq!(writes(&cmds), vec![(worker.clone(), b"\r".to_vec())]);
+        assert!(writes(&cmds).is_empty());
     }
 
     #[test]
@@ -17213,6 +17244,7 @@ mod tests {
             brigade_id: 2,
             token: DIRECTOR_TOKEN.to_string(),
             key: offstage.clone(),
+            wake_pending: false,
             has_unseen: true,
             is_idle_this_tick: Some(true),
             agent: None,
@@ -17771,7 +17803,6 @@ mod tests {
         // prompt ever started one.
         let (mut state, mut app, brigade, key, t0) = spawned_claude_goinkyo();
         let observe = || vec![unread_goinkyo_observation(&key, None)];
-        let nudge = RELAY_NUDGE_LINE.as_bytes().to_vec();
 
         for secs in 1..=6 {
             let cmds = goinkyo_tick_observing(
@@ -17781,7 +17812,7 @@ mod tests {
                 observe(),
                 t0 + Duration::from_secs(secs),
             );
-            assert!(writes_of(&cmds).is_empty(), "tick {secs}: {cmds:?}");
+            assert!(wakes_of(&cmds).is_empty(), "tick {secs}: {cmds:?}");
         }
         assert_eq!(state.first_turn_watch.len(), 1);
 
@@ -17797,7 +17828,7 @@ mod tests {
                 observe(),
                 t0 + Duration::from_secs(secs),
             );
-            nudged |= writes_of(&cmds).contains(&(key.clone(), nudge.clone()));
+            nudged |= wakes_of(&cmds).contains(&(1, "goinkyo".to_string()));
         }
         assert!(state.first_turn_watch.is_empty());
         assert!(nudged, "nudged after the watch ended");
@@ -17995,6 +18026,17 @@ mod tests {
             .collect()
     }
 
+    fn wakes_of(cmds: &[Cmd]) -> Vec<(BrigadeId, MemberToken)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::Store(StoreIntent::IssueWake { brigade_id, token }) => {
+                    Some((*brigade_id, token.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn a_nudge_for_one_pane_is_not_suppressed_by_input_forwarded_to_a_different_pane() {
         // `last_forwarded_input` is per pane: were it one run-wide `Instant`,
@@ -18028,6 +18070,7 @@ mod tests {
             brigade_id: 1,
             token: "worker-1".to_string(),
             key: worker.clone(),
+            wake_pending: false,
             has_unseen: true,
             is_idle_this_tick: Some(true),
             agent: None,
@@ -18057,8 +18100,8 @@ mod tests {
         );
 
         assert_eq!(
-            writes_of(&cmds),
-            vec![(worker.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec())],
+            wakes_of(&cmds),
+            vec![(1, "worker-1".to_string())],
             "the Worker pane never received a keystroke; the Director's own \
              recent input must not suppress its nudge"
         );
@@ -18088,6 +18131,7 @@ mod tests {
             brigade_id: 1,
             token: "worker-1".to_string(),
             key: worker.clone(),
+            wake_pending: false,
             has_unseen: true,
             is_idle_this_tick: Some(true),
             agent: None,
@@ -18117,7 +18161,7 @@ mod tests {
         );
 
         assert!(
-            writes_of(&cmds).is_empty(),
+            wakes_of(&cmds).is_empty(),
             "recent input to the focused pane itself must still suppress its own nudge"
         );
     }
@@ -18142,7 +18186,7 @@ mod tests {
 
     /// Two consecutive idle ticks a second apart with unread mail for
     /// `key` (the debounce a nudge needs), advancing `now` past both.
-    /// Returns every PTY write the two ticks produced.
+    /// Returns every wake issued by the two ticks.
     fn nudge_ticks(
         state: &mut EmporiumState,
         app: &mut App,
@@ -18150,7 +18194,7 @@ mod tests {
         token: &str,
         key: &SessionKey,
         now: &mut Instant,
-    ) -> Vec<(SessionKey, Vec<u8>)> {
+    ) -> Vec<(BrigadeId, MemberToken)> {
         let mut writes = Vec::new();
         for _ in 0..2 {
             *now += Duration::from_secs(1);
@@ -18165,6 +18209,7 @@ mod tests {
                         brigade_id: 1,
                         token: token.to_string(),
                         key: key.clone(),
+                        wake_pending: false,
                         has_unseen: true,
                         is_idle_this_tick: Some(true),
                         agent: None,
@@ -18174,21 +18219,14 @@ mod tests {
                 },
                 *now,
             );
-            writes.extend(writes_of(&cmds));
+            writes.extend(wakes_of(&cmds));
         }
         writes
     }
 
-    /// The nudge, and the Enter the second tick of a call that began with the
-    /// idle streak already built up flushes behind it.
-    fn nudge_then_enter_for(key: &SessionKey) -> Vec<(SessionKey, Vec<u8>)> {
-        let mut writes = nudge_for(key);
-        writes.push((key.clone(), b"\r".to_vec()));
-        writes
-    }
-
-    fn nudge_for(key: &SessionKey) -> Vec<(SessionKey, Vec<u8>)> {
-        vec![(key.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec())]
+    fn nudge_for(key: &SessionKey) -> Vec<(BrigadeId, MemberToken)> {
+        assert_eq!(key.as_str(), "dir");
+        vec![(1, "director".to_string())]
     }
 
     #[test]
@@ -18608,6 +18646,7 @@ mod tests {
                     brigade_id: 1,
                     token: token.to_string(),
                     key: key.clone(),
+                    wake_pending: false,
                     has_unseen,
                     is_idle_this_tick: Some(true),
                     agent: None,
@@ -18840,8 +18879,7 @@ mod tests {
             let cmds = tick_for(
                 &mut state, &mut app, &brigade, "director", &director, true, now,
             );
-            wrote_nudge |= writes_of(&cmds)
-                .contains(&(director.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec()));
+            wrote_nudge |= wakes_of(&cmds).contains(&(1, "director".to_string()));
             assert!(
                 !state
                     .status
@@ -18978,6 +19016,7 @@ mod tests {
                     brigade_id: 1,
                     token: "director".to_string(),
                     key: key.clone(),
+                    wake_pending: false,
                     has_unseen: seen.has_unseen,
                     is_idle_this_tick: seen.idle,
                     agent: seen.agent,
@@ -18998,7 +19037,7 @@ mod tests {
         key: &SessionKey,
         agent: Option<AgentKind>,
         now: &mut Instant,
-    ) -> Vec<(SessionKey, Vec<u8>)> {
+    ) -> Vec<(BrigadeId, MemberToken)> {
         let mut writes = Vec::new();
         for _ in 0..2 {
             *now += Duration::from_secs(1);
@@ -19014,7 +19053,7 @@ mod tests {
                 },
                 *now,
             );
-            writes.extend(writes_of(&cmds));
+            writes.extend(wakes_of(&cmds));
         }
         writes
     }
@@ -19022,6 +19061,174 @@ mod tests {
     const CLAUDE: Option<AgentKind> = Some(AgentKind::ClaudeCode);
 
     const CODEX: Option<AgentKind> = Some(AgentKind::Codex);
+
+    #[test]
+    fn claude_wake_holds_until_receipt_or_mail_read() {
+        let (mut state, mut app, brigade, key, mut now) = reading_fixture();
+        draw_prompt(&mut state, &key, None);
+        let tick = |state: &mut EmporiumState, app: &mut App, now, pending, unseen, idle| {
+            update(
+                state,
+                app,
+                &brigade,
+                Event::Tick {
+                    relay: vec![RelayObservation {
+                        brigade_id: 1,
+                        token: "director".to_string(),
+                        key: key.clone(),
+                        has_unseen: unseen,
+                        wake_pending: pending,
+                        is_idle_this_tick: idle,
+                        agent: CLAUDE,
+                        live: None,
+                        glance: None,
+                        briefed_since_launch: None,
+                    }],
+                    brigades: Vec::new(),
+                },
+                now,
+            )
+        };
+        tick(&mut state, &mut app, now, false, true, Some(true));
+        now += Duration::from_secs(1);
+        let cmds = tick(&mut state, &mut app, now, false, true, Some(true));
+        assert!(
+            cmds.iter()
+                .any(|cmd| matches!(cmd, Cmd::Store(StoreIntent::IssueWake { .. })))
+        );
+        assert!(writes_of(&cmds).is_empty());
+        let member = (1, "director".to_string());
+        assert!(matches!(
+            state.member_wakes[&member].phase,
+            WakePhase::Issuing { .. }
+        ));
+        tick(&mut state, &mut app, now, false, true, Some(false));
+        assert!(matches!(
+            state.member_wakes[&member].phase,
+            WakePhase::Issuing { .. }
+        ));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::ClaudeWakeIssued {
+                brigade_id: 1,
+                token: "director".to_string(),
+                ok: true,
+            },
+            now,
+        );
+        assert_eq!(state.relay_states[&member].nudge.attempts, 1);
+        assert!(matches!(
+            state.member_wakes[&member].phase,
+            WakePhase::Issued { .. }
+        ));
+        now += Duration::from_secs(10);
+        tick(&mut state, &mut app, now, true, true, Some(false));
+        assert!(matches!(
+            state.member_wakes[&member].phase,
+            WakePhase::Held {
+                cause: HoldCause::ClaudeNotTaken,
+                ..
+            }
+        ));
+        now += Duration::from_secs(1);
+        tick(&mut state, &mut app, now, true, true, Some(false));
+        assert!(matches!(
+            state.member_wakes[&member].phase,
+            WakePhase::Held { .. }
+        ));
+        now += Duration::from_secs(1);
+        tick(&mut state, &mut app, now, false, true, Some(false));
+        assert!(matches!(state.member_wakes[&member].phase, WakePhase::Free));
+        now += Duration::from_secs(1);
+        tick(&mut state, &mut app, now, false, false, Some(true));
+        assert!(!state.member_wakes.contains_key(&member));
+    }
+
+    #[test]
+    fn failed_claude_wake_does_not_consume_an_attempt() {
+        let (mut state, mut app, brigade, key, now) = reading_fixture();
+        let member = (1, "director".to_string());
+        state.member_wakes.insert(
+            member.clone(),
+            MemberWake {
+                phase: WakePhase::Issuing { key },
+                idle_since: None,
+            },
+        );
+        state.relay_states.insert(
+            member.clone(),
+            RelayState {
+                idle_streak: 2,
+                nudge: NudgeState {
+                    last_nudge: Some(now - RELAY_NUDGE_COOLDOWN),
+                    attempts: 1,
+                },
+            },
+        );
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::ClaudeWakeIssued {
+                brigade_id: 1,
+                token: "director".to_string(),
+                ok: false,
+            },
+            now,
+        );
+        assert!(matches!(state.member_wakes[&member].phase, WakePhase::Free));
+        assert_eq!(state.relay_states[&member].nudge.attempts, 1);
+        assert_eq!(
+            state.relay_states[&member].nudge.last_nudge,
+            Some(now - RELAY_NUDGE_COOLDOWN)
+        );
+        assert!(
+            state
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("failed to write wake")
+        );
+    }
+
+    #[test]
+    fn claude_wake_ages_without_a_member_observation() {
+        let (mut state, mut app, brigade, _key, now) = reading_fixture();
+        let member = (1, "director".to_string());
+        state.member_wakes.insert(
+            member.clone(),
+            MemberWake {
+                phase: WakePhase::Issued { since: now },
+                idle_since: None,
+            },
+        );
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![],
+                brigades: vec![],
+            },
+            now + Duration::from_secs(10),
+        );
+        assert!(matches!(
+            state.member_wakes[&member].phase,
+            WakePhase::Held {
+                cause: HoldCause::ClaudeNotTaken,
+                told: true,
+                ..
+            }
+        ));
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|text| text.contains("did not take the wake"))
+        );
+    }
 
     // --- waking a Codex member through its queue ------------------------------
 
@@ -19091,8 +19298,8 @@ mod tests {
         }
     }
 
-    fn the_wake(state: &EmporiumState) -> Option<&CodexWake> {
-        state.codex_wakes.get(&(1, "director".to_string()))
+    fn the_wake(state: &EmporiumState) -> Option<&MemberWake> {
+        state.member_wakes.get(&(1, "director".to_string()))
     }
 
     fn wake_is_held(state: &EmporiumState) -> bool {
@@ -19152,6 +19359,7 @@ mod tests {
                 RELAY_NUDGE_LINE.to_string()
             )]
         );
+        assert!(wakes_of(&cmds).is_empty(), "{cmds:?}");
         assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
         assert!(
             state
@@ -19719,9 +19927,9 @@ mod tests {
             .member_tokens
             .insert(key.clone(), "worker-1".to_string());
         let member = (1, "worker-1".to_string());
-        state.codex_wakes.insert(
+        state.member_wakes.insert(
             member.clone(),
-            CodexWake {
+            MemberWake {
                 phase: WakePhase::Held {
                     since: now,
                     cause: HoldCause::NotTakenUp,
@@ -19736,14 +19944,14 @@ mod tests {
         relaunch_member(&mut state, &app, &brigade, &key, false, now);
         assert!(
             matches!(
-                state.codex_wakes.get(&member).map(|wake| &wake.phase),
+                state.member_wakes.get(&member).map(|wake| &wake.phase),
                 Some(WakePhase::Held { .. })
             ),
             "a reopen is not a not-idle reading"
         );
 
         state.unstage(&key);
-        assert!(!state.codex_wakes.contains_key(&member));
+        assert!(!state.member_wakes.contains_key(&member));
         let _ = &mut app;
     }
 
@@ -19758,7 +19966,7 @@ mod tests {
 
     fn the_phase_of<'a>(state: &'a EmporiumState, token: &str) -> Option<&'a WakePhase> {
         state
-            .codex_wakes
+            .member_wakes
             .get(&(1, token.to_string()))
             .map(|wake| &wake.phase)
     }
@@ -19778,6 +19986,7 @@ mod tests {
             brigade_id: 1,
             token: token.to_string(),
             key: SessionKey::from_id(key),
+            wake_pending: false,
             has_unseen: true,
             is_idle_this_tick: idle,
             agent: CODEX,
@@ -20236,16 +20445,16 @@ mod tests {
         ));
     }
 
-    /// The order `say_codex_holds` tells these held members in, one a tick; the
+    /// The order `say_member_holds` tells these held members in, one a tick; the
     /// members are put in the map in the order given, which is never the answer.
     fn told_in_order(members: &[(BrigadeId, &str)]) -> Vec<(BrigadeId, String)> {
         let mut state = EmporiumState::new(PrefixKey::default());
         let app = app_with(vec![]);
         let now = test_instant();
         for (brigade_id, token) in members {
-            state.codex_wakes.insert(
+            state.member_wakes.insert(
                 (*brigade_id, token.to_string()),
-                CodexWake {
+                MemberWake {
                     phase: WakePhase::Held {
                         since: now,
                         cause: HoldCause::NotTakenUp,
@@ -20257,7 +20466,7 @@ mod tests {
         }
         let told = |state: &EmporiumState| -> HashSet<(BrigadeId, MemberToken)> {
             state
-                .codex_wakes
+                .member_wakes
                 .iter()
                 .filter(|(_, wake)| matches!(wake.phase, WakePhase::Held { told: true, .. }))
                 .map(|(member, _)| member.clone())
@@ -20267,7 +20476,7 @@ mod tests {
         for _ in members {
             let before = told(&state);
             state.status = None;
-            say_codex_holds(&mut state, &app, now);
+            say_member_holds(&mut state, &app, now);
             let new: Vec<_> = told(&state).difference(&before).cloned().collect();
             assert_eq!(new.len(), 1, "one member a tick: {new:?}");
             order.push(new[0].clone());
@@ -20308,7 +20517,7 @@ mod tests {
     // --- the wake, second round of side tests ------------------------------------
 
     /// The Director's maps as the shell fills them when it opens the pane, which
-    /// `reading_fixture` leaves out: what `unstage` and `codex_wake_waiting` go by.
+    /// `reading_fixture` leaves out: what `unstage` and `member_wake_waiting` go by.
     fn register_director(state: &mut EmporiumState, director: &SessionKey) {
         state.member_brigades.insert(director.clone(), 1);
         state
@@ -20324,9 +20533,9 @@ mod tests {
         // the two-member test only catches on some runs.
         for result in [queued_ok(), refused()] {
             let (mut state, mut app, brigade, director, now) = reading_fixture();
-            state.codex_wakes.insert(
+            state.member_wakes.insert(
                 (1, "director".to_string()),
-                CodexWake {
+                MemberWake {
                     phase: WakePhase::Asking {
                         session_id: "dir".to_string(),
                         since: now,
@@ -20464,7 +20673,7 @@ mod tests {
         );
 
         state
-            .codex_wakes
+            .member_wakes
             .get_mut(&(1, "director".to_string()))
             .unwrap()
             .phase = WakePhase::Held {
@@ -20567,6 +20776,7 @@ mod tests {
         now += Duration::from_secs(1);
         let cmds = idle_claude_tick(&mut state, &mut app, &brigade, &director, now);
         assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        assert!(wakes_of(&cmds).is_empty(), "{cmds:?}");
         now += Duration::from_secs(1);
         (state, app, brigade, director, now)
     }
@@ -20599,7 +20809,7 @@ mod tests {
         let (mut state, mut app, brigade, director, now) =
             claude_director_one_idle_tick_from_a_nudge();
         let cmds = idle_claude_tick(&mut state, &mut app, &brigade, &director, now);
-        assert_eq!(writes_of(&cmds), nudge_for(&director));
+        assert_eq!(wakes_of(&cmds), nudge_for(&director));
     }
 
     #[test]
@@ -20628,20 +20838,21 @@ mod tests {
         });
         let cmds = idle_claude_tick(&mut state, &mut app, &brigade, &director, now);
         assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        assert!(wakes_of(&cmds).is_empty(), "{cmds:?}");
         assert_eq!(state.pending_submits.len(), 1, "the Enter is still due");
     }
 
     #[test]
     fn a_nudges_delayed_enter_follows_its_pane_to_the_session_key_discovery_gives_it() {
-        // The relay's own nudge queues the Enter under the key the pane has when
-        // it is typed; a discovery in the 300 ms between the two renames the pane
-        // and the Enter must be written to the new key, not to a screen that is
-        // gone. `member: None` on purpose: the rename is not gated on the pane
-        // being a recognized member.
+        // A legacy queued Enter follows its pane through discovery.
         let (mut state, mut app, brigade, director, now) =
             claude_director_one_idle_tick_from_a_nudge();
         let cmds = idle_claude_tick(&mut state, &mut app, &brigade, &director, now);
-        assert_eq!(writes_of(&cmds), nudge_for(&director));
+        assert_eq!(wakes_of(&cmds), nudge_for(&director));
+        state.pending_submits.push(PendingSubmit {
+            key: director.clone(),
+            nudged_at: now,
+        });
         assert_eq!(state.pending_submits.len(), 1);
 
         let renamed = SessionKey::from_id("dir-real");
@@ -20726,7 +20937,7 @@ mod tests {
         let later = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
         assert_eq!(
             later,
-            nudge_then_enter_for(&director),
+            nudge_for(&director),
             "past it, the empty screen is believed"
         );
         assert!(!state.has_unsent_operator_input(&director));
@@ -20742,7 +20953,7 @@ mod tests {
 
         state.unsent_operator_input.remove(&director);
         let sent = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
-        assert_eq!(sent, nudge_then_enter_for(&director), "unmarked");
+        assert_eq!(sent, nudge_for(&director), "unmarked");
     }
 
     #[test]
@@ -20780,6 +20991,10 @@ mod tests {
         let (mut state, mut app, brigade, director, mut now) = reading_fixture();
         let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
         assert_eq!(writes, nudge_for(&director));
+        state.pending_submits.push(PendingSubmit {
+            key: director.clone(),
+            nudged_at: now,
+        });
         draw_prompt(&mut state, &director, Some("[banto relay] nudge text"));
         assert!(!state.has_unsent_operator_input(&director));
 
@@ -20853,7 +21068,7 @@ mod tests {
         // The operator clears the line by a route banto does not model.
         draw_labelled_prompt(&mut state, &director, None);
         let sent = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
-        assert_eq!(sent, nudge_then_enter_for(&director), "released");
+        assert_eq!(sent, nudge_for(&director), "released");
     }
 
     #[test]
@@ -21056,6 +21271,7 @@ mod tests {
             brigade_id: 1,
             token: GOINKYO_TOKEN.to_string(),
             key: key.clone(),
+            wake_pending: false,
             has_unseen: false,
             is_idle_this_tick: idle,
             agent: Some(AgentKind::ClaudeCode),
@@ -21090,6 +21306,8 @@ mod tests {
     /// is recorded for does.
     fn unread_goinkyo_observation(key: &SessionKey, agent: Option<AgentKind>) -> RelayObservation {
         RelayObservation {
+            wake_pending: false,
+
             has_unseen: true,
             agent,
             ..goinkyo_observation(key, Some(true))
@@ -21143,6 +21361,7 @@ mod tests {
             brigade_id: 1,
             token: "worker-1".to_string(),
             key: key.clone(),
+            wake_pending: false,
             has_unseen: false,
             is_idle_this_tick: None,
             agent: Some(agent),
@@ -25221,6 +25440,7 @@ mod tests {
                         brigade_id: 1,
                         token: "director".to_string(),
                         key: director.clone(),
+                        wake_pending: false,
                         has_unseen: true,
                         is_idle_this_tick: Some(true),
                         agent: CLAUDE,
@@ -25398,6 +25618,7 @@ mod tests {
                     brigade_id: 1,
                     token: "director".to_string(),
                     key: key.clone(),
+                    wake_pending: false,
                     has_unseen: true,
                     is_idle_this_tick: Some(true),
                     agent: CLAUDE,
@@ -25606,6 +25827,7 @@ mod tests {
                     brigade_id: *brigade_id,
                     token: token.to_string(),
                     key: key.clone(),
+                    wake_pending: false,
                     has_unseen: true,
                     is_idle_this_tick: Some(true),
                     agent: None,
@@ -25905,6 +26127,7 @@ mod tests {
             brigade_id: 1,
             token: token.to_string(),
             key: key_of(name),
+            wake_pending: false,
             has_unseen: false,
             is_idle_this_tick: None,
             agent,
@@ -27929,6 +28152,7 @@ mod tests {
             brigade_id: 1,
             token: "worker-1".to_string(),
             key: worker.clone(),
+            wake_pending: false,
             has_unseen: true,
             is_idle_this_tick: Some(true),
             agent: None,
@@ -27956,14 +28180,11 @@ mod tests {
             },
             now,
         );
-        assert_eq!(
-            cmds,
-            vec![Cmd::WritePty {
-                key: worker.clone(),
-                bytes: RELAY_NUDGE_LINE.as_bytes().to_vec(),
-            }],
-            "setup error: expected the nudge text to have gone out"
-        );
+        assert_eq!(wakes_of(&cmds), vec![(1, "worker-1".to_string())]);
+        state.pending_submits.push(PendingSubmit {
+            key: worker.clone(),
+            nudged_at: now,
+        });
 
         (state, app, brigade, worker, now)
     }

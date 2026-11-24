@@ -49,6 +49,7 @@ mod mcp;
 mod session;
 mod single_instance;
 mod startup;
+mod wake;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -214,6 +215,10 @@ fn config_stop(error: &anyhow::Error, is_mcp: bool) -> Option<ConfigStop> {
 }
 
 fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("_wake")) {
+        wake::run();
+        return Ok(());
+    }
     let cli = Cli::parse();
     if let Err(message) = cli.check_hand_off_flags() {
         use clap::CommandFactory;

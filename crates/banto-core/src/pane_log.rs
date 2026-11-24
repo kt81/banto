@@ -217,6 +217,7 @@ pub fn event_name(ev: &Event) -> &'static str {
         Event::CodexTrustChecked { .. } => "CodexTrustChecked",
         Event::CodexCatalogRead { .. } => "CodexCatalogRead",
         Event::CodexMessageQueued { .. } => "CodexMessageQueued",
+        Event::ClaudeWakeIssued { .. } => "ClaudeWakeIssued",
         Event::BrigadeFormed { .. } => "BrigadeFormed",
         Event::WorkerAdded { .. } => "WorkerAdded",
         Event::Disbanded { .. } => "Disbanded",
@@ -262,6 +263,7 @@ pub fn pane_facts_key(ev: &Event) -> Option<&SessionKey> {
         | Event::CodexTrustChecked { .. }
         | Event::CodexCatalogRead { .. }
         | Event::CodexMessageQueued { .. }
+        | Event::ClaudeWakeIssued { .. }
         | Event::BrigadeFormed { .. }
         | Event::WorkerAdded { .. }
         | Event::Disbanded { .. }
@@ -444,6 +446,7 @@ pub fn event_lines(ev: &Event, facts: &PaneFacts) -> Vec<Line> {
         | Event::CodexTrustChecked { .. }
         | Event::CodexCatalogRead { .. }
         | Event::CodexMessageQueued { .. }
+        | Event::ClaudeWakeIssued { .. }
         | Event::MemberSessionRecorded { .. }
         | Event::Tick { .. }
         | Event::QuiescenceSampled { .. }
@@ -647,7 +650,8 @@ fn store_line(intent: &StoreIntent, by: &'static str) -> Option<Line> {
                 None => line,
             }
         }
-        StoreIntent::SetPin { .. }
+        StoreIntent::IssueWake { .. }
+        | StoreIntent::SetPin { .. }
         | StoreIntent::Archive { .. }
         | StoreIntent::Unarchive { .. }
         | StoreIntent::JoinGroup { .. }

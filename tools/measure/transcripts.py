@@ -754,7 +754,7 @@ def _read_user(s, d, ts, check_ids, detail):
     if not text.strip():
         return
     stripped = text.lstrip()
-    is_nudge = stripped.startswith(NUDGE_PREFIX)
+    is_nudge = stripped.startswith(NUDGE_PREFIX) or (origin == "task-notification" and "[banto relay]" in text)
     is_tag = stripped.startswith("<") and not is_nudge  # task-notification, command wrappers, bash tags
     _key(s, d, len(s.events), "")
     s.events.append(("user", ts, text, is_nudge, not is_nudge and not is_tag, is_tag, origin))

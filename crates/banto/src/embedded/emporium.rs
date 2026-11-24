@@ -1735,8 +1735,19 @@ fn execute_open_embedded(
                         known_id,
                         &child_args,
                     )?;
-                    let gate = if gated_member(*role, deps.brigade.relay) {
-                        Some(write_gate_settings(&data_dir, *brigade_id, token)?)
+                    let gate = if deps.brigade.relay == RelayMode::Auto {
+                        let db_path = match deps.child {
+                            Some(child) => child.db_path()?.to_path_buf(),
+                            None => data_dir.db_path(),
+                        };
+                        Some(write_wake_settings(
+                            &data_dir,
+                            exe,
+                            &db_path,
+                            *brigade_id,
+                            token,
+                            *role,
+                        )?)
                     } else {
                         None
                     };
@@ -1835,6 +1846,17 @@ fn execute_open_embedded(
 
 fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Event> {
     match intent {
+        StoreIntent::IssueWake { brigade_id, token } => {
+            let ok = store
+                .borrow()
+                .issue_wake(brigade_id, &token)
+                .unwrap_or(false);
+            vec![Event::ClaudeWakeIssued {
+                brigade_id,
+                token,
+                ok,
+            }]
+        }
         StoreIntent::SetPin { id, pinned } => {
             let store = store.borrow();
             let session_id = SessionId(id);
@@ -2767,6 +2789,10 @@ fn gather_relay_observations_from(
                 brigade_id: brigade.id,
                 token: member.token.clone(),
                 key,
+                wake_pending: store
+                    .borrow()
+                    .wake_pending(brigade.id, &member.token)
+                    .unwrap_or(true),
                 has_unseen,
                 is_idle_this_tick,
                 agent,
@@ -3936,7 +3962,7 @@ pub(crate) fn mcp_config_json(
 /// Worker, with the relay on. Only the relay makes a refusal useful, because the
 /// refusal tells the Worker to read its mail and the relay is what wakes a
 /// Worker that has none of its own to read; the Director and the Goinkyo are
-/// never interrupted, so they carry no hook to be slowed by or to fail.
+/// never interrupted, so they do not carry the gate hook. They do carry wake hooks.
 ///
 /// Claude only, by where this is called: a Codex member has no hook of this kind.
 fn gated_member(role: BrigadeRole, relay: RelayMode) -> bool {
@@ -3956,6 +3982,7 @@ const GATE_HOOK_TIMEOUT_SECS: u64 = 15;
 /// Write the member's `--settings` file, the hook that gates its tool calls, and
 /// return its path. Beside its MCP config and named in the same family, so the
 /// sweep collects it with the member ([`DataDir::member_settings_path`]).
+#[cfg(test)]
 fn write_gate_settings(data_dir: &DataDir, brigade_id: BrigadeId, token: &str) -> Result<PathBuf> {
     let path = data_dir
         .member_settings_path(brigade_id, token)
@@ -3965,6 +3992,49 @@ fn write_gate_settings(data_dir: &DataDir, brigade_id: BrigadeId, token: &str) -
     std::fs::create_dir_all(data_dir.mcp_dir())?;
     std::fs::write(&path, serde_json::to_vec_pretty(&gate_settings_json())?)?;
     Ok(path)
+}
+
+fn write_wake_settings(
+    data_dir: &DataDir,
+    exe: &Path,
+    db: &Path,
+    brigade_id: BrigadeId,
+    token: &str,
+    role: BrigadeRole,
+) -> Result<PathBuf> {
+    let path = data_dir
+        .member_settings_path(brigade_id, token)
+        .ok_or_else(|| {
+            anyhow::anyhow!("no settings file name for member {token:?} of brigade {brigade_id}")
+        })?;
+    let settings = wake_settings_json(exe, db, brigade_id, token, role);
+    std::fs::create_dir_all(data_dir.mcp_dir())?;
+    std::fs::write(&path, serde_json::to_vec_pretty(&settings)?)?;
+    Ok(path)
+}
+
+fn wake_settings_json(
+    exe: &Path,
+    db: &Path,
+    brigade_id: BrigadeId,
+    token: &str,
+    role: BrigadeRole,
+) -> serde_json::Value {
+    let hook = serde_json::json!({
+        "type": "command", "command": exe.to_string_lossy(),
+        "args": ["_wake", "--db-path", &db.to_string_lossy(), "--brigade", &brigade_id.to_string(), "--member", token],
+        "timeout": 86400, "asyncRewake": true,
+    });
+    let mut settings = if gated_member(role, RelayMode::Auto) {
+        gate_settings_json()
+    } else {
+        serde_json::json!({"hooks": {}})
+    };
+    settings["hooks"]["SessionStart"] = serde_json::json!([{ "hooks": [hook.clone()] }]);
+    settings["hooks"]["Stop"] = serde_json::json!([{ "hooks": [hook.clone()] }]);
+    settings["hooks"]["PostToolUse"] =
+        serde_json::json!([{ "matcher": "mcp__banto__check_messages", "hooks": [hook] }]);
+    settings
 }
 
 /// The `--settings` file's content: one `PreToolUse` hook, no matcher so that it
@@ -7814,6 +7884,7 @@ mod tests {
                     brigade_id: 1,
                     token: "worker-1".to_string(),
                     key: key.clone(),
+                    wake_pending: false,
                     has_unseen: false,
                     is_idle_this_tick: None,
                     agent: Some(AgentKind::Codex),
@@ -7975,6 +8046,7 @@ mod tests {
                     brigade_id: 1,
                     token: "worker-1".to_string(),
                     key: key.clone(),
+                    wake_pending: false,
                     has_unseen: false,
                     is_idle_this_tick: None,
                     agent: Some(AgentKind::Codex),
@@ -8090,6 +8162,7 @@ mod tests {
                                 brigade_id: 1,
                                 token: "worker-1".to_string(),
                                 key: SessionKey::from_id(W1),
+                                wake_pending: false,
                                 has_unseen: false,
                                 is_idle_this_tick: None,
                                 agent: Some(AgentKind::ClaudeCode),
@@ -9308,6 +9381,7 @@ mod tests {
             brigade_id: 1,
             token: "worker-1".to_string(),
             key: key.clone(),
+            wake_pending: false,
             has_unseen: false,
             is_idle_this_tick: None,
             agent,
@@ -10118,6 +10192,7 @@ mod tests {
             brigade_id: 1,
             token: token.to_string(),
             key: SessionKey::from_id(key),
+            wake_pending: false,
             has_unseen: false,
             is_idle_this_tick: None,
             agent: Some(agent),
@@ -10356,6 +10431,29 @@ mod tests {
         name_it(&mut mcp_side, brigade_id, "worker-1", "");
         tick(&mut state, &mut app, &mut gate);
         assert_eq!(state.tile_label(&worker), "worker-1");
+    }
+
+    #[test]
+    fn issue_wake_store_error_returns_a_failed_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let mut store = Store::open(&path).unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_issue BEFORE UPDATE OF wake_issued ON brigade_members BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+        let events = execute_store_intent(
+            StoreIntent::IssueWake {
+                brigade_id,
+                token: "worker-1".to_string(),
+            },
+            &RefCell::new(store),
+        );
+        assert!(
+            matches!(events.as_slice(), [Event::ClaudeWakeIssued { brigade_id: id, token, ok: false }] if *id == brigade_id && token == "worker-1")
+        );
     }
 
     #[test]
@@ -13858,10 +13956,7 @@ mod tests {
         );
         assert!(cmds.iter().any(|cmd| matches!(
             cmd,
-            Cmd::WritePty { key, bytes }
-                if key == &offstage_key
-                    && bytes
-                        == b"[banto relay] Your brigade peer sent you a message. Call the check_messages tool now."
+            Cmd::Store(StoreIntent::IssueWake { brigade_id, token }) if *brigade_id == offstage_brigade && token == "director"
         )));
     }
 
@@ -17046,7 +17141,7 @@ mod tests {
         fn resolved(&self) -> crate::startup::Resolved {
             crate::startup::Resolved {
                 config_file: crate::startup::ConfigFile::None,
-                db_path: None,
+                db_path: Some(DataDir::new(self.data_dir.path().to_path_buf()).db_path()),
                 claude_home: None,
                 codex_home: None,
                 data_dir: Some(self.data_dir.path().to_path_buf()),
@@ -17506,7 +17601,11 @@ mod tests {
         assert_eq!(argv[at + 2], "--mcp-config", "{argv:?}");
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&expected).unwrap()).unwrap();
-        assert_eq!(written, gate_settings_json());
+        assert_eq!(
+            written["hooks"]["PreToolUse"],
+            gate_settings_json()["hooks"]["PreToolUse"]
+        );
+        assert!(written["hooks"]["SessionStart"].is_array());
     }
 
     #[test]
@@ -17517,18 +17616,6 @@ mod tests {
         };
         let auto = BrigadeConfig::default();
         let cases = [
-            (
-                AgentKind::ClaudeCode,
-                "director",
-                BrigadeRole::Director,
-                &auto,
-            ),
-            (
-                AgentKind::ClaudeCode,
-                "goinkyo",
-                BrigadeRole::Goinkyo,
-                &auto,
-            ),
             (
                 AgentKind::ClaudeCode,
                 "worker-1",
@@ -17545,6 +17632,62 @@ mod tests {
                 .member_settings_path(rig.brigade_id, token)
                 .unwrap();
             assert!(!path.exists(), "{agent:?} {token}: {}", path.display());
+        }
+    }
+
+    #[test]
+    fn automatic_claude_leaders_receive_wake_settings_without_the_gate() {
+        for (token, role) in [
+            ("director", BrigadeRole::Director),
+            ("goinkyo", BrigadeRole::Goinkyo),
+        ] {
+            let rig = BriefingRig::new();
+            let argv = rig.launch(AgentKind::ClaudeCode, "", token, role);
+            let path = PathBuf::from(settings_arg(&argv).expect("settings"));
+            let settings: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert!(settings["hooks"].get("PreToolUse").is_none());
+            assert!(settings["hooks"]["SessionStart"].is_array());
+        }
+    }
+
+    #[test]
+    fn wake_hooks_use_exec_form_for_every_role_and_gate_only_workers() {
+        let exe = Path::new("/a directory/banto");
+        let db = Path::new("/another directory/banto.db");
+        for role in [
+            BrigadeRole::Director,
+            BrigadeRole::Worker,
+            BrigadeRole::Goinkyo,
+        ] {
+            let value = wake_settings_json(exe, db, 3, "worker-1", role);
+            let hooks = &value["hooks"];
+            assert_eq!(
+                hooks.get("PreToolUse").is_some(),
+                role == BrigadeRole::Worker
+            );
+            for event in ["SessionStart", "Stop", "PostToolUse"] {
+                let hook = &hooks[event][0]["hooks"][0];
+                assert_eq!(hook["command"], exe.to_string_lossy().as_ref());
+                assert_eq!(
+                    hook["args"],
+                    serde_json::json!([
+                        "_wake",
+                        "--db-path",
+                        db.to_string_lossy(),
+                        "--brigade",
+                        "3",
+                        "--member",
+                        "worker-1"
+                    ])
+                );
+                assert_eq!(hook["timeout"], 86400);
+                assert_eq!(hook["asyncRewake"], true);
+            }
+            assert_eq!(
+                hooks["PostToolUse"][0]["matcher"],
+                "mcp__banto__check_messages"
+            );
         }
     }
 
@@ -17891,6 +18034,7 @@ second line"
                         brigade_id: 1,
                         token: "director".to_string(),
                         key: SessionKey::from_id("dir"),
+                        wake_pending: false,
                         has_unseen: true,
                         is_idle_this_tick: Some(true),
                         agent: Some(AgentKind::Codex),

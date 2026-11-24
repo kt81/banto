@@ -190,6 +190,7 @@ impl Scene {
                     brigade_id,
                     token,
                     key: key.clone(),
+                    wake_pending: false,
                     has_unseen: false,
                     is_idle_this_tick: None,
                     agent: None,

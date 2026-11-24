@@ -741,8 +741,8 @@ count, which the tag is not, so showing it on the row and on the tile double-cou
 nothing. It stays, even while the Director's pane is focused, until the operator
 sends Enter into that pane: the key that submits what was typed, which reaches the
 child as a carriage return. Another key, a paste, any mouse event, a focus change,
-Shift+Enter, Ctrl+J, an Enter into another pane, and banto's own
-nudge and its submitting Enter do not clear it. Clearing removes the tag from the
+Shift+Enter, Ctrl+J, an Enter into another pane, and relay wakes do not clear it.
+Clearing removes the tag from the
 core and issues the conditional store clear. Disbanding drops all of it with the
 brigade's row. There is no collapsed-body rule: a collapsed Director cannot exist
 today.
@@ -795,8 +795,8 @@ of his for it is recorded here.
    `Esc again to quit — 2 not idle, 1 in background: a (unknown), b (busy), c (bg)`.
    A pane that took input in the last 3 seconds is counted as not idle, and no pane
    is counted twice. The reason words are `unknown`, `input` (the operator's key or
-   paste), `nudged` (only banto's own write: a nudge and its Enter, or a first prompt
-given when the process spawned), `busy`
+   paste), `nudged` (a relay wake or banto's first prompt given when the process
+   spawned), `busy`
    and, apart, `bg`.
 3. **`brigade_status` says what it is.** A shell peer prints as `idle (background
    command running)`; a Codex peer prints `busy (turn in progress)` or `idle (turn
@@ -1388,7 +1388,7 @@ writes an explicit `false` when an operator declines — treating "never seen th
 directory" as a refusal would have meant a warning on every directory opened for the
 first time.
 
-It used to be the gate on the first line banto types into a Codex Worker (Codex's
+It used to be the gate on the first line banto typed into a Codex Worker (Codex's
 own `config.toml` record) and into a Goinkyo (this one), and it was the wrong
 witness for both: Claude never records trust for the home directory, Codex was seen
 to write no trust key outside a git repository (so an already-trusted pane waited
@@ -2239,17 +2239,16 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   the unbroken all-idle stretch — the last member becoming idle, or the set of
   hosted members last changing (a member hosted, gone, or relaunched under the same
   key restarts it; a key that merely changes for the same process, as discovery or a
-  `/clear` do, does not); and (b) the last time banto itself wrote into a
-  hosted member of that brigade to start or continue a turn (the relay's nudge line
-  and its submitting Enter, a first prompt when its process spawned). It also needs the
+  `/clear` do, does not); and (b) the last time banto woke a hosted member or
+  gave it a first prompt when its process spawned. It also needs the
   brigade to have been *armed* by real work since it last fired or since banto began
   watching it (next bullet), so a brigade that never did anything does not ring and
   one that fired does not ring again until someone works; a change of members
   neither sets nor clears that. The decision is made at the end of the tick, after
-  the relay has decided what to type, so it never fires in a tick in which banto
-  types into a member of that brigade; sampling is about once a second, so the wait
+  the relay has decided whether to wake, so it never fires in a tick in which banto
+  wakes a member of that brigade; sampling is about once a second, so the wait
   is met between 5 and 6 seconds after its start. Why: a Worker that reports ends
-  its own turn before the relay has typed the nudge into the Director, and the
+  its own turn before the relay has woken the Director, and the
   Director only reads busy in a later sample, so for a moment the whole brigade is
   idle with work still in flight; the bell must not ring just before the brigade
   starts working again. A nudge the relay holds back writes nothing and so moves
@@ -2315,15 +2314,11 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   mouse events forwarded to a Claude pane count as operator input), every member
   sampled idle meanwhile, and the bell rang 5 s in with the report still unread; to
   him the work was not finished. Mail the relay will not deliver — relay not
-  automatic, attempts exhausted, or a Codex member whose wake is held (see "Waking a
+  automatic, attempts exhausted, or a member whose wake is held (see "Waking a
   Codex member") — does not hold the bell: the brigade is then waiting on the
-  operator. Consequences: a nudge delivered but never read keeps the
-  bell held through the relay's retries, and an operator's draft left in a Worker's
-  pane holds that Worker's mail and so the bell. In detail, for a nudge typed but
-  not answered: the bell stays held through the relay's retries (a cooldown of 60 s
-  between nudges, up to 3 attempts); once the last attempt has been written the mail
-  no longer counts, and the bell rings 5 s after that nudge's submitting Enter
-  unless the mail is read first. Switching the relay to manual ends the hold, and
+  operator. An operator's draft left in a Worker's pane holds that Worker's mail
+  and so the bell. An issued Claude wake holds the bell until received or held;
+  an unreceived wake is held after 10 seconds. Switching the relay to manual ends the hold, and
   the brigade rings after a normal settle from then. Mail counts as pending only if
   *this tick's* observation of that member says it has some (relay automatic,
   attempts not used up); nothing is carried over from an earlier tick, and a member
@@ -2340,7 +2335,7 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   prompt not yet taken (a trust question, a first-run dialog) for longer than the
   settle time, and the bell must not ring while banto's own prompt has not
   started its turn. The stretch then runs from after the watch stops holding, or
-  from banto's last write into the member, whichever is later. Not held, though the
+  from banto's last wake of the member, whichever is later. Not held, though the
   entry stays — the brigade then really is waiting on the operator, which is what
   the bell is for: the notice has been given (reported once, below), so the pane
   needs an answer to what it shows, or the operator's own first line.
@@ -2415,8 +2410,7 @@ record of its own (see *Effect* below) rather than through a pane's latch.
 DSR/DA queries (that traffic belongs to ConPTY probing banto's real terminal,
 not the hosted child — answering leaks garbage into the child's stdin and
 corrupts its repaint on resume); a chunk boundary can carry meaning (the
-relay's nudge Enter is sent ~300ms after the nudge text rather than
-back-to-back, see "Auto-relay" below); a child's exit produces no EOF on some
+the earlier typed relay needed a delay between its line and Enter); a child's exit produces no EOF on some
 paths, so an active waiter thread is needed rather than relying on read
 returning empty. The spike's own "not yet verified" list, stated plainly
 rather than glossed over: resize-under-stress and non-Windows behavior beyond
@@ -3083,7 +3077,7 @@ still being opened is ended the moment it appears. A Worker whose addition the
 store answers after the confirm is recorded in the roster and not started: it is
 created afresh the next time the brigade is opened, as after a restart. The exits
 are folded into one status line, `<name> closed`, said when the last pane has gone.
-What the panes left queued — a nudge's delayed Enter, held Codex creations, the
+What the panes left queued — held Codex creations, the
 hold and unreadable-input clocks — is dropped at the confirm, because nothing
 between it and the exits may act on it (a disband drops the same for the panes it
 ends, by the same code). Every pane is ended as "How a pane ends" below says: hung up,
@@ -4223,9 +4217,8 @@ and the caller's own name to its `You are …` line; `check_messages` headers an
 The text of a message is pulled, never stdin-injected: even though the embedded
 banto is the sole writer to a child's stdin, injecting a peer's message there would
 forge operator input mid-turn; a tool result respects turn boundaries and carries
-the firewall framing for free (`crates/banto/src/mcp.rs` module doc). What banto
-does type into an idle member's stdin is the fixed nudge line under "Auto-relay"
-below, and that starts a turn, so a message can cost its recipient a turn. It writes
+the firewall framing for free (`crates/banto/src/mcp.rs` module doc). The fixed wake instruction under "Auto-relay" starts a turn, so a message can
+cost its recipient a turn. It writes
 nothing into a *busy* member's pane: `interrupt_worker` refuses the Worker's tool
 calls from a hook instead, and the message itself still travels by pull.
 
@@ -4243,42 +4236,37 @@ existed in its own context at all — an information gap, not a reliability one.
 
 ## Auto-relay
 
-A Director↔Worker exchange over the MCP tools above pulls each message's text
-(see above), which means an idle member is not guaranteed to notice unread mail
-without a nudge. With the relay in `auto`, a message to an idle recipient
-can wake it for a turn over its whole context, even when the message asks for
-nothing. The relay holds the nudge back when the relay is `manual`, the pane is
-marked for possible unsent input or Claude's reader detects text, a Codex member's
-earlier wake is still out or held (below), the member has no
-hosted pane or an unknown idle state, or its
-attempts on the batch are used up. A Codex member is woken through its queue, not
-by typing: everything in this section about a line typed, its delayed Enter, the
-operator's mark and the input-line reader is about Claude members, and "Waking a
-Codex member" says what Codex members get instead. The auto-relay closes that loop: it
-observes every live brigade pane's idle/busy status, including panes behind
-the currently displayed brigade (the same
-`sessions/<pid>.json` live-state read the Activity indicator uses) and unseen
-message count, and once a member has been idle for `RELAY_IDLE_STREAK_REQUIRED`
-consecutive observation ticks with mail waiting, types a fixed line into its
-stdin — `"[banto relay] Your brigade peer sent you a message. Call the
-check_messages tool now."` — followed by a submitting Enter roughly 300ms
-later (`RELAY_SUBMIT_DELAY`; the delay exists because a chunk boundary can
-carry meaning for the embedded PTY — see "The emporium: hosted panes" above). A nudge is
-suppressed while the member's pane is focused and has just received forwarded
-keystrokes (`RELAY_INPUT_QUIET_PERIOD`), is subject to
-a cooldown between repeat nudges to the same member, and gives up after a
-capped number of attempts on one unseen batch
-(`crates/banto-core/src/engine.rs` relay constants). It also never lands behind a
-line banto itself has in a pane: while a typed line (a nudge)
-still waits for its delayed Enter, or an Enter went out into the pane on
-this very tick, the pane counts as not idle for the relay, so its idle streak
-starts over — otherwise one Enter would submit the two lines as a single message,
-and the idle reading would be from before the line. A delayed Enter still queued
-when its pane exits and is opened again (a relaunch), or is taken off the stage, is
-dropped, not written to what comes next: the pane's queue goes with its key.
-Everything above is about a
-member that is idle; what the Director's interrupt does to a busy one is under
-"Interrupting a Worker's turn" at the end of this section.
+A Director↔Worker exchange pulls each message's text through MCP. With the
+relay in `auto`, unread mail can wake an idle recipient for a turn over its
+whole context. Claude is woken by an asyncRewake hook and Codex through
+`codex queue`; neither wake types into a pane. The relay observes every hosted
+brigade pane, including off-stage panes. It requires consecutive idle samples,
+observes a cooldown and an attempt cap, and holds a Claude wake behind its draft
+fence and a first-turn watch. A wake can fail or be held, so a send is not proof
+that the recipient read the message. The busy Worker's interrupt is described
+under "Interrupting a Worker's turn" below.
+
+### Waking a Claude member
+
+Under automatic relay, every Claude member gets SessionStart and Stop hooks and
+a PostToolUse hook limited to `mcp__banto__check_messages`. Each starts the
+same `_wake` waiter with a 24-hour hook timeout; a Worker also gets the interrupt
+gate. Manual relay adds no settings file. The waiter opens only the current schema
+of banto's database and never an agent home. Each new waiter supersedes the old
+one. The UI issues a wake by incrementing the member's counter; the waiter polls
+in immediate transactions, consumes all issued wakes together, and exits 2 with
+the fixed check-messages instruction on stderr only when mail remains unread.
+An issue made before a waiter starts remains available for it. A consumed wake
+with no unread mail is silent.
+
+The store answers each issue with success or failure. A pending answer is not a
+receipt; a failed write returns the wake to free, does not consume an attempt,
+and is reported on the status line. Once the write succeeds, its ten-second
+receipt window begins. An issued wake counts as nudged until the waiter consumes
+it. If ten seconds pass without a receipt, banto holds further wakes and tells the operator once to ask
+the member to check its messages. A late receipt or the mail being read releases
+the hold; a not-idle reading does not. Retries for still-unread mail remain
+subject to the relay cooldown and attempt cap.
 
 A time window cannot protect a draft, so the operator's unsent text is
 tracked as a fact instead (`EmporiumState::has_unsent_operator_input`): a
@@ -4288,8 +4276,7 @@ an Enter that reaches the child as a `\r` (plain, Alt, Ctrl) is forwarded, the
 pane goes away, or a settled
 screen reading recognises an empty Claude input line. While a pane is
 marked, a nudge to it is suppressed whatever the focus and however long ago
-the operator last typed, a nudge's own delayed Enter is dropped if the mark
-appeared before it was due, and the status line says the nudge is being held
+the operator last typed, the status line says the nudge is being held
 (re-shown every 30s, never over another message). A member whose first turn is
 still expected is not nudged either, for a nudge would be a turn of its own and
 hide whether its first prompt started one; the hold lasts as long as its watch
@@ -4300,7 +4287,7 @@ notwithstanding.
 When a known Codex pane has enabled Win32 input mode (`CSI ? 9001 h`), banto
 forwards exactly Shift+Enter and Ctrl+J as Win32 key
 press and release records. Both count as adding text, including for the draft
-mark and cancellation of a pending relay Enter. The pane's own mode is tracked
+mark. The pane's own mode is tracked
 until `CSI ? 9001 l`; this is not inferred from another pane. The spawn event
 records the launched agent even before a new session is indexed. Its agent field
 is optional for older replays; an unconflicted session row or member fact can
@@ -4388,9 +4375,7 @@ other pane sizes, a modal at the prompt.
 announced); `Empty` clears the mark, but only `INPUT_ECHO_SETTLE` (3s) after banto
 last forwarded input to the pane, because a pane's screen lags its keys (36–108ms
 measured on 2026-11-10) and an `Empty` read inside that window is not yet true;
-`Unrecognized` leaves the mark in charge. The delayed Enter never reads the screen:
-by then the line holds banto's own
-nudge sentence. A Claude pane that stays idle yet `Unrecognized` for
+`Unrecognized` leaves the mark in charge. A Claude pane that stays idle yet `Unrecognized` for
 `INPUT_LINE_UNREADABLE_AFTER` (60s) is reported once on the status line, since
 Claude's layout can change without notice and a reader that stopped recognising it
 would look like one that works; waiting (a permission dialog) is not counted.
@@ -4490,12 +4475,8 @@ An answer that never comes puts the member on hold after 30 s
 (`CODEX_QUEUE_ANSWER_GIVE_UP`), so a lost answer ends. The queue's `message_id`,
 `client_id` and `turn_trigger` are not read back.
 
-**Settled (found 2026-11-14 by reading and by a test that tripped on it, not seen in
-the field):** a nudge's delayed submitting Enter still queued when its pane was
-relaunched used to be written to the new process, and counted as work given to it;
-that needed a nudge written less than 300 ms (`RELAY_SUBMIT_DELAY`) before the pane
-exited. `unstage` and `relaunch_member` now drop the queued Enter of the key, so it
-never reaches a new process.
+**Past incident (2026-11-14):** the former typed relay could leave a delayed Enter
+queued across a relaunch. The wake hook no longer queues an Enter.
 
 `[brigade].relay` in config.toml (`RelayMode`, default `Auto`) toggles this
 off (`Manual`) for an operator who would rather prompt `check_messages`
@@ -4605,9 +4586,8 @@ pinned by a test):
 The reason of a `no-pane` goes on the pane-log line of the outcome's store intent (`why=`)
 as that one fixed word, never into the column.
 
-*Nothing is typed.* The nudge line banto types into an idle pane is the ordinary one and
-is not affected: it is how a Worker that has no tool call left in its turn learns of its
-mail, and a turn that calls no tool is never gated. The things the Esc needed are gone
+*Nothing is typed.* The wake hook can reach a Worker that has no tool call left in
+its turn; a turn that calls no tool is never gated. The things the Esc needed are gone
 with it: the 300 ms quiet time after a key, the Enter-only repair of a restored nudge line,
 and the reading of the input line for an interrupt.
 
@@ -4731,8 +4711,7 @@ question)"). (Why `shell` shows busy in the list: the operator
 restarted banto without knowing a command was still running in a pane that said
 "alive".) The relay, which asks whether a member can be nudged, still treats `shell`
 as idle enough: the turn has ended and the member can take a message; it never
-nudges a `waiting` session, `dialog open` included, since a nudge's Enter would
-choose something in the dialog. The same classification without its last step, the
+nudges a `waiting` session, `dialog open` included. The same classification without its last step, the
 transcript's age (`live_activity`), is what the marks, the count and the bell read
 for a member with no list row, and what its tile reads through the shell's sample: a
 Claude Worker that has not run a turn has a live file and no transcript, so it is

@@ -148,6 +148,17 @@ class WorkerErrandTests(Base):
 
 
 class DirectorTurnTests(Base):
+    def test_task_notification_wake_opens_a_nudge_turn(self):
+        recs = [user_text(ts(1), "start"),
+                user_text(ts(2), "<task-notification>[banto relay] check messages</task-notification>",
+                          origin={"kind": "task-notification"}),
+                user_text(ts(3), "<task-notification>other task</task-notification>",
+                          origin={"kind": "task-notification"})]
+        s = self.read("d", recs)
+        s.role = "director"
+        errs, _ = tr.build_errands(s)
+        self.assertEqual([e.nudge for e in errs], [False, True])
+
     def director(self):
         recs = []
         recs += call_lines("pre", ts(0), usage(cr=10), tools=[(TOOL + "name_member", "n1", {})])  # before any turn

@@ -42,8 +42,8 @@
 //! message, and what makes the Worker read it is a hook's refusal of its next tool
 //! calls.
 //!
-//! What banto does type into an idle member's pane is a fixed line that says to
-//! call `check_messages` (the relay in `banto_core::engine`), and that starts a
+//! banto wakes an idle member with a fixed instruction to call `check_messages`
+//! through a Claude hook or the Codex queue, and that starts a
 //! turn. So a message is free to send and not free to receive: the tool
 //! description and the briefings say so, because "a pull" read as costing the
 //! idle recipient nothing, and a stand-down broadcast to Workers that had all
@@ -420,8 +420,8 @@ fn tools_list_result() -> Value {
                 "_meta": always_loaded(),
                 "description": "Send a message to your brigade peer through banto: a Director \
                                 reaches every Worker by default, a Worker or a Goinkyo reaches \
-                                the Director. banto's relay, on by default, types a line into an \
-                                idle recipient's pane to wake it to read the message, which costs \
+                                the Director. banto's relay, on by default, wakes an idle \
+                                recipient to read the message, which costs \
                                 it a turn over its whole context; it reads the text with \
                                 check_messages. A wake is not guaranteed (the relay can be off, or \
                                 held back by a draft in the pane), so do not take a send as a \
@@ -3003,7 +3003,7 @@ mod tests {
             "the wake is the relay's, and is conditional: {description}"
         );
         assert!(
-            description.contains("idle recipient's pane to wake it"),
+            description.contains("wakes an idle recipient"),
             "{description}"
         );
         assert!(

@@ -1444,6 +1444,61 @@ impl Store {
             |row| row.get(0),
         )?)
     }
+
+    /// Issue a wake, retaining it until a waiter consumes it.
+    pub fn issue_wake(&self, brigade_id: BrigadeId, member: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE brigade_members SET wake_issued = wake_issued + 1 WHERE brigade_id = ?1 AND member_token = ?2",
+            params![brigade_id, member],
+        )? != 0)
+    }
+
+    pub fn wake_pending(&self, brigade_id: BrigadeId, member: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT wake_issued > wake_received FROM brigade_members WHERE brigade_id = ?1 AND member_token = ?2",
+            params![brigade_id, member], |row| row.get(0),
+        ).optional()?.unwrap_or(false))
+    }
+
+    /// Register a waiter, superseding every earlier waiter for this member.
+    pub fn arm_wake(&self, brigade_id: BrigadeId, member: &str) -> Result<Option<i64>, StoreError> {
+        Ok(self.conn.query_row(
+            "UPDATE brigade_members SET wake_waiter = wake_waiter + 1 WHERE brigade_id = ?1 AND member_token = ?2 RETURNING wake_waiter",
+            params![brigade_id, member], |row| row.get(0),
+        ).optional()?)
+    }
+
+    /// `None` means this waiter has been superseded or its member removed.
+    pub fn poll_wake(
+        &mut self,
+        brigade_id: BrigadeId,
+        member: &str,
+        generation: i64,
+    ) -> Result<Option<bool>, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(i64, i64, i64, String)> = tx.query_row(
+            "SELECT wake_waiter, wake_issued, wake_received, role FROM brigade_members WHERE brigade_id = ?1 AND member_token = ?2",
+            params![brigade_id, member], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        let Some((waiter, issued, received, role)) = row else {
+            return Ok(None);
+        };
+        if waiter != generation {
+            return Ok(None);
+        }
+        let mut unread = false;
+        if issued > received {
+            tx.execute("UPDATE brigade_members SET wake_received = wake_issued WHERE brigade_id = ?1 AND member_token = ?2", params![brigade_id, member])?;
+            unread = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM brigade_messages WHERE brigade_id = ?1 AND to_role = ?2 AND id > COALESCE((SELECT last_seen_id FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?3), 0) AND (to_member IS NULL OR to_member = ?3))",
+                params![brigade_id, role, member], |row| row.get(0),
+            )?;
+        }
+        tx.commit()?;
+        Ok(Some(unread))
+    }
 }
 
 /// Ranks beyond this read as "no preference": no brigade has anything like
@@ -5545,6 +5600,93 @@ mod tests {
             .unwrap();
         assert_eq!(store.list_brigades().unwrap().len(), 1);
         assert!(store.brigade_member(br, "director").unwrap().is_some());
+    }
+
+    #[test]
+    fn wake_waiter_consumes_issues_and_newest_generation_wins() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        store.issue_wake(br, "worker-1").unwrap();
+        store.issue_wake(br, "worker-1").unwrap();
+        let first = store.arm_wake(br, "worker-1").unwrap().unwrap();
+        let second = store.arm_wake(br, "worker-1").unwrap().unwrap();
+        assert_eq!(store.poll_wake(br, "worker-1", first).unwrap(), None);
+        assert_eq!(
+            store.poll_wake(br, "worker-1", second).unwrap(),
+            Some(false)
+        );
+        assert!(!store.wake_pending(br, "worker-1").unwrap());
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "hi")
+            .unwrap();
+        store.issue_wake(br, "worker-1").unwrap();
+        assert!(store.wake_pending(br, "worker-1").unwrap());
+        assert_eq!(store.poll_wake(br, "worker-1", second).unwrap(), Some(true));
+        assert!(!store.wake_pending(br, "worker-1").unwrap());
+        assert_eq!(
+            store.poll_wake(br, "worker-1", second).unwrap(),
+            Some(false)
+        );
+        store
+            .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
+            .unwrap();
+        store.issue_wake(br, "worker-1").unwrap();
+        assert_eq!(
+            store.poll_wake(br, "worker-1", second).unwrap(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn wake_only_delivers_mail_addressed_to_the_waiter() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        for member in ["worker-1", "worker-2"] {
+            store
+                .add_brigade_member(br, member, BrigadeRole::Worker, None)
+                .unwrap();
+        }
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, Some("worker-2"), "hi")
+            .unwrap();
+        let first = store.arm_wake(br, "worker-1").unwrap().unwrap();
+        let second = store.arm_wake(br, "worker-2").unwrap().unwrap();
+        store.issue_wake(br, "worker-1").unwrap();
+        store.issue_wake(br, "worker-2").unwrap();
+        assert_eq!(store.poll_wake(br, "worker-1", first).unwrap(), Some(false));
+        assert!(!store.wake_pending(br, "worker-1").unwrap());
+        assert_eq!(store.poll_wake(br, "worker-2", second).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn wake_poll_waits_for_a_competing_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let mut store = Store::open(&path).unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "hi")
+            .unwrap();
+        let generation = store.arm_wake(br, "worker-1").unwrap().unwrap();
+        store.issue_wake(br, "worker-1").unwrap();
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let poller = std::thread::spawn(move || {
+            tx.send(()).unwrap();
+            store.poll_wake(br, "worker-1", generation)
+        });
+        rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(!poller.is_finished(), "poll did not wait for the writer");
+        blocker.execute_batch("COMMIT").unwrap();
+        assert_eq!(poller.join().unwrap().unwrap(), Some(true));
     }
 
     #[test]
