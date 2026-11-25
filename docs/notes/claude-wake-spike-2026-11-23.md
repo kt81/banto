@@ -146,8 +146,15 @@ instead.
 - **Measured, timeout 30:** the waiter was gone between 12 and 47 s after it
   started, with no record in the transcript, on the screen or in its own log. It
   ends silently. The exact end time was not pinned.
-- **Measured, timeout 86400:** accepted without a settings error; alive 47 s later.
-  Waiting the whole day was not done.
+- **Measured, timeout 86400:** accepted without a settings error. A waiter alive
+  after 3 h was woken by a flag and the model replied. The longest-lived waiter
+  recorded 223 one-minute heartbeats (about 3 h 43 min) before a banto restart
+  killed its process tree.
+- **Not measured:** a full day. An overnight run was cut by that restart; a
+  second was started, but its log records only 13 min and no outcome. A longer
+  measurement was dropped: reopening a member's session (including after a banto
+  restart) arms a new waiter on `SessionStart`, and an unanswered wake is shown
+  once on the status line, so the operator can recover a dead waiter by hand.
 - **Measured, timeout 1200:** respected. The waiter armed on `SessionStart` was alive
   670 s (about 11 min) after start, 70 s past the default 600 s; a flag then woke
   it and the model read its mail.
