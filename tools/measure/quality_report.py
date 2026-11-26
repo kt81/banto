@@ -399,6 +399,8 @@ class Analysis:
         for e in events:
             if e[0] == "deliver":
                 instr = "\n\n".join(body for sender, _n, _sc, body in e[2] if sender == "director")
+                if not instr.strip():
+                    continue
                 if cur:
                     cur["end"] = cur["end"] or e[1]
                 cur = {"start": e[1], "instr": instr, "reports": [], "end": None}
@@ -572,7 +574,7 @@ def find_candidates(changes, since, director_events, release_triggers, horizon_h
 # effect metrics: what working as a brigade bought the operator
 # ---------------------------------------------------------------------------
 
-TRIGGERS = ("operator", "worker", "self")
+TRIGGERS = ("operator", "worker", "planner", "banto", "relay", "mixed", "self")
 JUDGMENT_VERDICTS = ("real", "not", "unsure")
 JUDGMENT_ID_RX = re.compile(r"^[AB]-[0-9a-f]{8}$", re.I)
 WORKER_SENDERS = ("worker-", "goinkyo")
@@ -630,25 +632,40 @@ def worker_message(ev):
     return any(p[0].startswith(WORKER_SENDERS) for p in ev[2])
 
 
+def delivery_trigger(ev):
+    """Classify the actual senders, not the wake that preceded their delivery."""
+    kinds = set()
+    for sender, _name, _scope, _body in ev[2]:
+        if sender == "operator":
+            kinds.add("operator")
+        elif sender == "banto":
+            kinds.add("banto")
+        elif sender == "planner":
+            kinds.add("planner")
+        elif sender.startswith(WORKER_SENDERS):
+            kinds.add("worker")
+        else:
+            kinds.add("self")
+    return next(iter(kinds)) if len(kinds) == 1 else ("mixed" if kinds else "self")
+
+
 def turn_trigger(events, i):
-    """What started the Director's turn in which events[i] was written: 'operator' if the last thing
-    to start a turn was a message the operator typed, 'worker' if it was a relay nudge or a
-    check_messages answer carrying a Worker's or Goinkyo's message, else 'self'. Tool results,
-    system text and answers with no Worker in them do not start a turn, and the Director's own text,
-    sends and calls are never inputs. A delivery carrying a message from the operator counts as the
-    operator's. It cannot see self-correction: a turn an operator message or a Worker report started
-    counts as that trigger even when the Director found the error itself."""
+    """The most recent relevant input before events[i], including its delivery sender when known.
+
+    A relay wake alone does not identify its sender. A delivery can contain several categories.
+    Tool results, system text and the Director's own text, sends and calls do not start a turn.
+    This cannot see whether a correction was actually prompted by the most recent input.
+    """
     for ev in reversed(events[:i]):
         kind = ev[0]
         if kind == "operator":
             return "operator"
         if kind == "nudge":
-            return "worker"
+            return "relay"
         if kind == "deliver":
-            if any(p[0] == "operator" for p in ev[2]):
-                return "operator"
-            if worker_message(ev):
-                return "worker"
+            trigger = delivery_trigger(ev)
+            if trigger != "self":
+                return trigger
     return "self"
 
 
@@ -661,11 +678,9 @@ def predecessor_trigger(events, i):
         if kind == "operator":
             return "operator"
         if kind == "nudge":
-            return "worker"
+            return "relay"
         if kind == "deliver":
-            if any(p[0] == "operator" for p in ev[2]):
-                return "operator"
-            return "worker" if worker_message(ev) else "self"
+            return delivery_trigger(ev)
         if kind in ("result", "system"):
             return "self"
     return "self"
@@ -807,7 +822,7 @@ def write_candidates(out, changes, cand_a, cand_b, horizon_h):
                 fh.write(f"  {cid}  {t:%m-%d %H:%M:%SZ}  after {kind} at {t0:%H:%M:%SZ}: {ex}\n")
     with tr.open_output(os.path.join(out, "candidates_b.txt")) as fh:
         fh.write("(b) Director text containing a retraction/correction phrase. Candidates only (high false-positive rate).\n"
-                 "Each line starts with the candidate's id and, in brackets, what started the Director's turn (operator / worker / self).\n\n")
+                 "Each line starts with the candidate's id and, in brackets, the most recent input category.\n\n")
         for ch in changes:
             fh.write(f"## change {ch['id']} {ch['commits'][-1]['hash']} ({len(cand_b[ch['id']])})\n")
             for t, to, ex, cid, trig, _pred in cand_b[ch["id"]]:
@@ -856,9 +871,9 @@ DEFINITIONS = [
     "    (it moves when a record at that timestamp is added or removed), and a send_to_peer block without a tool_use id by the position of the block in its record.",
     "    The id keeps 32 bits of a hash, so two candidates can share one by chance: a run counts such collisions in the summary and warns on stderr, and a judgment naming a colliding id is ambiguous and applied to neither candidate.",
     "    The problem-word and retraction-phrase lists were tuned once, on one window, against the first-pass judgments of one judge, with no holdout: a first pass, not a validation.",
-    "  Director reversal: a (b) candidate, a Director message (text to the operator, or a send_to_peer) containing a retraction phrase. Trigger = what started the Director's turn in which it was written:",
-    "    operator = the last thing to start a turn was a message the operator typed; worker = it was a relay nudge, or a check_messages answer with at least one worker-N or goinkyo message in it;",
-    "    self = neither (tool results, system text, an answer with no Worker message and the Director's own text never start a turn). 'by turn' CANNOT SEE self-correction: a turn an operator message",
+    "  Director reversal: a (b) candidate, a Director message (text to the operator, or a send_to_peer) containing a retraction phrase. Trigger = the most recent relevant input:",
+    "    operator, worker, planner and banto name the sender; relay is a wake whose sender is not yet known; mixed is a delivery with different sender categories;",
+    "    self = no identified input (tool results, system text and the Director's own text never start a turn). 'by turn' CANNOT SEE self-correction: a turn an operator message",
     "    or a Worker report started counts as that trigger even when the Director found the error itself; a human records self in the judgments note. The secondary column 'by predecessor' names the",
     "    most recent input of any kind before the message (a tool result or system text is self); it is mostly self, since a Director writes most of its text right after a tool call.",
     "  operator-typed message: a user record in the Director's transcript that is not a tool result, not meta/compaction-summary/transcript-only, has origin human or none, and whose text does not",

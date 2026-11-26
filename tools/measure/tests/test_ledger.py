@@ -318,7 +318,7 @@ class WhatRanEndToEnd(unittest.TestCase):
     def test_configured_versus_observed_flags_what_differs(self):
         _, stdout, _ = self.run_ledger()
         section = stdout.split("4. CONFIGURED VERSUS OBSERVED")[1].split("5. PRICE WHAT-IF")[0]
-        self.assertIn("expected: director none configured; worker sonnet/high; goinkyo fable/max", section)
+        self.assertIn("expected: director none configured; planner none configured; worker sonnet/high; goinkyo fable/max", section)
         flagged = [ln for ln in section.splitlines() if "DIFFERS" in ln]
         self.assertEqual(len(flagged), 3)
         self.assertEqual(sum(HAIKU in ln and "model sonnet expected" in ln for ln in flagged), 2)

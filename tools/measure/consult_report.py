@@ -461,7 +461,7 @@ def render(args, zone, since, until, sessions, rows, dropped):
     P("")
     P("WHAT THIS CANNOT SEE")
     P("  A consultation that should have happened and did not. A Director is any session that called a Director-only")
-    P("  banto tool (consult_goinkyo, dismiss_goinkyo, name_member, request_decision) at least once, so one that never")
+    P("  banto tool (consult_goinkyo, dismiss_goinkyo, name_member, request_decision, open_planner, close_planner) at least once, so one that never")
     P("  did is absent, and a day with only records of a relay nudge counts as a day the Director was active. A session")
     P("  resumed into a new file is a new row: a row is a file, not a team.")
     return "\n".join(out)

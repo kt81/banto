@@ -223,6 +223,7 @@ def print_report(args, weights, since, until, sessions, live, dups, erows, srows
       f"calls with no errand logic applied: {len(una)}")
     roles = Counter(s.role for s in sessions_used)
     P(f"  sessions by role guess: {dict(roles)}  (role is inferred: Director = uses a director-only banto tool; "
+      "Planner = uses a planner-only tool, reads its request file or has its briefing in the first snapshot; "
       "Worker = uses banto tools only; Goinkyo = uses banto tools only and its first system-prompt snapshot carries the Goinkyo briefing; "
       "solo = no banto tool; subagent = path under 'subagents')")
     P(f"CSV files written to {out}: calls.csv sessions.csv errands.csv context_series.csv")

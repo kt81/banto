@@ -53,7 +53,8 @@ ASSUMPTION = (
 # banto's MCP tools reach the agent as mcp__banto__<tool>.
 BANTO_TOOL_PREFIX = "mcp__banto__"
 # Tools only a Director is given; a session that calls one is a Director.
-DIRECTOR_ONLY_TOOLS = {"consult_goinkyo", "dismiss_goinkyo", "name_member", "request_decision"}
+DIRECTOR_ONLY_TOOLS = {"consult_goinkyo", "dismiss_goinkyo", "name_member", "request_decision", "open_planner", "close_planner"}
+PLANNER_ONLY_TOOLS = {"write_plan", "release_plan"}
 # Text banto types into an agent's pane to make it call check_messages.
 NUDGE_PREFIX = "[banto relay]"
 # Events kept only in detail mode for quality_report: a request_decision call and a tool result that
@@ -65,7 +66,7 @@ DELIVERED_RE = re.compile(r"^\s*\d+ message\(s\) relayed by banto")
 # The header banto puts above each delivered message: [from worker-2 "name" — to you]
 FROM_RE = re.compile(r"^\[from [^\]]*\]\s*$")
 FROM_HDR_RE = re.compile(r"^\[from ([^\]]+)\]\s*$", re.M)
-FROM_PARTS_RE = re.compile(r'^(worker-\d+|goinkyo|director|operator)(?: "([^"]*)")?(?: — (to you|broadcast))?')
+FROM_PARTS_RE = re.compile(r'^(worker-\d+|goinkyo|director|planner|operator|banto)(?: "([^"]*)")?(?: — (to you|broadcast))?$')
 # The first message a Worker / Goinkyo receives names its place in a brigade.
 WORKER_BRIEFING_RE = re.compile(r"You are (worker-\d+), a Worker in banto brigade (\d+)")
 GOINKYO_BRIEFING_RE = re.compile(r"You are the Goinkyo of banto brigade (\d+)")
@@ -499,6 +500,7 @@ class Session:
         self.keys = {}
         self.sidechain_events = set()
         self.tools = Counter()
+        self.planner_request_read = False
         self.compactions = []
         self.first_ts = None
         self.last_ts = None
@@ -675,6 +677,7 @@ def _read_assistant(s, d, ts, check_ids, detail):
         new_call = c
 
     events, subkeys, tools, checks = [], [], [], []
+    planner_request_read = False
     content = msg.get("content")
     for block_no, b in enumerate(content if isinstance(content, list) else []):
         if not isinstance(b, dict):
@@ -688,6 +691,10 @@ def _read_assistant(s, d, ts, check_ids, detail):
             name = _optional_str(b.get("name")) or ""
             tool_id = _optional_str(b.get("id"))
             inp = as_dict(b.get("input"))
+            if name == "Read" and not d.get("isSidechain"):
+                path = inp.get("file_path", inp.get("path"))
+                if isinstance(path, str) and "mcp/planner/" in path.replace("\\", "/"):
+                    planner_request_read = True
             short = name[len(BANTO_TOOL_PREFIX):] if name.startswith(BANTO_TOOL_PREFIX) else None
             if short:
                 tools.append(short)
@@ -729,6 +736,7 @@ def _read_assistant(s, d, ts, check_ids, detail):
     if d.get("isSidechain"):
         s.sidechain_events.update(range(len(s.events), len(s.events) + len(events)))
     s.events.extend(events)
+    s.planner_request_read = s.planner_request_read or planner_request_read
     s.tools.update(tools)
     check_ids.update(checks)
 
@@ -744,7 +752,9 @@ def _read_user(s, d, ts, check_ids, detail):
                 if tool_use_id and tool_use_id in check_ids:
                     text = block_text(b.get("content"))
                     if DELIVERED_RE.match(text):
-                        events.append(("deliver", ts, instruction_label(text), split_delivery(text) if detail else None))
+                        parts = split_delivery(text)
+                        events.append(("deliver", ts, instruction_label(text), parts if detail else
+                                       [(sender, None, None, "") for sender, _name, _scope, _body in parts]))
                         continue
                 if detail:
                     events.append(("result", ts))
@@ -763,16 +773,14 @@ def _read_user(s, d, ts, check_ids, detail):
     s.events.append(("user", ts, text, is_nudge, not is_nudge and not is_tag, is_tag, origin))
 
 
-def snapshot_members(path):
-    """[(member, brigade)] for the briefings in the system prompt of the file's FIRST `prompt_snapshot`
-    record, in that order: member is "worker-N" or "goinkyo". A later snapshot is not read, and a
-    first snapshot with no briefing gives [], whatever a later one carries.
+PLANNER_PROMPT_MARKERS = (
+    "banto runs this pane and adds the following to the text above.",
+    "Write the Plan with write_plan, once per version, in the operator's language:",
+)
 
-    Only the system prompt of a snapshot counts. briefings() above counts every line that quotes a
-    briefing, and a Director's file, or a Worker that read the briefing text while working on it,
-    quotes it dozens of times: of 21 banto sessions from one project, whole-file counts gave a
-    Director a Worker's briefing and a Worker a Goinkyo's. Claude Code writes the snapshot from
-    2.1.265; an older file has none, and a Goinkyo in one stays filed as a Worker."""
+
+def first_snapshot_prompt(path):
+    """Only the first snapshot's system prompt identifies this session's briefing."""
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             if "prompt_snapshot" not in line:
@@ -785,11 +793,21 @@ def snapshot_members(path):
             if not isinstance(att, dict) or att.get("type") != "prompt_snapshot":
                 continue
             prompt = att.get("systemPrompt")
-            text = prompt if isinstance(prompt, str) else json.dumps(prompt, ensure_ascii=False)
-            found = [m.groups() for m in WORKER_BRIEFING_RE.finditer(text)]
-            found += [("goinkyo", m.group(1)) for m in GOINKYO_BRIEFING_RE.finditer(text)]
-            return found
-    return []
+            return prompt if isinstance(prompt, str) else json.dumps(prompt, ensure_ascii=False)
+    return ""
+
+
+def snapshot_members(path):
+    """Find Worker and Goinkyo briefings in the first snapshot's system prompt."""
+    text = first_snapshot_prompt(path)
+    found = [m.groups() for m in WORKER_BRIEFING_RE.finditer(text)]
+    found += [("goinkyo", m.group(1)) for m in GOINKYO_BRIEFING_RE.finditer(text)]
+    return found
+
+
+def planner_snapshot(path):
+    prompt = first_snapshot_prompt(path)
+    return any(marker in prompt for marker in PLANNER_PROMPT_MARKERS)
 
 
 def _assign_role(s):
@@ -798,6 +816,12 @@ def _assign_role(s):
     elif set(s.tools) & DIRECTOR_ONLY_TOOLS:
         s.role = "director"
         s.evidence = "uses " + ",".join(sorted(set(s.tools) & DIRECTOR_ONLY_TOOLS))
+    elif set(s.tools) & PLANNER_ONLY_TOOLS or s.planner_request_read or planner_snapshot(s.path):
+        s.role = "planner"
+        s.evidence = ("uses " + ",".join(sorted(set(s.tools) & PLANNER_ONLY_TOOLS))
+                      if set(s.tools) & PLANNER_ONLY_TOOLS else
+                      "reads the banto Planner request file" if s.planner_request_read else
+                      "first system-prompt snapshot carries the Planner briefing")
     elif s.tools:
         s.role = "worker"
         s.evidence = "banto tools: " + ",".join(sorted(s.tools)) + " (no director-only tool)"
@@ -950,7 +974,7 @@ def build_errands(s):
             ts = ev[1] if kind != "call" else None
             if ts:
                 last_ts = ts
-            if kind == "deliver" and cur is None:
+            if kind == "deliver" and cur is None and any(p[0] != "banto" for p in ev[3]):
                 cur = Errand(s.id, s.role, "errand", ev[1], ev[2])
             elif kind == "call":
                 (cur.calls if cur is not None else between).append(ev[1])

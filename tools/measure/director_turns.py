@@ -10,7 +10,7 @@ import sys
 import transcripts as tr
 
 
-TRIGGERS = ("operator-typed", "relay-woken", "other/unknown")
+TRIGGERS = ("operator-typed", "relay-woken", "banto-notice", "other/unknown")
 
 
 def turns_for(s, seen):
@@ -36,6 +36,10 @@ def turns_for(s, seen):
                 trigger = "other/unknown"
             current = {"start": ts, "trigger": trigger, "characters": 0, "lines": 0, "decisions": 0}
             turns.append(current)
+        elif kind == "deliver" and current is not None and current["trigger"] in ("relay-woken", "banto-notice"):
+            senders = current.setdefault("senders", set())
+            senders.update(p[0] for p in ev[3])
+            current["trigger"] = "banto-notice" if senders == {"banto"} else "relay-woken"
         elif kind in ("atext", "decision"):
             if current is None:
                 current = {"start": ev[1], "trigger": "other/unknown", "characters": 0, "lines": 0, "decisions": 0}

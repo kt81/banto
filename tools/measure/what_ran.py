@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import transcripts as tr  # noqa: E402
 
-ROLES = ("director", "worker", "goinkyo", "subagent", "solo")
+ROLES = ("director", "planner", "worker", "goinkyo", "subagent", "solo")
 CSV_NAMES = ["ledger_roles.csv", "ledger_sessions.csv", "ledger_errands.csv"]
 LIMITS = (("top", "--top", 0, 1_000_000),)
 _MIN_TS = datetime.min.replace(tzinfo=timezone.utc)
@@ -381,7 +381,7 @@ def print_report(args, weights, since, until, sessions, dups, rtal, stal, errand
     P(f"files {len(sessions)}; calls that ran {sum(t.calls for t in rtal.values())}; "
       f"left out as placeholders (synthetic or no tokens) {skipped_calls(sessions)}; "
       f"duplicate message ids dropped across files {dups}")
-    P("role: director = used a Director-only banto tool; worker / goinkyo = banto tools only, told apart by the briefing in the "
+    P("role: director = used a Director-only banto tool; planner = used a Planner-only tool, read its request file or has its briefing in the first snapshot; worker / goinkyo = banto tools only, told apart by the briefing in the "
       "file's first system-prompt snapshot (Claude Code 2.1.265+; an older file reads as a worker); subagent = a file under "
       "'subagents'; solo = no banto tool. Effort is the `effort` field of each assistant record ('?' = none recorded).")
     P("")

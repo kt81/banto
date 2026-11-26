@@ -24,7 +24,7 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import transcripts as tr  # noqa: E402
 
-ROLES = ("director", "worker", "other")
+ROLES = ("director", "planner", "worker", "other")
 
 
 def med(xs):
@@ -36,7 +36,7 @@ def fmt(x):
 
 
 def role_of(s):
-    return "director" if s.role == "director" else ("worker" if s.role == "worker" else "other")
+    return s.role if s.role in ("director", "planner", "worker") else "other"
 
 
 def attach_order(s):

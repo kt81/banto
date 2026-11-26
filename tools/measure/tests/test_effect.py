@@ -173,8 +173,8 @@ class TriggerKinds(unittest.TestCase):
         self.assertEqual(self.turn(self.OPERATOR), "operator")
         self.assertEqual(self.turn(self.FROM_OPERATOR), "operator")
 
-    def test_a_relay_nudge_or_a_delivery_carrying_a_worker_or_goinkyo_message_starting_the_turn_is_worker(self):
-        self.assertEqual(self.turn(self.NUDGE), "worker")
+    def test_a_relay_wake_does_not_identify_its_sender(self):
+        self.assertEqual(self.turn(self.NUDGE), "relay")
         self.assertEqual(self.turn(self.FROM_WORKER), "worker")
         self.assertEqual(self.turn(self.FROM_GOINKYO), "worker")
 
@@ -184,7 +184,7 @@ class TriggerKinds(unittest.TestCase):
         self.assertEqual(self.turn(self.OPERATOR, self.FROM_DIRECTOR_ONLY), "operator")
 
     def test_the_most_recent_start_wins(self):
-        self.assertEqual(self.turn(self.OPERATOR, self.NUDGE), "worker")
+        self.assertEqual(self.turn(self.OPERATOR, self.NUDGE), "relay")
         self.assertEqual(self.turn(self.NUDGE, self.OPERATOR), "operator")
 
     def test_self_is_what_is_left_when_neither_started_the_turn(self):
@@ -195,7 +195,7 @@ class TriggerKinds(unittest.TestCase):
     def test_a_correction_the_director_found_itself_still_counts_as_what_started_its_turn(self):
         # the rule cannot see self-correction: only a human reading the candidate can say it was self
         self.assertEqual(self.turn(self.OPERATOR, *self.OWN), "operator")
-        self.assertEqual(self.turn(self.NUDGE, self.RESULT, *self.OWN), "worker")
+        self.assertEqual(self.turn(self.NUDGE, self.RESULT, *self.OWN), "relay")
 
     def test_a_candidate_is_never_its_own_input(self):
         evs = [self.OPERATOR, ("atext", when(10, 2), "I was wrong")]
@@ -205,7 +205,7 @@ class TriggerKinds(unittest.TestCase):
     # -- by predecessor: the secondary column, the most recent input of any kind
     def test_the_predecessor_is_the_most_recent_input_of_any_kind(self):
         self.assertEqual(self.prev(self.OPERATOR), "operator")
-        self.assertEqual(self.prev(self.NUDGE), "worker")
+        self.assertEqual(self.prev(self.NUDGE), "relay")
         self.assertEqual(self.prev(self.FROM_WORKER), "worker")
         self.assertEqual(self.prev(self.OPERATOR, self.RESULT), "self")
         self.assertEqual(self.prev(self.RESULT, self.OPERATOR), "operator")
@@ -213,6 +213,15 @@ class TriggerKinds(unittest.TestCase):
         self.assertEqual(self.prev(self.FROM_DIRECTOR_ONLY), "self")
         self.assertEqual(self.prev(), "self")
         self.assertEqual(self.prev(self.OPERATOR, *self.OWN), "operator")
+
+    def test_banto_planner_and_mixed_deliveries_are_not_worker_reports(self):
+        for sender in ("banto", "planner"):
+            delivery = ("deliver", when(10, 1), [(sender, None, "to you", "notice")])
+            self.assertEqual(self.turn(self.NUDGE, delivery), sender)
+            self.assertEqual(self.prev(delivery), sender)
+        mixed = ("deliver", when(10, 1), [("banto", None, "to you", "notice"),
+                                          ("worker-1", None, "to you", "report")])
+        self.assertEqual(self.turn(self.NUDGE, mixed), "mixed")
 
 
 class OperatorMessageRule(unittest.TestCase):
@@ -776,12 +785,12 @@ class EffectEndToEnd(unittest.TestCase):
         self.assertEqual((c1["escapes"]["candidates_a"], c2["escapes"]["candidates_a"]), (1, 1))
         self.assertEqual((c1["escapes"]["fix_commits"], c2["escapes"]["fix_commits"]), (1, 0))
         self.assertIsNone(c1["escapes"]["judged_a"])
-        self.assertEqual(c1["reversals"]["by_trigger"], {"operator": 1, "worker": 2, "self": 0})
-        self.assertEqual(c1["reversals"]["by_predecessor"], {"operator": 1, "worker": 1, "self": 1})
+        self.assertEqual(c1["reversals"]["by_trigger"], dict.fromkeys(qr.TRIGGERS, 0) | {"operator": 1, "worker": 2})
+        self.assertEqual(c1["reversals"]["by_predecessor"], dict.fromkeys(qr.TRIGGERS, 0) | {"operator": 1, "worker": 1, "self": 1})
         self.assertEqual([(c["trigger"], c["predecessor"]) for c in c1["reversals"]["candidates"]],
                          [("operator", "operator"), ("worker", "worker"), ("worker", "self")])
         self.assertIsNone(c1["reversals"]["judged"])
-        self.assertEqual(c2["reversals"]["by_trigger"], {"operator": 0, "worker": 0, "self": 0})
+        self.assertEqual(c2["reversals"]["by_trigger"], dict.fromkeys(qr.TRIGGERS, 0))
         self.assertEqual(c1["lead_time_s"], 29 * 60)        # first errand opened 10:01, last commit 10:30
         self.assertIsNone(c2["lead_time_s"])
         self.assertIn("never reported", c2["lead_time_note"])
@@ -798,8 +807,8 @@ class EffectEndToEnd(unittest.TestCase):
         self.assertEqual(s["escapes"]["changes_with_candidate_a"], 2)
         self.assertEqual((s["escapes"]["changes_with_fix_commits"], s["escapes"]["fix_commits"]), (1, 1))
         self.assertEqual(s["reversals"]["candidates_b"], 3)
-        self.assertEqual(s["reversals"]["by_trigger"], {"operator": 1, "worker": 2, "self": 0})
-        self.assertEqual(s["reversals"]["by_predecessor"], {"operator": 1, "worker": 1, "self": 1})
+        self.assertEqual(s["reversals"]["by_trigger"], dict.fromkeys(qr.TRIGGERS, 0) | {"operator": 1, "worker": 2})
+        self.assertEqual(s["reversals"]["by_predecessor"], dict.fromkeys(qr.TRIGGERS, 0) | {"operator": 1, "worker": 1, "self": 1})
         self.assertEqual(s["lead_time"], {"median_s": 29 * 60, "max_s": 29 * 60, "changes_with_lead_time": 1, "changes_without_lead_time": 1})
         self.assertEqual(s["left_out_errands"], {"errands": 2, "changes": 2, "unowned": 0})
         self.assertEqual(s["parallelism"]["share"], 60 / 420)
@@ -835,9 +844,10 @@ class EffectEndToEnd(unittest.TestCase):
         e1 = doc["changes"][0]["effect"]
         self.assertEqual(e1["escapes"]["judged_a"], {"real": 1, "not": 0, "unsure": 0, "unjudged": 0})
         self.assertEqual(doc["changes"][1]["effect"]["escapes"]["judged_a"], {"real": 0, "not": 1, "unsure": 0, "unjudged": 0})
-        self.assertEqual(e1["reversals"]["judged"], {"operator": {"real": 1, "not": 0, "unsure": 0, "unjudged": 0},
-                                                      "worker": {"real": 0, "not": 0, "unsure": 1, "unjudged": 1},
-                                                      "self": {"real": 0, "not": 0, "unsure": 0, "unjudged": 0}})
+        expected = {t: {"real": 0, "not": 0, "unsure": 0, "unjudged": 0} for t in qr.TRIGGERS}
+        expected["operator"]["real"] = 1
+        expected["worker"].update(unsure=1, unjudged=1)
+        self.assertEqual(e1["reversals"]["judged"], expected)
         s = doc["summary"]
         self.assertEqual(s["escapes"]["judged_a"], {"real": 1, "not": 1, "unsure": 0, "unjudged": 0})
         self.assertEqual(s["reversals"]["judged"]["operator"]["real"], 1)

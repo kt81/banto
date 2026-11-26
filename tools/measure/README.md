@@ -12,8 +12,8 @@ networking module.
 ## What each script answers
 
 **`director_turns.py`: what a Claude Director wrote in each turn.** It prints
-each Director session's turns, their trigger (`operator-typed`, `relay-woken` or
-`other/unknown`), assistant text characters and lines, and whether it called
+each Director session's turns, their trigger (`operator-typed`, `relay-woken`,
+`banto-notice` or `other/unknown`), assistant text characters and lines, and whether it called
 `request_decision`; the session totals count turns by trigger and decision calls.
 It prints counts and session metadata, no conversation text, and writes no file.
 Run `python tools/measure/director_turns.py --project PROJECT --since 2026-11-01`
@@ -28,6 +28,10 @@ to select a project and a starting date. The shared `--root`, `--project`,
   unrecognized tag counts as unknown. This conservative rule can miss operator
   messages in older transcripts without an origin. Relay-prefix checks can also
   mistake an operator who typed that exact prefix for a wake.
+- A relay wake followed by a delivery solely from banto is `banto-notice`; a wake
+  with no delivery, or a delivery mixing banto with other senders, is `relay-woken`.
+  The wake alone does not identify its sender. A delivery during an operator turn
+  does not change what started that turn.
 - Only assistant text blocks outside sidechains count; tool inputs, tool results
   and thinking do not. Characters are Unicode code points, and lines are counted
   separately per text block using `splitlines()` (a trailing newline adds no empty
@@ -47,7 +51,14 @@ delegated work as the Director and its Workers exchange it: for a Worker, it
 opens at the delivery of an instruction and closes at the Worker's first
 `send_to_peer`, the report it sends back; for the Director, a solo session and a
 subagent, a turn opens at each operator message or relay nudge and runs to the
-next. A session's role is `director`, `worker`, `goinkyo`, `subagent` or `solo`. The
+next; a Planner uses the same turn boundaries. A session's role is `director`,
+`planner`, `worker`, `goinkyo`, `subagent` or `solo`. A Planner is identified by
+its exclusive `write_plan` or `release_plan` call, a `Read` of a path containing
+`mcp/planner/` (with either slash style), or either of two fixed Planner briefing
+sentences in the first system-prompt snapshot; a Director is also identified by
+`open_planner` or `close_planner`. A Planner that has not called either exclusive
+tool, read the request file or recorded the briefing cannot be distinguished from a Worker by the current parser, since `read_plan`
+and other member tools are shared. The
 Goinkyo uses the same banto tools as a Worker and no Director-only one, so only its
 briefing tells them apart: the scripts read it from the system prompt in the file's first
 `prompt_snapshot` record (Claude Code 2.1.265 and later; a Goinkyo file from an older
@@ -164,7 +175,7 @@ characters of a session id, and no conversation text.
   `mcp_tool_call_end` whose `invocation.server` is `banto` and `invocation.tool` is
   `consult_goinkyo`, its `kind` from `invocation.arguments`. A Director is a session that
   called any Director-only banto tool (`consult_goinkyo`, `dismiss_goinkyo`, `name_member`,
-  `request_decision`, the same rule as `transcripts.py`), so a Director that never consulted
+  `request_decision`, `open_planner`, `close_planner`, the same rule as `transcripts.py`), so a Director that never consulted
   still has a row of zeros on each day it was active. A subagent's file is left out.
 - **Refused calls are not consultations.** banto refuses a consultation (a Goinkyo is
   already in the cell, a missing argument) with an error result. In Claude Code that is a
@@ -270,9 +281,10 @@ then speed, then operator effort, then cost.
    unjudged by the line a person wrote for it.
 3. **Director reversals by trigger.** Each (b) candidate is classified by what
    started the Director's turn in which it was written: `operator` (the last thing
-   to start a turn was a message the operator typed), `worker` (a relay nudge, or a
-   `check_messages` answer carrying a Worker's or Goinkyo's message), `self`
-   (neither). Tool results, system text and the Director's own text do not start a
+   to start a turn was a message the operator typed), `worker`, `planner`, or `banto`
+   (a `check_messages` answer from that sender), `mixed` (different sender categories
+   in one delivery), `relay` (a wake whose sender is not known), or `self`
+   (none). Tool results, system text and the Director's own text do not start a
    turn. **By turn cannot see self-correction:** a turn that an operator message or a
    Worker report started counts as that trigger even when the Director found the
    error itself, so `self` is nearly empty by construction. A human who reads the
