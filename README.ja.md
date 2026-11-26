@@ -274,7 +274,8 @@ goinkyo_model = ""               # Codex の Goinkyo のモデル。"" は Codex
 goinkyo_effort = ""              # Codex の Goinkyo の -c model_reasoning_effort。"" は渡さない
 
 [keys]
-prefix = "C-b"      # ペインのプレフィックスのキー
+prefix = "C-b"      # ペインのプレフィックスのキー。バックスラッシュは TOML では 'C-\' か "C-\\" と書く
+                    # macOS/Linux で使えるキーは、i と m を除く a-z、スペース、\ ] ^ _ と、その数字の別名 4-7
 ```
 
 `--claude-home` と `--codex-home`、および設定の `claude_home` と `codex_home` は、banto が一覧にして再開するホームを変えます。ペインの中のエージェントが読むホームは変えません。banto は `CLAUDE_CONFIG_DIR` と `CODEX_HOME` を設定しないので、そのエージェントは環境変数か、`~/.claude` / `~/.codex` を使います。両者が違うとき、または環境変数が相対パスのときは、banto が起動時にステータスラインで一度だけ、両方の場所を挙げて知らせます。

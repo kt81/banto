@@ -141,7 +141,9 @@ fn push_utf8(out: &mut Vec<u8>, c: char) {
     out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
 }
 
-fn ctrl_byte(c: char) -> Option<u8> {
+/// `PrefixKey::matches` reads this table as key identity, so what arms the
+/// prefix and what prefix-prefix sends cannot drift apart.
+pub(crate) fn ctrl_byte(c: char) -> Option<u8> {
     let upper = c.to_ascii_uppercase();
     if upper.is_ascii_alphabetic() {
         return Some((upper as u8) & 0x1f);

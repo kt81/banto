@@ -2208,7 +2208,7 @@ A Worker added later gets the mean of the others' height.
 | `F4` | Switch the brigade bell between silent-while-the-Director's-pane-is-focused (the default) and ringing there too (bell only, no mark); says which in the status line, and a standing `BELL ALWAYS` badge shows left of the counts while it is on. One keystroke from the list or from a pane, taken by banto like `F2`/`F3` and never forwarded to the agent; with a modal or the search box open the key goes to that, and with the prefix armed it is an unbound prefix key (no toggle), as for `F2`/`F3` |
 | `F5` | Open the reading screen ("The reading screen" in "Decision (2026-11-26)"): a read-only modal with a brigade's open decision and its Progress. From a pane it reads the staged brigade; from the list, the selected row's brigade (a Director's, or a hosted member's), otherwise the staged one; with none, a status line says so and nothing opens. It stages and resumes nobody. Taken by banto like `F2`/`F3`/`F4` and never forwarded to the agent (it used to reach a pane as no bytes); with a modal or the search box open the key goes to that |
 | `q`/`Esc` (list focused) | Quit — at once when every hosted session is known to be idle (or none is hosted); otherwise the first press only shows the sessions it counts, each with its reason, for example `Esc again to quit — 2 not idle: a (unknown), b (busy)`, background commands as `(bg)` or `2 in background: x, y` (the forms and the naming are in "Is it idle? (the quit question)") and a second `q`/`Esc` within 3 seconds quits, since quitting ends every hosted process. N counts hosted sessions (staged or off-stage, collapsed tiles included) that are not known idle; "Is it idle? (the quit question)" below says what that is. Any other key, a mouse press, the focus leaving the list, every session becoming known idle or the window running out drops the prompt silently. Esc stays one of the two keys because an IME swallows `q`. Once quitting is decided the status line reads `Closing — ending N session(s)…` until the process exits. |
-| prefix chord (`Ctrl+B` default, `[keys] prefix` in config.toml), from sidebar or pane, then: | |
+| prefix chord (`Ctrl+B` default, `[keys] prefix` in config.toml; matched as below), from sidebar or pane, then: | |
 | … `o`/`Tab` | cycle focus through sidebar and panes |
 | … arrows | directional pane navigation |
 | … `Shift`+`Up`/`Down` | move the focused stack tile one slot up/down (focus stays on it) |
@@ -2221,6 +2221,20 @@ A Worker added later gets the mean of the others' height.
 | … `Esc` | cancel the prefix: nothing else happens — focus stays, nothing reaches the child |
 | … `x` | dismiss the focused Worker or Goinkyo from its brigade (one confirmation: it leaves for good — membership, read cursor and the mail addressed to it — and its session is not deleted; a Goinkyo's session is archived, see "Ending a consultation"); on a Director's tile, close the whole brigade (confirm; "Closing a brigade"); on a single session, end its process (confirm) |
 | … `b`/`Ctrl+B` | send a literal prefix chord through to the child |
+
+The prefix chord is matched by the physical key, not by how a platform spells
+it: only a character key arms; a Control chord (`C-<char>`) arms on a key with
+Ctrl and without Alt whose control byte is the chord's (`C-\` arms on the
+`Char('4')` + Ctrl that crossterm's Unix parser reports for byte 0x1C, and
+`C-b` on Ctrl+`B`; a character with no control byte must be equal); a bare
+chord arms on a key with neither Ctrl nor Alt; Shift is ignored in both. Alt
+never arms, because on Windows AltGr arrives as Ctrl+Alt. Tab, Enter and Esc
+never arm even where they encode to the same byte as a chord (`C-i`, `C-m`,
+`C-[`), so those chords arm only in a terminal that reports them as their own
+keys, not in one that sends the legacy byte. Pressing the prefix
+twice sends the chord's own key to the child, so what arms and what is sent
+come from one table (`key_encode::ctrl_byte`). The hint line names a Control
+chord as `Ctrl+B`, `Ctrl+Space`.
 
 While the prefix is armed, the status bar shows the full binding table.
 Otherwise its idle hints follow the focus, because that is where keys go: with
@@ -4134,7 +4148,8 @@ and column `toml` reports, with `` `worker_agent` does not take "typo"; it takes
 "inherit", "claude", "codex" or "select" `` under it. Every setting that reads one
 of a fixed set of words is held to it when the file is read: `relay` (`auto` or
 `manual`), `worker_agent`, `goinkyo_agent`, `goinkyo_consult`, `worker_autocompact`,
-`agents` and `[keys] prefix`, each trimmed and case-insensitive, and with `""` valid only where
+`agents`, each trimmed and case-insensitive, and `[keys] prefix`, which must be exactly
+`C-<char>` or one character (`C-b` is read, `c-b` is refused), and with `""` valid only where
 it is documented as an escape (`goinkyo_consult`, `worker_autocompact`, `agents`).
 Free text that goes to an agent (the model, effort and permission-mode settings,
 the prompts) has no fixed set and is not checked: the agent says what it thinks of

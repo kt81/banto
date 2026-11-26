@@ -465,7 +465,8 @@ goinkyo_model = ""               # a Codex Goinkyo's model; "" = Codex's own def
 goinkyo_effort = ""              # a Codex Goinkyo's -c model_reasoning_effort; "" = none
 
 [keys]
-prefix = "C-b"      # pane prefix chord
+prefix = "C-b"      # pane prefix chord; a backslash is written 'C-\' or "C-\\" in TOML
+                    # on macOS/Linux, portable chords are a-z except i and m, space, \ ] ^ _ and their digit twins 4-7
 ```
 
 `--claude-home`/`--codex-home` and the `claude_home`/`codex_home` keys change which home banto lists and resumes from. They do not change what the agent in a pane reads, because banto never sets `CLAUDE_CONFIG_DIR` or `CODEX_HOME`: that agent uses the variable, or `~/.claude` / `~/.codex`. When the two differ, or the variable is a relative path, banto says so once at startup on the status line, naming both locations.

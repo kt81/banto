@@ -34,7 +34,8 @@ use crate::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crate::key_encode::{
-    InputEffect, key_to_encoded_input, normalize_paste_line_endings, wrap_bracketed_paste,
+    InputEffect, ctrl_byte, key_to_encoded_input, normalize_paste_line_endings,
+    wrap_bracketed_paste,
 };
 use crate::member_name;
 use crate::model::Activity;
@@ -3633,15 +3634,39 @@ impl PrefixKey {
         Self::try_parse(raw).unwrap_or_default()
     }
 
+    /// Whether `key` is this chord, by the physical key and not by how a platform
+    /// spells it: crossterm's Unix parser reports Ctrl+`\` (byte 0x1C) as
+    /// `Char('4')` + Ctrl, so `"C-\\"` must arm on it. A Control chord matches a
+    /// Ctrl key that has the same control byte ([`ctrl_byte`]; a char without one
+    /// must be equal), a bare chord a key with neither Ctrl nor Alt. Shift is
+    /// ignored in both, since layouts differ on which characters need it. Alt
+    /// never arms: on Windows AltGr arrives as Ctrl+Alt, so a backslash typed with
+    /// AltGr must stay a backslash. Only `Char` keys arm; comparing the encoded
+    /// bytes of whole events would let `C-j` arm on Shift+Enter and `C-i` on Tab.
     fn matches(&self, key: &KeyEvent) -> bool {
-        key.code == self.code && key.modifiers == self.mods
+        let (KeyCode::Char(want), KeyCode::Char(got)) = (self.code, key.code) else {
+            return false;
+        };
+        if key.modifiers.alt {
+            return false;
+        }
+        if self.mods.ctrl {
+            key.modifiers.ctrl
+                && match (ctrl_byte(got), ctrl_byte(want)) {
+                    (Some(got), Some(want)) => got == want,
+                    _ => got == want,
+                }
+        } else {
+            !key.modifiers.ctrl && got == want
+        }
     }
 
     /// The chord as the operator would name it on a hint line: `Ctrl+B` for a
     /// Control chord (a letter shown upper-case), the character itself for a
-    /// bare one, `Space` for a bare space.
+    /// bare one, `Space` for a bare space and `Ctrl+Space` for a Control one.
     pub fn label(&self) -> String {
         match (self.code, self.mods) {
+            (KeyCode::Char(' '), mods) if mods == Modifiers::CONTROL => "Ctrl+Space".to_string(),
             (KeyCode::Char(c), mods) if mods == Modifiers::CONTROL => {
                 format!("Ctrl+{}", c.to_ascii_uppercase())
             }
@@ -28278,6 +28303,7 @@ mod tests {
         assert_eq!(PrefixKey::parse("C-]").label(), "Ctrl+]");
         assert_eq!(PrefixKey::parse("`").label(), "`");
         assert_eq!(PrefixKey::parse(" ").label(), "Space");
+        assert_eq!(PrefixKey::parse("C- ").label(), "Ctrl+Space");
         // Invalid values fall back to the default chord, so its label.
         assert_eq!(PrefixKey::parse("").label(), "Ctrl+B");
         assert_eq!(PrefixKey::parse("C-").label(), "Ctrl+B");
@@ -28300,6 +28326,129 @@ mod tests {
         for raw in ["", "C-", "C-bb", "toolong"] {
             assert_eq!(PrefixKey::parse(raw), PrefixKey::default(), "raw = {raw:?}");
         }
+    }
+
+    // --- PrefixKey::matches -------------------------------------------------
+
+    fn ctrl_shift() -> Modifiers {
+        Modifiers {
+            ctrl: true,
+            alt: false,
+            shift: true,
+        }
+    }
+
+    #[test]
+    fn a_prefix_arms_on_every_spelling_of_its_physical_key() {
+        // crossterm's Unix parser reads 0x1C..=0x1F as Ctrl+'4'..'7'; Windows
+        // reports Ctrl+^ as Ctrl+Shift+'6'.
+        let arming: [(&str, KeyCode, Modifiers); 12] = [
+            ("C-\\", KeyCode::Char('4'), Modifiers::CONTROL),
+            ("C-\\", KeyCode::Char('\\'), Modifiers::CONTROL),
+            ("C-]", KeyCode::Char('5'), Modifiers::CONTROL),
+            ("C-^", KeyCode::Char('6'), Modifiers::CONTROL),
+            ("C-^", KeyCode::Char('6'), ctrl_shift()),
+            ("C-^", KeyCode::Char('^'), Modifiers::CONTROL),
+            ("C-_", KeyCode::Char('7'), Modifiers::CONTROL),
+            ("C-4", KeyCode::Char('\\'), Modifiers::CONTROL),
+            ("C-b", KeyCode::Char('B'), Modifiers::CONTROL),
+            ("C-@", KeyCode::Char(' '), Modifiers::CONTROL),
+            ("C- ", KeyCode::Char('@'), Modifiers::CONTROL),
+            ("A", KeyCode::Char('A'), Modifiers::SHIFT),
+        ];
+        for (raw, code, mods) in arming {
+            let prefix = PrefixKey::parse(raw);
+            let key = KeyEvent::new(code, mods);
+            assert!(prefix.matches(&key), "{raw:?} should arm on {key:?}");
+            // What arms and what prefix-prefix sends are the same bytes.
+            assert_eq!(
+                crate::key_encode::key_to_bytes(&key),
+                crate::key_encode::key_to_bytes(&prefix.as_key_event()),
+                "{raw:?} / {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefix_does_not_arm_on_a_key_that_merely_encodes_alike() {
+        let ctrl_alt = Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: false,
+        };
+        let not_arming: [(&str, KeyCode, Modifiers); 11] = [
+            ("C-j", KeyCode::Enter, Modifiers::SHIFT),
+            ("C-j", KeyCode::Enter, Modifiers::NONE),
+            ("C-i", KeyCode::Tab, Modifiers::NONE),
+            ("C-[", KeyCode::Esc, Modifiers::NONE),
+            ("C-b", KeyCode::Esc, Modifiers::NONE),
+            // An AltGr-typed backslash on Windows.
+            ("C-\\", KeyCode::Char('\\'), ctrl_alt),
+            ("C-\\", KeyCode::Char('4'), ctrl_alt),
+            ("b", KeyCode::Char('b'), Modifiers::CONTROL),
+            ("C-b", KeyCode::Char('b'), Modifiers::NONE),
+            ("C-b", KeyCode::Char('b'), Modifiers::ALT),
+            ("C-4", KeyCode::Char('5'), Modifiers::CONTROL),
+        ];
+        for (raw, code, mods) in not_arming {
+            let prefix = PrefixKey::parse(raw);
+            let key = KeyEvent::new(code, mods);
+            assert!(!prefix.matches(&key), "{raw:?} must not arm on {key:?}");
+        }
+        // A bare chord with Alt held, and a Control chord whose char has no
+        // control byte (so only an equal char counts).
+        assert!(!PrefixKey::parse("b").matches(&KeyEvent::new(KeyCode::Char('b'), Modifiers::ALT)));
+        assert!(
+            PrefixKey::parse("C-3").matches(&KeyEvent::new(KeyCode::Char('3'), Modifiers::CONTROL))
+        );
+        assert!(
+            !PrefixKey::parse("C-3")
+                .matches(&KeyEvent::new(KeyCode::Char('4'), Modifiers::CONTROL))
+        );
+    }
+
+    #[test]
+    fn a_backslash_prefix_arms_on_what_a_unix_terminal_sends_and_sends_itself_through() {
+        let mut state = EmporiumState::new(PrefixKey::parse("C-\\"));
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        // Ctrl+\ as crossterm reports it on Unix.
+        let press = |state: &mut EmporiumState, app: &mut App| {
+            update(
+                state,
+                app,
+                &brigade,
+                Event::Input(InputEvent::Key(KeyEvent::new(
+                    KeyCode::Char('4'),
+                    Modifiers::CONTROL,
+                ))),
+                now,
+            )
+        };
+
+        let cmds = press(&mut state, &mut app);
+        assert!(
+            !cmds.iter().any(|cmd| matches!(cmd, Cmd::WritePty { .. })),
+            "arming forwards nothing"
+        );
+        assert_eq!(state.prefix_armed, Some(now));
+
+        let cmds = press(&mut state, &mut app);
+        let writes: Vec<&Cmd> = cmds
+            .iter()
+            .filter(|cmd| matches!(cmd, Cmd::WritePty { .. }))
+            .collect();
+        assert_eq!(writes.len(), 1, "expected exactly one WritePty");
+        assert!(matches!(
+            writes[0],
+            Cmd::WritePty { key: k, bytes } if *k == key && bytes.as_slice() == [0x1c]
+        ));
+        assert_eq!(state.prefix_armed, None);
     }
 
     // --- prefix arming / resolution (Focus::Pane, update_key) --------------
