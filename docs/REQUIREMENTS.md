@@ -990,8 +990,10 @@ line he had to act on.
    not a history, so a Director sends everything that still matters. *Why structured:* so
    that banto can draw a stage line, a task list and an off-plan list without parsing
    prose, and so that a later Plan can be linked to a task by its id.
-2. **Bounds, and a refusal rather than a cut.** `stage` 200 characters, task id 16,
-   task note 200, `off_plan` item 200, at most 40 tasks and 20 `off_plan` items, a
+2. **Bounds, and a refusal rather than a cut.** `stage` 80 characters (it was 200
+   until the stage was given one line of the Director's tile, item 7; a stored stage
+   longer than that is still read and drawn, cut by width, since the limit is on
+   writes), task id 16, task note 200, `off_plan` item 200, at most 40 tasks and 20 `off_plan` items, a
    decision question 4000. Counted in characters, not columns. Over a limit the call is
    refused with the field and the limit named, and nothing is written, so the Director
    writes a shorter one instead of the operator reading a sentence that stops. Control
@@ -1040,8 +1042,8 @@ line he had to act on.
    (the waiting magenta is not one of them: it means "wants the operator" everywhere
    else).
 6. **How the screen is fed.** The per-tick brigade facts carry a `ProgressGlance` (the
-   write count and the stage line; a defaulted field, so an older recording still
-   parses), next to the request's sequence number. While the screen is open the core
+   write count, the stage line and its write time; the last a defaulted field, so an
+   older recording still parses and reads as written long ago), next to the request's sequence number. While the screen is open the core
    emits one `Cmd` to read the bodies when it opens and again whenever the facts show
    that the request or the Progress of that brigade changed; the shell answers with an
    `Event` carrying the readings, with ages computed by the shell so that the core never
@@ -1049,12 +1051,32 @@ line he had to act on.
    the one on screen is dropped, and so is a decision the operator has already answered.
    A store read error is shown on the screen with its reason; on the tick it leaves the
    brigade's Progress out for that tick without hiding the brigade from the roster.
-7. **No stage on the list row.** The Progress `stage` was first drawn on the
-   Director's row, on line two after the `▸ decision` tag, and was taken out again after
-   the operator looked at it in a real sidebar: the sidebar is too narrow for a stage
-   line (he found it "completely crushed"). The row is as it was, the tag or the cwd.
-   The `stage` stays in the per-tick facts (`ProgressGlance`) with nothing drawing it,
-   since where it is shown is still to be decided.
+7. **The stage is on the Director's tile, not on the list row.** The Progress `stage`
+   was first drawn on the Director's row, on line two after the `▸ decision` tag, and
+   was taken out again after the operator looked at it in a real sidebar: the sidebar is
+   too narrow for a stage line (he found it "completely crushed"). The row is as it was,
+   the tag or the cwd. The operator then approved the bottom border row of the
+   Director's tile: `└─ ▸ 5m Phase 2 の実機確認待ち ───┘`, drawn by
+   `banto_tui::strip::render_stage_line` after the tile's title row, which it never
+   touches. It is a chip: one space of padding each side and all of it on the named
+   `DarkGray` background, with the marker and the age (`humanize_age_compact`) in `Gray`
+   on it and the stage in the normal text colour; the rest of the row is the border, and
+   one cell of it separates the left corner from the chip. *Why the background and the
+   cell (the operator's live checks, 2026-11-26):* on the Director's bottom border,
+   right under a busy Claude statusline, the bare line read as part of that statusline;
+   with the background but flush against the corner it still stood out, and its `▸`
+   fell in the column of the `⏵⏵` that opens the statusline's own line above. Two cells
+   of margin were tried and were more than wanted. A long stage also turns the chip into
+   a band across the row (a Director's ~40 Japanese characters did), so the tool
+   description asks for a few words naming the phase and the detail in the tasks; the
+   80-character limit is unchanged. The age is the
+   write time the tick carries (`ProgressGlance::updated_at_ms`) against the same clock
+   the frame's list age column uses, so the core reads none. The stage is cut by display
+   width with a `…`, by grapheme; the chip, padding included, is at most the tile's
+   width less eleven (two corners, the cell after the left one, eight of line), so
+   at least eight cells of line stay before the right corner. The tile is the one whose
+   member token is the Director's, wherever it stands in the stack; a Worker's tile never carries it. Nothing is drawn when the brigade has no
+   Progress or when the tile is under three rows high.
 8. **A quieter Director, by text only.** The default Director briefing says that in its
    own pane the Director writes answers to what the operator asked there and decision
    requests, and that a Worker's report, what it did next and the state of the work go to
@@ -1067,10 +1089,194 @@ line he had to act on.
    operator's own `director_prompt` is never edited. A Codex Director is told about
    `update_progress` with the other Director-only tools.
 
-*Not built.* A Planner role, a Plan (per brigade, versioned, a third section of the same
-screen below Progress, approved by an operator key on it), a link from a task id to the
-Plan, and a mark on lines changed since the screen was last closed. The screen's sections
-and the facts' sequence number are kept easy to extend for them.
+*Not built.* A link from a task id to a Plan, and a mark on lines changed since the screen
+was last closed. The Planner role and the Plan, which were also listed here, are
+"Decision (2026-11-26): the Planner". The screen's sections and the facts' sequence number
+are kept easy to extend.
+
+## Decision (2026-11-26): the Planner
+
+The operator's flow, written from the code as built: he gives the Director a request;
+the Director weighs its size and, for work that spans several errands and whose scope
+or completion is not settled in his words, opens a Planner; he moves to the Planner's pane and works the plan out with it; when it has
+come together the Director is told; the Director sends the Plan for a Goinkyo review or
+does not; the work is built; the Director closes the Planner. "Come together" means one
+thing: **the operator approved a saved draft with a key on the reading screen.** The
+reasons are the Director's and the implementer's unless marked as his.
+
+1. **A role, not a mode.** `BrigadeRole::Planner`, token `planner`, Claude only. A
+   brigade has at most one Planner and at most one open Plan, and the two lifetimes are
+   one: the Planner opens with its Plan and closes with it. Opening is refused with a
+   reason when the caller is not the Director, when a Planner or an open Plan exists,
+   and, as `consult_goinkyo` is, when Claude is disabled in `agents` or its home cannot
+   be resolved (the UI side refuses the same way, with a status line, for a Planner
+   whose launch cannot happen). **Invariant: the Planner's member row disappears only
+   inside the transaction that closes its Plan** (`close_open_plan_on`).
+   `dismiss_worker` refuses a Planner, and deleting a brigade (the disband) closes the Plan
+   first, as `abandoned` by the operator. Closing a brigade does not: that ends the
+   processes and deletes nothing, the Planner's row and the Plan stay, and reopening the
+   brigade resumes the Planner where it was. The Plan ends only by `close_planner`, by
+   prefix-`x` on the Planner's tile, or by a disband. Store tests pin it.
+2. **Addressing.** The Director and the Planner reach each other by `to`. Workers and
+   the Goinkyo cannot reach the Planner and it cannot reach them; a broadcast never
+   reaches it. The MCP descriptions of `send_to_peer` and `name_member` say so (the
+   Planner cannot be named).
+3. **Settings.** `[brigade] planner = "auto" | "off"`: only the Director briefing's
+   Planner paragraph changes, as `goinkyo_consult` changes one paragraph; `open_planner`
+   works the same at both and banto enforces neither. `[brigade] planner_prompt` is the
+   operator's role text (`{brigade}` substituted). The file banto writes has two parts:
+   that text, then a banto-owned paragraph that is always there (the request file's
+   path with forward slashes, the first-turn rule, `write_plan` and `release_plan`,
+   approval on `F5`, what `send_to_peer` is for). An empty `planner_prompt` leaves only
+   that paragraph and never Claude's default prompt, which also keeps the explanation of
+   banto messaging in place when the operator rewrites the text. `[brigade.claude]`
+   `planner_model` / `planner_effort` / `planner_permission_mode` / `planner_tools`
+   default to `opus`, `xhigh`, `auto` (the Goinkyo's) and `Read,Grep,Glob` and are passed
+   through unvalidated. Model and effort go to a new Planner only at creation; permission
+   mode and tools are on the command line of every launch, a resume included, so an
+   edit reaches an existing Planner at its next launch.
+4. **Launch.** `open_planner(title, request, known?)` writes the request file under the
+   data directory first, then in one transaction creates the Plan (state `drafting`)
+   and the member row; if the file cannot be written nothing is created. The next tick
+   launches the row by the path the Goinkyo uses, off stage too when the Director is
+   hosted. The command line, on create and on every resume: `--system-prompt-file`
+   (rewritten on each launch, so an edited `planner_prompt` reaches a resumed Planner),
+   `--tools <planner_tools>`, `--mcp-config` with `--strict-mcp-config`, `--no-chrome`,
+   and the wake hooks' `--settings`. On create also model, effort, permission mode and
+   a fixed ASCII first prompt after `--`. On resume always `--system-prompt-snapshot
+   off`, since the replaced prompt is not always the last section and the "compare the
+   last section" rule does not apply. A Planner never gets `--autocompact` (the
+   operator ruled it Workers-only), `--disallowedTools` or `--append-system-prompt`.
+5. **Measured, for the launch shape** (by worker-14 against the real `_mcp`, on haiku,
+   one run per condition; not seen on the default model):
+   - `--strict-mcp-config` drops the claude.ai connectors (65 tools), but not Chrome's
+     20 tools or their system-prompt section; `--no-chrome` does.
+   - On the first turn banto's MCP tools are not connected; from the second turn they
+     are. So the Planner reads the request file with `Read` on turn one, and is told to
+     say so, not to write the Plan into its answer, if the tools are still missing later.
+   - A Windows backslash path in the system prompt was misread by the model, so the
+     path is written with forward slashes.
+   - The auto-mode classifier refused `send_to_peer` once in a session with no banto
+     briefing. *Unverified:* whether `write_plan` and `send_to_peer` go through for the
+     real Planner on the default text, model and permission mode `auto`.
+   - `--system-prompt-file` is absent from `claude --help` on 2.1.332, but in an
+     interactive session driven through `ptydrv`, with banto's real `_mcp`, `--tools`,
+     `--strict-mcp-config`, `--no-chrome` and a first prompt after `--`, it started, the
+     replacement prompt reached the model, and turn one read the request file with `Read`.
+6. **Unasked exits and the pane.** A crash or an auto-update never closes the Plan and
+   never removes the row. The Planner is relaunched like a Worker, but where the Worker
+   path gives up and removes the row (nothing to resume, or a second death within the
+   cooldown) the Planner keeps its row and Plan and only its pane is unstaged, as the
+   Director's and Goinkyo's are; a Planner that never talked is re-created with the
+   first prompt, the request file still being there. `brigade_status` shows the open
+   Plan (title, state, version, age) and says when the Planner is not running.
+7. **The Plan.** Tables in schema v25 (`banto.db.before-v25` is taken on the first
+   open): `plans` (one row per Plan a brigade ever opened, numbered by position in its
+   history; state `drafting` / `approved` / `closed`; result `completed` / `abandoned`;
+   who closed it) and `plan_versions` (body, a one-line summary, kind `draft` /
+   `operator_approved` / `planner_released`, times). `plans_one_open` is a partial
+   unique index: the database, not the callers, keeps one open Plan per brigade, and a
+   row in any state but `closed` counts as open. `consultations` gains `role`, so a
+   Planner's ended session is titled `Planner: <title>` and a Goinkyo's is not; every
+   earlier row is a Goinkyo's. Bounds, refused rather than cut: body 30000 characters,
+   summary 200, request and `known` 20000 each, 100 versions per Plan. The body is
+   Markdown in the operator's language and banto does not interpret it. Deleted with
+   the brigade; dismissing a Worker does not touch it.
+8. **Tools.** `read_plan` (every member) returns the request and the version in force,
+   saying whether the operator approved it or the Planner released it, and tells anyone
+   but the Planner only that a newer draft awaits approval: a Worker must not build a
+   draft, and the Director's context should not carry two bodies. Whether a Plan is
+   approved is what `read_plan` says; a message that says so only tells the Director to
+   look. `write_plan(body, summary)` (Planner) records a new draft version and never
+   replaces what is in force. `release_plan` (Planner) puts the latest draft in force
+   without the operator, for a Plan he already approved and only to split or reorder its
+   tasks; scope and completion conditions go back to his key. `close_planner(result)`
+   (Director) closes the Plan and removes the row in one transaction, archives the
+   session and keeps the export; `completed` is refused when the Plan was never
+   approved, when Progress has no task, or when a task is `todo`, `doing` or `blocked`
+   (`abandoned` is never refused). The role is checked at call time and again inside
+   each write's transaction. Prefix-`x` on the Planner's tile closes it the same way by
+   the operator: `completed` if those conditions hold, otherwise `abandoned`, and the
+   Director is told. A Codex Director and Codex Workers have the tools in their
+   briefing's tool lists.
+9. **Approval.** On the reading screen `A` (Shift; `a` does nothing) approves exactly
+   the version displayed. If the Planner wrote a newer one since the screen read, the
+   key refuses with a short message and the screen re-reads. The hint names the key only
+   while something can be approved. The UI process writes the approval and, **in the
+   same transaction**, a message to the Director, so a failed second step cannot leave a
+   Plan approved and the Director never woken; `release_plan`'s notice is written the
+   same way. banto's own messages have their own sender (`BANTO_SENDER`, a reserved
+   word that cannot be a display name) and their own inbox frame saying this is banto's
+   record, not another AI's words; nothing about one looks like it came from the Planner.
+   The approval notice also tells the Director what to do next: read the Plan, copy its
+   tasks into Progress, and a review step that depends on the operator's
+   `goinkyo_consult`, which the UI process knows and passes into the same transaction.
+   At `off` and `disputes` (and an empty setting) the Plan goes to the Goinkyo only if
+   the operator asks; at `design` it goes, with kind `design`, if it contains a lasting
+   change; at `decisions` it always goes. At every level, while a review is out nothing
+   is built, and its findings go to the Planner with `send_to_peer` and to Progress, and
+   those touching scope or completion conditions also go to the operator with
+   `request_decision`. `release_plan`'s notice starts no review and says only that one
+   already out still blocks the build. The text is delivered when it matters and costs
+   the briefing nothing. A failed export is a status line and never undoes the
+   approval.
+10. **Export.** On approval and on close (including a close forced by a disband; closing
+    a brigade closes nothing, so it writes nothing) banto writes `<data dir>/plans/<brigade>-<number>.md`,
+    overwriting it: the title, the state, the body (the version in force, or the latest
+    draft marked as one when none was ever approved) and, on close, the final Progress.
+    It stays after a disband, in banto's own directory, never the repository.
+11. **The reading screen.** `F5` gains a **Plan** section after Progress: title and
+    state, the version shown and whether it is in force (by approval or by release) or a
+    pending draft, then the body with its lines kept and wrapped by display width. A
+    draft newer than the approved version is shown, marked as awaiting approval. The
+    section's data is fed as Progress's is: a Plan glance in the tick facts, and the body
+    read only while the screen is open.
+12. **The bell.** Typing in the Planner's pane does not arm the brigade's quiet bell and
+    does not spend a request's next quiet point; a turn banto started in it (the first
+    prompt, a relay wake) arms it as before, and so does Worker work. So when the
+    operator talks to the Planner and everyone else goes quiet, the bell still rings.
+    Today's code already kept the operator's input and banto's prompts as separate
+    stamps (`last_given_input`, `last_prompted`); the rule reads the later of the two.
+13. **Texts.** The default `planner_prompt` is written from scratch, in English whatever
+    the operator speaks, and tells the Planner to answer in his language. The Director
+    briefing gets a short Planner paragraph after the consultation paragraph, for every
+    Director with a non-empty template, varying with `planner`. `auto` says to open a
+    Planner only when both hold: the work spans several errands or commits, and what to
+    build, how far or when it is done is not settled in the operator's words; it names
+    what is not for a Planner (one more of a kind, a repair, a mechanical edit, an
+    investigation, one errand), says the operator's word overrides either way, and asks
+    for a one-line reason when a borderline case is done without one. `off` says only
+    when asked. The paragraph is short on purpose: Codex keeps a hook's context over
+    about 10,000 bytes as a truncated preview that can never be matched again, and the
+    longest consultation level on the shipped template with nine peers is 9892 bytes
+    with it, against the test's 9900. For the same reason "build only from what
+    `read_plan` shows in force" is in that tool's description, not the briefing. How to
+    use the Plan tools and what to send the Planner (an answer to a check it asked for,
+    an amendment, a review finding, batched, never status) is in the tool descriptions
+    and the approval notice. In the consultation paragraph a Plan is the exception to
+    "a shape the operator has approved is settled at this level": the Planner wrote it
+    and nobody reviewed it, so whether it goes to the Goinkyo before the first errand
+    that builds it is said by the approval notice (item 9), per level, because the
+    briefing had no room to say it per level. An existing Claude Director's recorded
+    briefing differs from the new one by this paragraph, so its next resume takes the
+    Director's `--system-prompt-snapshot off` path; *unverified here:* that path on a
+    real resume.
+
+*Set aside.*
+- A long-lived Goinkyo, because the Goinkyo and the Planner are present at once during
+  a review.
+- The request in the first prompt, because it is the operator's own words, often
+  Japanese, and would go on the command line; a file read on turn one carries it.
+- ToolSearch for banto's tools, because it fails on the first turn against the real
+  `_mcp`.
+- A tool that reads the Planner's transcript, because the Plan is the source of truth.
+- A generated file as the reading place, because the operator found an external viewer
+  awkward; the reading screen is.
+
+*Not built.* Plan metrics, a Codex Planner, a tile for the Plan, a mark on Progress that
+has gone stale, and replacing the Director's own system prompt. A link from a task id to
+the Plan is still the intent of the ids in the Plan's task headings, and nothing reads
+them yet.
 
 ## Goinkyo's product: `goinkyo_agent` (2026-11-23)
 
@@ -3615,9 +3821,10 @@ how the rendered text reaches the member differs by product:
   and Codex's own developer prompt otherwise casts the model as the primary
   agent of a different, unrelated multi-agent feature — measured end to end
   in `docs/notes/codex-briefing-spike.md`. So the addendum names every tool
-  the member's role may call: the three any member has, and to a Director
-  only, its own six (`request_decision`, `update_progress`, `name_member`,
-  `consult_goinkyo`, `dismiss_goinkyo`, `interrupt_worker`). Until 2026-11-16 it named
+  the member's role may call: the three any member has plus `read_plan`, and to a Director
+  only, its own eight (`request_decision`, `update_progress`, `name_member`,
+  `consult_goinkyo`, `dismiss_goinkyo`, `interrupt_worker`, `open_planner`,
+  `close_planner`). Until 2026-11-16 it named
   only the three, so a Codex Director was never told the four it had then; a test checks
   every advertised tool against the two lists.
 
@@ -4139,6 +4346,13 @@ message `send_to_peer` accepts, and every `consult_goinkyo` request (as the text
 the Goinkyo reads), is appended in full to
 `<data dir>/logs/brigade-<brigade_id>.log`, written by the
 `banto _mcp` process that handled the call (`crates/banto-io/src/brigade_log.rs`).
+The messages banto itself writes to the Director about a Plan are logged too, from
+banto's own sender (`from=banto`), once the transaction that wrote them has committed
+(the store hands the written row back and logs nothing): the `_mcp` process logs a
+release, and the UI process logs an approval and the operator's close from the
+Planner's tile, since it made those writes and knows the logs directory. The UI process
+drops a failed log write without a note, because stderr is the terminal there. A
+Director's own `close_planner` writes no message, so there is nothing to log.
 The file's name is not configurable, so it is always inside banto's own data
 directory (wherever the operator put that). An entry is a header line starting with `@@@` — UTC time, `message
 #<queue id>` or `consultation-request`, `from=<token>` and `to=<token>` or
@@ -4288,6 +4502,10 @@ same `tools/list`:
   `request_decision` is: replaces the brigade's Progress with what it sent, whole or not
   at all. Its result tells the Director the write was recorded and that it may end its
   turn with no text for the operator. See "Decision (2026-11-26)".
+- `open_planner(title, request, known?)`, `close_planner(result)` — Director-only;
+  `read_plan` — every member; `write_plan(body, summary)` and `release_plan` —
+  Planner-only. Each checks the caller's role from the store at call time and again
+  inside the write's transaction. See "Decision (2026-11-26): the Planner".
 - `interrupt_worker(member, text)` — Director-only (by the store's live membership,
   checked again in the write's transaction): delivers `text` to a Worker as an
   ordinary message and, for a Claude Worker whose relay is on, has banto refuse that

@@ -123,6 +123,13 @@ pub enum Modal {
     /// confirmed against, the panes hosted at that moment
     /// (`EmporiumState::close_reading`), so what it says is what Enter ends.
     ConfirmCloseBrigade { brigade_id: i64, name: String },
+    /// Prefix-`x` on a Planner's tile: Enter closes the brigade's open Plan and ends
+    /// the Planner with it, Esc cancels. Its own dialog rather than
+    /// [`Self::ConfirmKill`]'s, because a Planner is not dismissed like a Worker:
+    /// what leaves is a Plan, with its export and the operator's own word as the
+    /// result, and the dialog has to say so. `name` is the brigade, as it is called
+    /// to the operator.
+    ConfirmClosePlanner { brigade_id: i64, name: String },
     /// The emporium's prefix-`x` confirm dialog. Enter confirms, Esc cancels.
     /// What confirming does depends on who the focused pane is:
     ///
@@ -1234,6 +1241,7 @@ impl App {
             | Some(Modal::ConfirmGroupDelete { .. })
             | Some(Modal::ConfirmDisband { .. })
             | Some(Modal::ConfirmCloseBrigade { .. })
+            | Some(Modal::ConfirmClosePlanner { .. })
             | Some(Modal::ConfirmKill { .. })
             | Some(Modal::ConfirmCodexTrust)
             | Some(Modal::ConfirmDirectorReopen { .. })
@@ -1786,6 +1794,11 @@ impl App {
     /// [`Modal::ConfirmCloseBrigade`].
     pub fn open_confirm_close_brigade_modal(&mut self, brigade_id: i64, name: String) {
         self.modal = Some(Modal::ConfirmCloseBrigade { brigade_id, name });
+    }
+
+    /// Open the close-the-Plan confirm dialog — see [`Modal::ConfirmClosePlanner`].
+    pub fn open_confirm_close_planner_modal(&mut self, brigade_id: i64, name: String) {
+        self.modal = Some(Modal::ConfirmClosePlanner { brigade_id, name });
     }
 
     /// Open the reading screen — see [`Modal::Reading`].

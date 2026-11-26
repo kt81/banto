@@ -20,6 +20,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::display_text::display_lines;
 use crate::model::{BrigadeId, humanize_age};
+use crate::plan::{PlanGlance, PlanReading, PlanState, PlanVersion, VersionKind};
 use crate::progress::{BrigadeReading, TaskState};
 
 /// The screen never grows past this many columns: a line of prose longer than
@@ -68,9 +69,17 @@ pub enum ReadingBody {
     Unreadable(String),
 }
 
-/// The two counters whose change makes the body stale: the open request's
-/// sequence number and the Progress write count, as the tick last read them.
-pub type ReadingTrigger = (Option<i64>, Option<i64>);
+/// What the tick last read about a brigade that makes the body stale when it
+/// changes: the open request's sequence number, the Progress write count, and the
+/// open Plan's glance (its newest version, its state, whether that version is a
+/// draft). A change of any of them is a new read of the body, and only while the
+/// screen is open.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadingTrigger {
+    pub request: Option<i64>,
+    pub progress: Option<i64>,
+    pub plan: Option<PlanGlance>,
+}
 
 /// The open reading screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,8 +121,8 @@ impl ReadingState {
         &self.body
     }
 
-    pub fn asked(&self) -> ReadingTrigger {
-        self.asked
+    pub fn asked(&self) -> &ReadingTrigger {
+        &self.asked
     }
 
     pub fn set_asked(&mut self, asked: ReadingTrigger) {
@@ -132,6 +141,18 @@ impl ReadingState {
 
     pub fn set_unreadable(&mut self, reason: String) {
         self.body = ReadingBody::Unreadable(reason);
+    }
+
+    /// The Plan's number and the version the approval key approves, when the body
+    /// on screen shows a draft: the key approves exactly what is displayed, so it
+    /// is read from the body and never from the tick.
+    pub fn approvable(&self) -> Option<(i64, i64)> {
+        match &self.body {
+            ReadingBody::Loaded { reading, .. } => {
+                reading.plan.as_ref().and_then(|plan| plan.approvable())
+            }
+            _ => None,
+        }
     }
 
     /// Whether the body says a decision is open, which is what Enter on the
@@ -430,9 +451,91 @@ pub fn reading_lines(state: &ReadingState, now: Instant, width: usize) -> Vec<Re
                     }
                 }
             }
+            lines.push(ReadingLine::blank());
+            lines.push(ReadingLine::one("Plan", Tone::Heading));
+            plan_lines(&mut lines, reading.plan.as_deref(), elapsed, width);
         }
     }
     lines
+}
+
+/// The Plan section: which Plan and where it stands, then the draft awaiting the
+/// operator (what the approval key approves, so it comes first), then the version
+/// in force. Each version is its summary and its body wrapped by display width.
+fn plan_lines(
+    lines: &mut Vec<ReadingLine>,
+    plan: Option<&PlanReading>,
+    elapsed: Duration,
+    width: usize,
+) {
+    let Some(plan) = plan else {
+        lines.push(ReadingLine::one("No Plan is open.", Tone::Dim));
+        return;
+    };
+    let view = &plan.view;
+    let state = match view.plan.state {
+        PlanState::Drafting => "drafting, nothing approved yet",
+        PlanState::Approved => "approved",
+        PlanState::Closed => "closed",
+    };
+    hanging(
+        lines,
+        Vec::new(),
+        &format!("Plan {} \u{b7} {state}", view.plan.number),
+        Tone::Dim,
+        width,
+    );
+    hanging(lines, Vec::new(), &view.plan.title, Tone::Plain, width);
+    let age_of = |at_ms: i64| age_phrase((plan.read_at_ms - at_ms).max(0), elapsed);
+    if let Some(draft) = &view.pending {
+        lines.push(ReadingLine::blank());
+        hanging(
+            lines,
+            Vec::new(),
+            &format!(
+                "Draft, version {} \u{2014} awaits your approval",
+                draft.version
+            ),
+            Tone::Heading,
+            width,
+        );
+        hanging(
+            lines,
+            Vec::new(),
+            &format!("written {}", age_of(draft.created_at_ms)),
+            Tone::Dim,
+            width,
+        );
+        version_lines(lines, draft, width);
+    }
+    if let Some(version) = &view.in_force {
+        lines.push(ReadingLine::blank());
+        hanging(
+            lines,
+            Vec::new(),
+            &format!("In force, version {}", version.version),
+            Tone::Heading,
+            width,
+        );
+        let how = match (version.kind, version.approved_at_ms) {
+            (VersionKind::PlannerReleased, _) => {
+                format!("released by the Planner {}", age_of(version.created_at_ms))
+            }
+            (_, Some(at)) => format!("approved {}", age_of(at)),
+            (_, None) => format!("written {}", age_of(version.created_at_ms)),
+        };
+        hanging(lines, Vec::new(), &how, Tone::Dim, width);
+        version_lines(lines, version, width);
+    }
+}
+
+/// A version's summary, then its body.
+fn version_lines(lines: &mut Vec<ReadingLine>, version: &PlanVersion, width: usize) {
+    hanging(lines, Vec::new(), &version.summary, Tone::Dim, width);
+    lines.push(ReadingLine::blank());
+    for piece in wrap_to_width(&version.body, width) {
+        lines.push(ReadingLine::one(piece, Tone::Plain));
+    }
 }
 
 /// The furthest the screen can scroll in a terminal of `size`: the number of
@@ -457,7 +560,7 @@ mod tests {
     }
 
     fn loaded(reading: BrigadeReading) -> ReadingState {
-        let mut state = ReadingState::new(1, "alpha".to_string(), (None, None));
+        let mut state = ReadingState::new(1, "alpha".to_string(), ReadingTrigger::default());
         state.set_loaded(reading, now());
         state
     }
@@ -468,6 +571,7 @@ mod tests {
 
     fn sample() -> BrigadeReading {
         BrigadeReading {
+            plan: None,
             decision: Some(DecisionReading {
                 seq: 3,
                 question: Some("Ship it now?\nOr wait for the review.".to_string()),
@@ -494,6 +598,128 @@ mod tests {
                 age_ms: 90 * 1000,
             }),
         }
+    }
+
+    fn plan_version(
+        version: i64,
+        kind: crate::plan::VersionKind,
+        body: &str,
+    ) -> crate::plan::PlanVersion {
+        crate::plan::PlanVersion {
+            version,
+            body: body.to_string(),
+            summary: format!("summary {version}"),
+            kind,
+            created_at_ms: 1_000,
+            approved_at_ms: (kind == crate::plan::VersionKind::OperatorApproved).then_some(4_000),
+        }
+    }
+
+    fn with_plan(
+        pending: Option<crate::plan::PlanVersion>,
+        in_force: Option<crate::plan::PlanVersion>,
+    ) -> BrigadeReading {
+        BrigadeReading {
+            decision: None,
+            progress: None,
+            plan: Some(Box::new(PlanReading {
+                view: crate::plan::PlanView {
+                    plan: crate::plan::Plan {
+                        number: 3,
+                        title: "Split the store".to_string(),
+                        request: "split it".to_string(),
+                        state: if in_force.is_some() {
+                            PlanState::Approved
+                        } else {
+                            PlanState::Drafting
+                        },
+                        result: None,
+                        closed_by: None,
+                        opened_at_ms: 500,
+                        closed_at_ms: None,
+                    },
+                    in_force,
+                    pending,
+                },
+                read_at_ms: 7_201_000,
+            })),
+        }
+    }
+
+    #[test]
+    fn the_plan_comes_after_progress_and_says_none_is_open_when_there_is_none() {
+        let lines = texts(&reading_lines(&loaded(sample()), now(), 60));
+        let progress = lines.iter().position(|l| l == "Progress").unwrap();
+        let plan = lines.iter().position(|l| l == "Plan").unwrap();
+        assert!(progress < plan, "{lines:?}");
+        assert_eq!(lines.last().map(String::as_str), Some("No Plan is open."));
+    }
+
+    #[test]
+    fn a_draft_is_shown_before_the_version_in_force_with_both_bodies_in_full() {
+        use crate::plan::VersionKind::{Draft, OperatorApproved};
+        let reading = with_plan(
+            Some(plan_version(2, Draft, "the new body\nsecond line")),
+            Some(plan_version(1, OperatorApproved, "the old body")),
+        );
+        let state = loaded(reading);
+        assert_eq!(state.approvable(), Some((3, 2)));
+        let lines = texts(&reading_lines(&state, now(), 60));
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}: {lines:?}"))
+        };
+        assert!(at("Plan 3") < at("Draft, version 2"));
+        assert!(at("Draft, version 2") < at("the new body"));
+        assert!(at("the new body") < at("second line"));
+        assert!(at("second line") < at("In force, version 1"));
+        assert!(at("In force, version 1") < at("the old body"));
+        assert!(lines[at("Draft, version 2")].contains("awaits your approval"));
+        // Ages are the shell's read time minus the stored time: two hours for the
+        // draft, an hour and fifty-nine minutes for the approval.
+        assert!(
+            lines[at("Draft, version 2") + 1].contains("written 2h ago"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[at("In force, version 1") + 1].contains("approved 1h ago"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn with_nothing_drafted_there_is_nothing_to_approve() {
+        use crate::plan::VersionKind::OperatorApproved;
+        let state = loaded(with_plan(
+            None,
+            Some(plan_version(1, OperatorApproved, "in force")),
+        ));
+        assert_eq!(state.approvable(), None);
+        assert_eq!(loaded(sample()).approvable(), None);
+        let lines = texts(&reading_lines(&state, now(), 60));
+        assert!(!lines.iter().any(|l| l.contains("awaits your approval")));
+    }
+
+    #[test]
+    fn nothing_is_approvable_until_the_body_has_loaded() {
+        let state = ReadingState::new(1, "alpha".to_string(), ReadingTrigger::default());
+        assert_eq!(state.approvable(), None);
+    }
+
+    #[test]
+    fn a_plan_body_is_wrapped_by_display_width() {
+        use crate::plan::VersionKind::Draft;
+        let body = "あいうえおかきくけこ";
+        let state = loaded(with_plan(Some(plan_version(1, Draft, body)), None));
+        let lines = texts(&reading_lines(&state, now(), 9));
+        assert!(lines.contains(&"あいうえ".to_string()), "{lines:?}");
+        assert!(lines.contains(&"おかきく".to_string()), "{lines:?}");
+        // The Plan section is wrapped throughout; the sections above it have short
+        // fixed texts of their own.
+        let plan = lines.iter().position(|l| l == "Plan").unwrap();
+        assert!(lines[plan..].iter().all(|l| l.width() <= 9), "{lines:?}");
     }
 
     #[test]
@@ -548,9 +774,10 @@ mod tests {
         // word and the gaps the lead is forty-four, wider than a forty-column text. The
         // note used to start at column forty-four and be clipped away.
         let id: String = "あ".repeat(16);
-        let mut state = ReadingState::new(1, "alpha".to_string(), (None, None));
+        let mut state = ReadingState::new(1, "alpha".to_string(), ReadingTrigger::default());
         state.set_loaded(
             BrigadeReading {
+                plan: None,
                 decision: None,
                 progress: Some(ProgressReading {
                     progress: Progress {
@@ -576,6 +803,7 @@ mod tests {
                 .map(ReadingLine::plain)
                 .skip_while(|text| text.trim() != "Tasks")
                 .skip(1)
+                .take_while(|text| !text.is_empty())
                 .collect();
             // Nothing of the task is lost to the edge, the id included: the lead is
             // wrapped like the note, and the note's indent gives way to a wide
@@ -644,6 +872,7 @@ mod tests {
     #[test]
     fn the_screen_says_so_when_there_is_nothing_to_read() {
         let state = loaded(BrigadeReading {
+            plan: None,
             decision: None,
             progress: None,
         });
@@ -655,6 +884,7 @@ mod tests {
     #[test]
     fn a_decision_without_a_question_points_at_the_directors_pane() {
         let state = loaded(BrigadeReading {
+            plan: None,
             decision: Some(DecisionReading {
                 seq: 1,
                 question: None,
@@ -731,7 +961,7 @@ mod tests {
 
     #[test]
     fn a_failed_read_is_said_with_its_reason() {
-        let mut state = ReadingState::new(1, "a".to_string(), (None, None));
+        let mut state = ReadingState::new(1, "a".to_string(), ReadingTrigger::default());
         state.set_unreadable("database is locked".to_string());
         let joined = texts(&reading_lines(&state, now(), 80)).join("\n");
         assert!(joined.contains("Could not read this brigade: database is locked"));

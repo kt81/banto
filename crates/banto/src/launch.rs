@@ -94,6 +94,22 @@ pub(crate) enum SessionStart {
     },
 }
 
+/// The flags only a Planner's launch carries. One value rather than four
+/// fields, so a launch cannot carry half of them: a Planner without its
+/// `--strict-mcp-config` would load every MCP server the operator has configured,
+/// and one without its tool list would have all of Claude's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannerLaunch {
+    /// `--system-prompt-file <file>`: replaces Claude's own system prompt with the
+    /// file's text, which `[brigade] planner_prompt` and banto's own paragraph
+    /// make. Rewritten by the shell on every launch, resume included.
+    pub system_prompt_file: PathBuf,
+    /// `--tools <list>`: the built-in tools the Planner has
+    /// (`[brigade.claude] planner_tools`). `None` leaves Claude's full set, which
+    /// is what an operator who sets it empty asked for.
+    pub tools: Option<String>,
+}
+
 /// A pending agent invocation, turned into argv by [`Self::argv`]. This is the
 /// single place in the workspace that knows which flags each agent product
 /// takes and in what order.
@@ -136,6 +152,10 @@ pub(crate) enum AgentLaunch {
         /// a resumed session remembering a launch flag.
         autocompact: Option<String>,
         append_system_prompt: Option<String>,
+        /// What makes this launch a Planner's: its own system prompt in place of
+        /// Claude's, its tool list, and the two flags that keep it to banto's MCP
+        /// server and out of the browser. `None` for every other member.
+        planner: Option<PlannerLaunch>,
         /// `--settings <file>`: the one file banto passes a Claude Worker whose
         /// relay is on, holding the hook that gates its tool calls while an
         /// interrupt is unread. Pushed right before `--mcp-config`, so that both
@@ -534,6 +554,7 @@ impl AgentLaunch {
                 disallowed_tools,
                 autocompact,
                 append_system_prompt,
+                planner,
                 settings,
                 mcp_config,
                 first_prompt,
@@ -574,6 +595,26 @@ impl AgentLaunch {
                         argv.push("off".to_string());
                     }
                 }
+                if let Some(planner) = planner {
+                    argv.push("--system-prompt-file".to_string());
+                    argv.push(planner.system_prompt_file.to_string_lossy().into_owned());
+                    // On every resume, whatever `snapshot_off` says: a Planner's
+                    // prompt file is rewritten on each launch and Claude 2.1.265+
+                    // would otherwise reuse the one it recorded
+                    // (`banto_io::claude_briefing`), so an edited `planner_prompt`
+                    // would never reach a Planner that was resumed. The prompt
+                    // rides in a file, not in `append_system_prompt`, so the
+                    // briefing check that sets `snapshot_off` has nothing to read
+                    // here.
+                    if matches!(start, SessionStart::Resume(_)) {
+                        argv.push("--system-prompt-snapshot".to_string());
+                        argv.push("off".to_string());
+                    }
+                    if let Some(tools) = &planner.tools {
+                        argv.push("--tools".to_string());
+                        argv.push(tools.clone());
+                    }
+                }
                 if let Some(path) = settings {
                     argv.push("--settings".to_string());
                     argv.push(path.to_string_lossy().into_owned());
@@ -581,6 +622,14 @@ impl AgentLaunch {
                 if let Some(path) = mcp_config {
                     argv.push("--mcp-config".to_string());
                     argv.push(path.to_string_lossy().into_owned());
+                }
+                if planner.is_some() {
+                    // `--strict-mcp-config`: only the server named just above, none
+                    // of the operator's own, and it also ends the variadic
+                    // `--mcp-config`. `--no-chrome`: a Planner reads files and
+                    // writes a Plan; a browser is not among its tools.
+                    argv.push("--strict-mcp-config".to_string());
+                    argv.push("--no-chrome".to_string());
                 }
                 // `--mcp-config` and `--disallowedTools` take a variable number
                 // of values, so a prompt right behind them is read as one more
@@ -817,6 +866,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            planner: None,
             settings: None,
             mcp_config: None,
             first_prompt: None,
@@ -842,6 +892,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            planner: None,
             settings: None,
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-worker-1.json")),
             first_prompt: None,
@@ -868,6 +919,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            planner: None,
             settings: None,
             mcp_config: None,
             first_prompt: None,
@@ -886,6 +938,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            planner: None,
             settings: None,
             mcp_config: None,
             first_prompt: None,
@@ -907,6 +960,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            planner: None,
             settings: None,
             mcp_config: None,
             first_prompt: None,
@@ -934,6 +988,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            planner: None,
             settings: None,
             mcp_config: None,
             first_prompt: None,
@@ -952,6 +1007,7 @@ mod tests {
             disallowed_tools: Some("Edit".to_string()),
             autocompact: Some("250000".to_string()),
             append_system_prompt: Some("you are a Worker".to_string()),
+            planner: None,
             settings: None,
             mcp_config: Some(PathBuf::from("/tmp/mcp.json")),
             first_prompt: None,
@@ -984,6 +1040,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: Some("auto".to_string()),
             append_system_prompt: None,
+            planner: None,
             settings: None,
             mcp_config: None,
             first_prompt: None,
@@ -1002,6 +1059,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            planner: None,
             settings: None,
             mcp_config: None,
             first_prompt: None,
@@ -1023,6 +1081,7 @@ mod tests {
             disallowed_tools: Some("Edit,Write,NotebookEdit".to_string()),
             autocompact: None,
             append_system_prompt: None,
+            planner: None,
             settings: None,
             mcp_config: None,
             first_prompt: None,
@@ -1052,6 +1111,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            planner: None,
             settings: None,
             mcp_config: None,
             first_prompt: None,
@@ -1078,6 +1138,7 @@ mod tests {
             disallowed_tools: Some("Edit,Write,NotebookEdit".to_string()),
             autocompact: None,
             append_system_prompt: Some("you are the Director".to_string()),
+            planner: None,
             settings: None,
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-director.json")),
             first_prompt: None,
@@ -1192,6 +1253,7 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
             append_system_prompt: None,
+            planner: None,
             settings: None,
             mcp_config: None,
             first_prompt: None,
@@ -1852,6 +1914,7 @@ mod tests {
             disallowed_tools: Some("Bash,Edit".to_string()),
             autocompact: None,
             append_system_prompt: Some("brief".to_string()),
+            planner: None,
             settings: None,
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-goinkyo.json")),
             first_prompt: prompt.map(str::to_string),
@@ -1953,5 +2016,137 @@ mod tests {
         *first_prompt = Some(FIRST_PROMPT.to_string());
         let without = codex_member_launch(resume, BrigadeRole::Worker);
         assert_eq!(with.argv("codex"), without.argv("codex"));
+    }
+
+    fn planner_launch(start: SessionStart, tools: Option<&str>) -> AgentLaunch {
+        AgentLaunch::Claude {
+            start,
+            permission_mode: Some("auto".to_string()),
+            disallowed_tools: None,
+            autocompact: None,
+            append_system_prompt: None,
+            planner: Some(PlannerLaunch {
+                system_prompt_file: PathBuf::from("/data/planner/1-prompt.md"),
+                tools: tools.map(str::to_string),
+            }),
+            settings: Some(PathBuf::from("/data/hooks/1-planner.json")),
+            mcp_config: Some(PathBuf::from("/data/mcp/1-planner.json")),
+            first_prompt: None,
+        }
+    }
+
+    #[test]
+    fn a_created_planner_carries_its_prompt_file_tools_and_first_prompt_in_the_fixed_order() {
+        let mut launch = planner_launch(
+            SessionStart::Create {
+                model: Some("opus".to_string()),
+                effort: Some("xhigh".to_string()),
+            },
+            Some("Read,Grep,Glob"),
+        );
+        let AgentLaunch::Claude { first_prompt, .. } = &mut launch else {
+            unreachable!();
+        };
+        *first_prompt = Some("Start.".to_string());
+        assert_eq!(
+            launch.argv("claude"),
+            [
+                "claude",
+                "--model",
+                "opus",
+                "--effort",
+                "xhigh",
+                "--permission-mode",
+                "auto",
+                "--system-prompt-file",
+                "/data/planner/1-prompt.md",
+                "--tools",
+                "Read,Grep,Glob",
+                "--settings",
+                "/data/hooks/1-planner.json",
+                "--mcp-config",
+                "/data/mcp/1-planner.json",
+                "--strict-mcp-config",
+                "--no-chrome",
+                "--",
+                "Start.",
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn a_resumed_planner_always_turns_the_recorded_prompt_off_and_has_no_first_prompt() {
+        let launch = planner_launch(
+            SessionStart::Resume("sess-1".to_string()),
+            Some("Read,Grep,Glob"),
+        );
+        // Whatever the briefing check says: a Planner has none to compare.
+        for snapshot_off in [false, true] {
+            assert_eq!(
+                launch.argv_with_snapshot_off("claude", snapshot_off),
+                [
+                    "claude",
+                    "--resume",
+                    "sess-1",
+                    "--permission-mode",
+                    "auto",
+                    "--system-prompt-file",
+                    "/data/planner/1-prompt.md",
+                    "--system-prompt-snapshot",
+                    "off",
+                    "--tools",
+                    "Read,Grep,Glob",
+                    "--settings",
+                    "/data/hooks/1-planner.json",
+                    "--mcp-config",
+                    "/data/mcp/1-planner.json",
+                    "--strict-mcp-config",
+                    "--no-chrome",
+                ]
+                .map(str::to_string)
+            );
+        }
+    }
+
+    #[test]
+    fn a_planner_never_carries_the_flags_that_belong_to_other_roles() {
+        for start in [
+            SessionStart::Resume("sess-1".to_string()),
+            SessionStart::Create {
+                model: None,
+                effort: None,
+            },
+        ] {
+            let argv = planner_launch(start, Some("Read")).argv("claude");
+            for flag in [
+                "--append-system-prompt",
+                "--autocompact",
+                "--disallowedTools",
+            ] {
+                assert!(!argv.iter().any(|a| a == flag), "{flag} in {argv:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_planner_with_an_empty_tool_list_passes_no_tools_flag() {
+        let argv = planner_launch(SessionStart::Resume("s".to_string()), None).argv("claude");
+        assert!(!argv.iter().any(|a| a == "--tools"), "{argv:?}");
+        assert!(argv.iter().any(|a| a == "--system-prompt-file"));
+    }
+
+    #[test]
+    fn a_launch_without_the_planner_slot_is_what_it_always_was() {
+        let launch = every_claude_flag(SessionStart::Resume("sess-1".to_string()));
+        let argv = launch.argv("claude");
+        for flag in [
+            "--system-prompt-file",
+            "--tools",
+            "--strict-mcp-config",
+            "--no-chrome",
+        ] {
+            assert!(!argv.iter().any(|a| a == flag), "{flag} in {argv:?}");
+        }
     }
 }

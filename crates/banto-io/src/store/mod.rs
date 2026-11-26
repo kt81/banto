@@ -23,6 +23,7 @@ mod consultations;
 mod groups;
 mod migrations;
 mod pins;
+mod plans;
 mod progress;
 mod ui_prefs;
 
@@ -34,6 +35,10 @@ pub use brigades::{
 };
 pub use groups::{Group, GroupId};
 pub use migrations::SCHEMA_VERSION;
+pub use plans::{
+    ClosedPlan, Notice, OpenedPlanner, PlanApproval, PlanClosed, PlanClosing, PlanReleased,
+    PlanWritten,
+};
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

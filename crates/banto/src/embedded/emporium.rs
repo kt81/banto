@@ -45,11 +45,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::app::{App, Mode};
-use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, RelayMode, ResolvedAgents};
+use banto_core::config::{
+    AgentBinaries, BrigadeConfig, GoinkyoConsult, KeysConfig, RelayMode, ResolvedAgents,
+};
 use banto_core::engine::{
     self, Axis, BellCause, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
-    GoinkyoLook, GoinkyoRow, GroupJoinTargetData, LiveStatus, PrefixKey, RelayObservation,
-    SessionKey, SpawnRefusal, StoreIntent, brigade_label, decide_goinkyo,
+    GoinkyoLook, GoinkyoRow, GroupJoinTargetData, LiveStatus, PlannerLook, PrefixKey,
+    RelayObservation, SessionKey, SpawnRefusal, StoreIntent, brigade_label, decide_goinkyo,
+    decide_planner,
 };
 #[cfg(test)]
 use banto_core::engine::{GoinkyoObservation, GoinkyoSpawnCandidate};
@@ -60,9 +63,13 @@ use banto_core::model::{
     MemberToken, MessageGlance, Quiescence, SessionId, SessionToOpen,
 };
 use banto_core::pane_log as pane_lines;
+use banto_core::plan::{
+    PlanApprovalReport, PlanCloseCause, PlanCloseReport, PlanResult, render_export,
+};
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::screen::{SPAWN_COLS, SPAWN_ROWS, Screen};
 use banto_core::status::AgeThresholds;
+use banto_io::brigade_log::BrigadeLog;
 use banto_io::claude_briefing::{self, BriefingPattern};
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_activity;
@@ -71,6 +78,7 @@ use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::codex_queue::CodexQueueCli;
 use banto_io::data_dir::DataDir;
+use banto_io::data_dir::write_plan_export;
 use banto_io::file_identity::DirectorySpellings;
 use banto_io::input::{CrosstermInputReader, InputReader, StampedEvent};
 use banto_io::pane_log::PaneLog;
@@ -83,9 +91,13 @@ use banto_io::status::{
     LiveSession, ProcessProbe, SysinfoProbe, ancestry_distance, claude_nudgeable,
     claude_quiescence, live_activity, live_reports_busy, read_live_sessions, waiting_on_a_dialog,
 };
-use banto_io::store::{SCHEMA_VERSION, Store};
+use banto_io::store::{
+    ClosedPlan, Notice, PlanApproval, PlanClosed, PlanClosing, SCHEMA_VERSION, Store,
+};
 use banto_tui::paint;
-use banto_tui::strip::{StripData, StripMessage, render_strip, render_title_status};
+use banto_tui::strip::{
+    StripData, StripMessage, render_stage_line, render_strip, render_title_status,
+};
 use banto_tui::view::{self, WAITING_ACTIVITY_COLOR};
 
 use crate::launch;
@@ -887,7 +899,7 @@ fn event_loop(
         let mut goinkyo_dur = Duration::ZERO;
         while let Some(ev) = next_event(&mut events, &mut goinkyo_owed, || {
             let observe_start = Instant::now();
-            let observed = goinkyo_events(
+            let observed = role_events(
                 &state,
                 deps.store,
                 app,
@@ -1272,7 +1284,17 @@ fn execute_cmd(
         } => execute_queue_codex_message(key, session_id, message, deps),
         Cmd::SweepDataDir => execute_sweep_data_dir(deps),
         Cmd::OpenCodexTrustPane { key } => execute_open_codex_trust_pane(key, deps, handles),
-        Cmd::Store(intent) => execute_store_intent(intent, deps.store),
+        Cmd::Store(intent) => execute_store_intent_with(
+            intent,
+            deps.store,
+            data_dir_of(deps).map(|dir| dir.plans_dir()).as_deref(),
+            deps.brigade.goinkyo_consult(),
+            crate::mcp::message_log_for(
+                deps.brigade.message_log,
+                data_dir_of(deps).map(|dir| dir.logs_dir()),
+            )
+            .as_ref(),
+        ),
         Cmd::Reload => gather_reload(deps),
         Cmd::ForwardClipboardToHost { bytes } => {
             // Safe to write here, outside `draw`, specifically because OSC
@@ -1556,6 +1578,7 @@ fn build_open_launch(
             disallowed_tools: flags.disallowed_tools.map(str::to_string),
             autocompact: flags.autocompact.map(str::to_string),
             append_system_prompt: briefing.map(str::to_string),
+            planner: None,
             settings: None,
             mcp_config: None,
             first_prompt: first_prompt.map(str::to_string),
@@ -1656,6 +1679,24 @@ fn execute_open_embedded(
             os_error: None,
         }];
     }
+    // A Planner is Claude's, and Claude may have been switched off since its row was
+    // made. The UI refuses here, in words, as the Goinkyo's launch is refused at the
+    // `_mcp` side (`goinkyo_launch_refusal`): a Planner that cannot start says so,
+    // and is not left an empty tile.
+    let planner = matches!(&brigade, Some((_, _, BrigadeRole::Planner)));
+    if planner
+        && (target.agent != AgentKind::ClaudeCode
+            || !deps.enabled_agents.contains(&AgentKind::ClaudeCode))
+    {
+        return vec![Event::SpawnFailed {
+            key,
+            error: "the Planner needs Claude, which is not enabled (see `agents` in \
+                    config.toml)"
+                .to_string(),
+            refusal: SpawnRefusal::Refused,
+            os_error: None,
+        }];
+    }
     let claude_home = deps.claude_home;
     // Only read live sessions when a resume might actually need them — a
     // fresh (unresumed) spawn never does.
@@ -1693,6 +1734,28 @@ fn execute_open_embedded(
             os_error: None,
         }];
     };
+    if let (
+        Some((brigade_id, _, BrigadeRole::Planner)),
+        launch::AgentLaunch::Claude { planner: slot, .. },
+    ) = (&brigade, &mut launch)
+    {
+        match write_planner_prompt(deps, *brigade_id) {
+            Ok(system_prompt_file) => {
+                *slot = Some(launch::PlannerLaunch {
+                    system_prompt_file,
+                    tools: deps.brigade.planner_tools().map(str::to_string),
+                });
+            }
+            Err(err) => {
+                return vec![Event::SpawnFailed {
+                    key,
+                    error: format!("could not write the Planner's system prompt: {err}"),
+                    refusal: SpawnRefusal::ChannelWiring,
+                    os_error: os_error_of(&err),
+                }];
+            }
+        }
+    }
     // Each product reaches banto's own MCP server a different way: Claude via
     // a config file named on the argv, Codex via `-c` overrides built from
     // banto's executable path. Either can fail (a full disk, a moved
@@ -1844,7 +1907,126 @@ fn execute_open_embedded(
     }
 }
 
+/// [`execute_store_intent_in`] with no data directory, for a test that has no plan
+/// export to look at.
+#[cfg(test)]
 fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Event> {
+    execute_store_intent_in(intent, store, None)
+}
+
+/// [`execute_store_intent_with`] under the built-in consultation level.
+#[cfg(test)]
+fn execute_store_intent_in(
+    intent: StoreIntent,
+    store: &RefCell<Store>,
+    plans_dir: Option<&Path>,
+) -> Vec<Event> {
+    execute_store_intent_with(intent, store, plans_dir, Some(GoinkyoConsult::Design), None)
+}
+
+/// What closing a Plan did, as the core is told: which Plan, how it ended, and how
+/// the export went. The export is written here, from what the closing transaction
+/// returned, and its failure never undoes the close: the database holds the Plan.
+/// `plans_dir` is `None` only where banto has no data directory.
+fn plan_close_report(
+    closed: &ClosedPlan,
+    cause: PlanCloseCause,
+    plans_dir: Option<&Path>,
+) -> PlanCloseReport {
+    let number = closed.view.plan.number;
+    let export = match plans_dir {
+        Some(dir) => write_plan_export(
+            dir,
+            closed.brigade_id,
+            number,
+            &render_export(closed.brigade_id, &closed.view, closed.progress.as_ref()),
+        )
+        .map(|path| path.display().to_string())
+        .map_err(|err| err.to_string()),
+        None => Err("banto has no data directory".to_string()),
+    };
+    PlanCloseReport {
+        cause,
+        number,
+        // A closed Plan always carries its result; abandoned is the safe word for
+        // one a hand-edited store left without.
+        result: closed.view.plan.result.unwrap_or(PlanResult::Abandoned),
+        export,
+    }
+}
+
+/// The operator's approval, then the export of what is now in force. The export
+/// is written after the approval is stored and its failure never undoes the
+/// approval: the database holds the Plan. A Plan that cannot be read back for the
+/// export reports the failure in the same place a failed write does.
+fn approve_plan_report(
+    store: &mut Store,
+    brigade_id: BrigadeId,
+    number: i64,
+    version: i64,
+    plans_dir: Option<&Path>,
+    consult: Option<GoinkyoConsult>,
+    notice_log: Option<&BrigadeLog>,
+) -> Result<PlanApprovalReport, String> {
+    let approval = store
+        .approve_plan(brigade_id, number, version, consult)
+        .map_err(|err| err.to_string())?;
+    Ok(match approval {
+        PlanApproval::Approved {
+            number,
+            version,
+            notice,
+        } => {
+            log_notice_after_commit(notice_log, store, brigade_id, notice.as_ref());
+            let export = match (plans_dir, store.open_plan_view(brigade_id)) {
+                (None, _) => Err("banto has no data directory".to_string()),
+                (Some(_), Err(err)) => Err(err.to_string()),
+                (Some(_), Ok(None)) => {
+                    Err("the Plan closed before it could be exported".to_string())
+                }
+                (Some(dir), Ok(Some(view))) => write_plan_export(
+                    dir,
+                    brigade_id,
+                    number,
+                    &render_export(brigade_id, &view, None),
+                )
+                .map(|path| path.display().to_string())
+                .map_err(|err| err.to_string()),
+            };
+            PlanApprovalReport::Approved {
+                number,
+                version,
+                export,
+            }
+        }
+        PlanApproval::Stale { latest } => PlanApprovalReport::Stale { latest },
+        PlanApproval::NothingToApprove => PlanApprovalReport::NothingToApprove,
+        PlanApproval::NoOpenPlan => PlanApprovalReport::NoOpenPlan,
+    })
+}
+
+/// Append a message banto wrote to the Director inside a transaction to the opt-in
+/// message log, after that transaction committed. A log that cannot be written is
+/// dropped without a word: the terminal is in raw mode here, and the notice is
+/// delivered whether or not it is logged.
+fn log_notice_after_commit(
+    log: Option<&BrigadeLog>,
+    store: &Store,
+    brigade_id: BrigadeId,
+    notice: Option<&Notice>,
+) {
+    if let (Some(log), Some(notice)) = (log, notice) {
+        let _ = crate::mcp::log_banto_notice(log, store, brigade_id, notice);
+    }
+}
+
+fn execute_store_intent_with(
+    intent: StoreIntent,
+    store: &RefCell<Store>,
+    plans_dir: Option<&Path>,
+    consult: Option<GoinkyoConsult>,
+    notice_log: Option<&BrigadeLog>,
+) -> Vec<Event> {
     match intent {
         StoreIntent::IssueWake { brigade_id, token } => {
             let ok = store
@@ -2010,9 +2192,16 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                         progress: record.progress,
                     }
                 });
+                let plan = store.open_plan_view(brigade_id)?.map(|view| {
+                    Box::new(banto_core::plan::PlanReading {
+                        view,
+                        read_at_ms: now_ms,
+                    })
+                });
                 Ok::<_, banto_io::store::StoreError>(banto_core::progress::BrigadeReading {
                     decision,
                     progress,
+                    plan,
                 })
             })();
             vec![Event::BrigadeReadingRead {
@@ -2093,16 +2282,77 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
         }
         StoreIntent::Disband { brigade_id } => {
             let mut store = store.borrow_mut();
-            let result = store
-                .delete_brigade(brigade_id)
-                .map_err(|err| err.to_string())
-                .map(|()| {
-                    (
+            // An open Plan is closed in the same transaction as the brigade
+            // (`Store::delete_brigade`), and what that returned is the one place its
+            // text is still to be had: the export is written from it, and a second
+            // event tells the core how that went.
+            let (result, closed) = match store.delete_brigade(brigade_id) {
+                Ok(closed) => (
+                    Ok((
                         crate::session::load_hidden_member_ids(&store),
                         crate::session::load_directors(&store),
-                    )
+                    )),
+                    closed,
+                ),
+                Err(err) => (Err(err.to_string()), None),
+            };
+            let mut events = vec![Event::Disbanded { brigade_id, result }];
+            if let Some(closed) = closed {
+                events.push(Event::PlannerClosed {
+                    brigade_id,
+                    result: Ok(Some(plan_close_report(
+                        &closed,
+                        PlanCloseCause::Disband,
+                        plans_dir,
+                    ))),
                 });
-            vec![Event::Disbanded { brigade_id, result }]
+            }
+            events
+        }
+        StoreIntent::ClosePlanner { brigade_id } => {
+            let closed = store
+                .borrow_mut()
+                .close_plan(brigade_id, &PlanClosing::Operator);
+            let result = closed
+                .map_err(|err| err.to_string())
+                .map(|closed| match closed {
+                    PlanClosed::Closed(closed) => {
+                        log_notice_after_commit(
+                            notice_log,
+                            &store.borrow(),
+                            brigade_id,
+                            closed.notice.as_ref(),
+                        );
+                        Some(plan_close_report(
+                            &closed,
+                            PlanCloseCause::Operator,
+                            plans_dir,
+                        ))
+                    }
+                    // `NotDirector` and `Refused` are answers to the Director's
+                    // closing, never to the operator's; naming them keeps a new
+                    // answer from being read as "nothing to close".
+                    PlanClosed::NoOpenPlan | PlanClosed::NotDirector | PlanClosed::Refused(_) => {
+                        None
+                    }
+                });
+            vec![Event::PlannerClosed { brigade_id, result }]
+        }
+        StoreIntent::ApprovePlan {
+            brigade_id,
+            number,
+            version,
+        } => {
+            let result = approve_plan_report(
+                &mut store.borrow_mut(),
+                brigade_id,
+                number,
+                version,
+                plans_dir,
+                consult,
+                notice_log,
+            );
+            vec![Event::PlanApprovalAnswered { brigade_id, result }]
         }
         StoreIntent::DismissWorker { brigade_id, token } => {
             let mut store = store.borrow_mut();
@@ -2732,6 +2982,9 @@ fn gather_relay_observations_from(
                 .borrow()
                 .brigade_progress_glance(brigade.id)
                 .unwrap_or(None),
+            // Read the same way, for the same reason: a Plan row that cannot be
+            // read is none for this tick, and the open screen asks again.
+            plan: store.borrow().open_plan_glance(brigade.id).unwrap_or(None),
         });
         for member in members {
             let Some(session_id) = member.session_id.as_ref() else {
@@ -2908,9 +3161,11 @@ fn next_event(
     queue.pop_front()
 }
 
-/// The events this tick's Goinkyo looks call for, recorded in the pane log as
-/// they are read.
-fn goinkyo_events(
+/// The events this tick's Goinkyo and Planner looks call for, the Goinkyo's
+/// recorded in the pane log as they are read. Both come from one roster read per
+/// brigade: they are the same rows seen for two roles, and reading them twice a
+/// tick would double a cost the tick timings already name.
+fn role_events(
     state: &EmporiumState,
     store: &RefCell<Store>,
     app: &App,
@@ -2918,7 +3173,8 @@ fn goinkyo_events(
     timings: Option<&mut TickTimings>,
 ) -> Vec<Event> {
     let mut events = Vec::new();
-    for look in gather_goinkyo_looks(state, store, app, timings) {
+    let looks = gather_role_looks(state, store, app, timings);
+    for look in looks.goinkyo {
         if let Some(log) = pane_log.as_deref_mut() {
             log.goinkyo(&look);
         }
@@ -2926,7 +3182,18 @@ fn goinkyo_events(
             events.push(Event::GoinkyoAwaitingSpawn { observation });
         }
     }
+    for look in looks.planner {
+        if let Some(observation) = decide_planner(&look) {
+            events.push(Event::PlannerObserved { observation });
+        }
+    }
     events
+}
+
+/// One tick's reading of every brigade's Goinkyo and Planner rows.
+struct RoleLooks {
+    goinkyo: Vec<GoinkyoLook>,
+    planner: Vec<PlannerLook>,
 }
 
 /// What each live brigade's Goinkyo row looks like this tick, as a value:
@@ -2948,17 +3215,22 @@ fn goinkyo_events(
 /// would-be candidate: that needs the synthetic key `stage_brigade` builds
 /// (`SessionKey::new_worker`), which is private to `banto_core::engine`.
 /// `update_goinkyo_awaiting_spawn` does that check on the core side instead.
-fn gather_goinkyo_looks(
+///
+/// The Planner is read the same way from the same roster, with the same refusal to
+/// take a failed read for an absent row, and its looks are not written to the pane
+/// log: a Planner's pane is logged by the lifecycle events it causes.
+fn gather_role_looks(
     state: &EmporiumState,
     store: &RefCell<Store>,
     app: &App,
     mut timings: Option<&mut TickTimings>,
-) -> Vec<GoinkyoLook> {
+) -> RoleLooks {
     // One look per brigade rather than one per tick: a brigade with a spawn to
     // attempt must not hide the next one's. The ids are the brigades banto has
     // a Goinkyo pane recorded for, and the brigades the store lists. Sorted: a
     // fold that is replayed is handed the same order every run.
     let mut ids: BTreeSet<BrigadeId> = state.goinkyo_brigades().into_iter().collect();
+    ids.extend(state.planner_brigades());
     let listing_start = Instant::now();
     if let Ok(brigades) = store.borrow().list_brigades() {
         ids.extend(brigades.iter().map(|brigade| brigade.id));
@@ -2967,8 +3239,10 @@ fn gather_goinkyo_looks(
         t.goinkyo_roster += listing_start.elapsed();
     }
     let mut looks = Vec::new();
+    let mut planner_looks = Vec::new();
     for brigade_id in ids {
         let guard = state.goinkyo_guard_facts(brigade_id);
+        let planner_guard = state.planner_guard_facts(brigade_id);
         let roster_start = Instant::now();
         let members = store.borrow().brigade_members_in_join_order(brigade_id);
         if let Some(t) = timings.as_deref_mut() {
@@ -2985,6 +3259,15 @@ fn gather_goinkyo_looks(
                 roster: Vec::new(),
                 agent: None,
                 director_agent: None,
+            });
+            planner_looks.push(PlannerLook {
+                brigade_id,
+                roster_read: false,
+                row: GoinkyoRow::Absent,
+                director_hosted: false,
+                guard: planner_guard,
+                cwd: PathBuf::new(),
+                roster: Vec::new(),
             });
             continue;
         };
@@ -3047,8 +3330,38 @@ fn gather_goinkyo_looks(
             agent,
             director_agent,
         });
+        let planner_row = match members.iter().find(|m| m.role == BrigadeRole::Planner) {
+            None => GoinkyoRow::Absent,
+            Some(planner) => match &planner.session_id {
+                Some(session) => GoinkyoRow::Session(session.0.clone()),
+                None => GoinkyoRow::NoSession,
+            },
+        };
+        let planner_awaiting = matches!(planner_row, GoinkyoRow::NoSession) && director_hosted;
+        let (planner_cwd, planner_roster) = if planner_awaiting {
+            // The Director's own cwd, as the Goinkyo's and `stage_brigade` read it.
+            let cwd = director_session
+                .and_then(|session| app.row_for_id(&session.0))
+                .and_then(|row| row.cwd.clone())
+                .unwrap_or_else(|| PathBuf::from("."));
+            (cwd, members.iter().map(|m| m.token.clone()).collect())
+        } else {
+            (PathBuf::new(), Vec::new())
+        };
+        planner_looks.push(PlannerLook {
+            brigade_id,
+            roster_read: true,
+            row: planner_row,
+            director_hosted,
+            guard: planner_guard,
+            cwd: planner_cwd,
+            roster: planner_roster,
+        });
     }
-    looks
+    RoleLooks {
+        goinkyo: looks,
+        planner: planner_looks,
+    }
 }
 
 /// The observations the looks call for, one per brigade that has something to
@@ -3061,9 +3374,24 @@ fn gather_goinkyo_observations(
     app: &App,
     timings: Option<&mut TickTimings>,
 ) -> Vec<GoinkyoObservation> {
-    gather_goinkyo_looks(state, store, app, timings)
+    gather_role_looks(state, store, app, timings)
+        .goinkyo
         .iter()
         .filter_map(decide_goinkyo)
+        .collect()
+}
+
+/// The Planner's counterpart of [`gather_goinkyo_observations`], for the tests.
+#[cfg(test)]
+fn gather_planner_observations(
+    state: &EmporiumState,
+    store: &RefCell<Store>,
+    app: &App,
+) -> Vec<engine::PlannerObservation> {
+    gather_role_looks(state, store, app, None)
+        .planner
+        .iter()
+        .filter_map(decide_planner)
         .collect()
 }
 
@@ -3786,6 +4114,12 @@ fn member_briefing(
     token: &str,
     role: BrigadeRole,
 ) -> Option<String> {
+    // A Planner's whole system prompt is a file (`write_planner_prompt`); it has no
+    // `--append-system-prompt` briefing, so nothing here and nothing for
+    // `resume_needs_snapshot_off` to compare.
+    if role == BrigadeRole::Planner {
+        return None;
+    }
     let peers = crate::briefing::peers_of(&deps.store.borrow(), brigade_id, role);
     let request = briefing_request(deps, brigade_id, role);
     // Always the Claude form: a Codex member discards this string
@@ -3858,6 +4192,29 @@ fn resume_needs_snapshot_off(
         &target.id,
         &pattern,
     )
+}
+
+/// Writes the Planner's system prompt where `--system-prompt-file` will name it, on
+/// every launch (a resume included): the operator may have edited `planner_prompt`
+/// since, and the file is the only place a changed text can reach a Planner that is
+/// being resumed.
+fn write_planner_prompt(deps: &Deps, brigade_id: BrigadeId) -> Result<PathBuf> {
+    let data_dir = data_dir_of(deps)
+        .ok_or_else(|| anyhow::anyhow!("could not determine banto's data directory"))?;
+    let (Some(prompt_path), Some(request_path)) = (
+        data_dir.planner_prompt_path(brigade_id),
+        data_dir.planner_request_path(brigade_id),
+    ) else {
+        anyhow::bail!("{brigade_id} is not a brigade id banto issues");
+    };
+    let text = crate::briefing::planner_system_prompt(
+        deps.brigade,
+        brigade_id,
+        &request_path.to_string_lossy(),
+    );
+    std::fs::create_dir_all(data_dir.planner_dir())?;
+    std::fs::write(&prompt_path, text)?;
+    Ok(prompt_path)
 }
 
 /// The data directory this emporium works in: the one it resolved at startup
@@ -4288,6 +4645,10 @@ fn draw(
                     soloed: state.soloed_key() == Some(key),
                 },
             );
+            // The state of the work, on the Director's bottom border row only.
+            if let Some(glance) = state.director_progress(key) {
+                render_stage_line(frame.buffer_mut(), *rect, glance, now);
+            }
             if collapsed {
                 // The child keeps running untouched; only its facts are shown.
                 let facts = state.member_facts(key);
@@ -7275,6 +7636,7 @@ mod tests {
                     interrupts: None,
                     roster: Vec::new(),
                     progress: None,
+                    plan: None,
                 }],
             },
             now,
@@ -8766,6 +9128,7 @@ mod tests {
                 interrupts: Some(Vec::new()),
                 roster: vec!["director".to_string(), "worker-1".to_string()],
                 progress: None,
+                plan: None,
             })
         );
         assert_eq!(
@@ -8779,6 +9142,7 @@ mod tests {
                 interrupts: Some(Vec::new()),
                 roster: vec!["director".to_string()],
                 progress: None,
+                plan: None,
             })
         );
         assert_eq!(by_id(3).map(|f| f.director_session), Some(None));
@@ -8854,6 +9218,7 @@ mod tests {
                     interrupts: None,
                     roster: Vec::new(),
                     progress: None,
+                    plan: None,
                 }],
             },
             now,
@@ -8868,6 +9233,268 @@ mod tests {
         give_request(&mut state, &mut app, &brigade, open, now);
         let buffer = render_at(&state, &app, width, now);
         title_row(&state, &buffer, DIR, width).0
+    }
+
+    // --- the stage line on the Director's bottom border row -------------------------------
+
+    /// The write time of every stage these tests draw, and the clock the frame is
+    /// drawn at: the age on the tile is the difference, with no clock read.
+    const STAGE_CLOCK_MS: i64 = 1_800_000_000_000;
+
+    fn stage_clock() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(STAGE_CLOCK_MS as u64)
+    }
+
+    /// A tick whose facts for brigade 1 carry `stage`, written `age` before the
+    /// frame's clock, or no Progress.
+    fn give_stage(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        stage: Option<&str>,
+        age: Duration,
+        now: Instant,
+    ) {
+        engine::update(
+            state,
+            app,
+            brigade,
+            Event::Tick {
+                relay: Vec::new(),
+                brigades: vec![BrigadeNameFacts {
+                    brigade_id: 1,
+                    name: "cell".to_string(),
+                    director_session: Some(DIR.to_string()),
+                    member_names: Vec::new(),
+                    request: None,
+                    interrupts: None,
+                    roster: Vec::new(),
+                    progress: stage.map(|stage| banto_core::progress::ProgressGlance {
+                        seq: 1,
+                        stage: stage.to_string(),
+                        updated_at_ms: STAGE_CLOCK_MS - age.as_millis() as i64,
+                    }),
+                    plan: None,
+                }],
+            },
+            now,
+        );
+    }
+
+    /// The frame at `width` x `height`, drawn at the stage tests' clock.
+    fn render_stage_frame(state: &EmporiumState, app: &App, width: u16, height: u16) -> Buffer {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let mut cache = HashMap::new();
+        terminal
+            .draw(|frame| {
+                let _ = draw(frame, app, state, stage_clock(), Instant::now(), &mut cache);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The characters of row `y` from `x` for `len` columns, one per glyph: the
+    /// blank cell a wide character leaves behind is not a character of its own.
+    fn glyphs_at(buffer: &Buffer, x: u16, y: u16, len: u16) -> String {
+        let mut out = String::new();
+        let mut column = x;
+        while column < x + len {
+            let symbol = buffer[(column, y)].symbol();
+            out.push_str(symbol);
+            column += unicode_width::UnicodeWidthStr::width(symbol).max(1) as u16;
+        }
+        out
+    }
+
+    /// Pane `id`'s tile in a 40-row frame `width` wide, and the text of its bottom
+    /// border row.
+    fn bottom_row(state: &EmporiumState, buffer: &Buffer, id: &str, width: u16) -> (String, Rect) {
+        let (_, rect) = title_row(state, buffer, id, width);
+        (
+            glyphs_at(buffer, rect.x, rect.bottom() - 1, rect.width),
+            rect,
+        )
+    }
+
+    /// The columns `[start, end)` of `rect`'s bottom row that sit on the stage
+    /// chip's background, starting one cell after the left corner and stepping by
+    /// glyph, so the blank cell behind a wide character is not taken for the end
+    /// of the chip.
+    fn chip_columns(buffer: &Buffer, rect: Rect) -> (u16, u16) {
+        let y = rect.bottom() - 1;
+        let start = rect.x + 2;
+        let mut end = start;
+        while end < rect.right() && buffer[(end, y)].bg == Color::DarkGray {
+            let width = unicode_width::UnicodeWidthStr::width(buffer[(end, y)].symbol());
+            end += width.max(1) as u16;
+        }
+        (start, end)
+    }
+
+    fn staged_with(width: u16, stage: Option<&str>, age: Duration) -> (EmporiumState, App) {
+        let (mut state, mut app, brigade, now) =
+            scene(width, [Activity::Busy, Activity::Alive, Activity::Alive]);
+        give_stage(&mut state, &mut app, &brigade, stage, age, now);
+        (state, app)
+    }
+
+    #[test]
+    fn the_director_tile_shows_its_stage_and_age_on_the_bottom_border_row() {
+        let (state, app) = staged_with(
+            160,
+            Some("Phase 2 \u{306e}\u{5b9f}\u{6a5f}\u{78ba}\u{8a8d}\u{5f85}\u{3061}"),
+            Duration::from_secs(5 * 60),
+        );
+        let buffer = render_stage_frame(&state, &app, 160, 40);
+        let (row, rect) = bottom_row(&state, &buffer, DIR, 160);
+        let text = "\u{25b8} 5m Phase 2 \u{306e}\u{5b9f}\u{6a5f}\u{78ba}\u{8a8d}\u{5f85}\u{3061}";
+        assert!(
+            row.starts_with(&format!("\u{2514}\u{2500} {text} \u{2500}")),
+            "{row:?}"
+        );
+        // Everything after the line is the border it was, down to the corner.
+        let (_, rest) = row.split_once("\u{5f85}\u{3061} ").unwrap();
+        assert!(
+            rest.ends_with('\u{2518}')
+                && rest
+                    .trim_end_matches('\u{2518}')
+                    .chars()
+                    .all(|c| c == '\u{2500}'),
+            "{rest:?}"
+        );
+        // The line is a chip: the padding, the marker, the age, the stage and the
+        // padding on the DarkGray background, and not a cell of border beside it.
+        let y = rect.bottom() - 1;
+        let (start, end) = chip_columns(&buffer, rect);
+        // A cell of line between the corner and the chip, so the marker is not in
+        // the column the statusline above starts in.
+        assert!(
+            (rect.x..start).all(|x| buffer[(x, y)].bg != Color::DarkGray),
+            "the corner and the cell after it are not part of it"
+        );
+        assert_eq!(buffer[(rect.x + 1, y)].symbol(), "\u{2500}");
+        assert_eq!(
+            glyphs_at(&buffer, start, y, end - start),
+            format!(" {text} ")
+        );
+        assert!(
+            (end..rect.right()).all(|x| buffer[(x, y)].bg != Color::DarkGray),
+            "nothing after it is on the chip"
+        );
+        // The marker and the age are Gray on it, the stage the terminal's own colour.
+        assert_eq!(buffer[(rect.x + 3, y)].symbol(), "\u{25b8}");
+        assert_eq!(buffer[(rect.x + 3, y)].fg, Color::Gray);
+        assert_eq!(buffer[(rect.x + 5, y)].fg, Color::Gray, "the age");
+        assert_eq!(buffer[(rect.x + 8, y)].symbol(), "P");
+        assert_eq!(buffer[(rect.x + 8, y)].fg, Color::Reset);
+        assert_eq!(buffer[(rect.x + 8, y)].bg, Color::DarkGray);
+        // The title row is the one it always was.
+        let (title, _) = title_row(&state, &buffer, DIR, 160);
+        assert!(!title.contains('\u{25b8}'), "{title:?}");
+    }
+
+    #[test]
+    fn a_long_stage_is_cut_with_an_ellipsis_and_never_through_a_wide_character() {
+        let long = "\u{3042}".repeat(80);
+        // An odd and an even room, so the cut falls both beside a spare column
+        // and exactly on the margin.
+        for width in [96u16, 97, 98, 99, 100, 101] {
+            let (state, app) = staged_with(width, Some(&long), Duration::from_secs(0));
+            let buffer = render_stage_frame(&state, &app, width, 40);
+            let (row, rect) = bottom_row(&state, &buffer, DIR, width);
+            let text = row
+                .strip_prefix("\u{2514}\u{2500} \u{25b8} now ")
+                .unwrap_or_else(|| panic!("{width}: {row:?}"));
+            let kept = text.chars().take_while(|c| *c == '\u{3042}').count();
+            assert!(
+                text[kept * 3..].starts_with("\u{2026} \u{2500}"),
+                "{width}: the cut is marked: {row:?}"
+            );
+            // As many whole characters as the room holds beside the mark: the tile
+            // less the eleven columns the line leaves (corners, the cell after the
+            // left one, eight of line at the right), the two padding spaces and the
+            // `▸ now ` lead.
+            let stage_room = usize::from(rect.width) - 11 - 2 - 6;
+            assert_eq!(kept, (stage_room - 1) / 2, "{width}: {row:?}");
+            // The chip, padding included, stays inside the tile less those eleven
+            // columns, so at least eight cells of line are left before the corner.
+            let (start, end) = chip_columns(&buffer, rect);
+            assert!(end - start <= rect.width - 11, "{width}: {row:?}");
+            assert!(row.ends_with(&format!("{}\u{2518}", "\u{2500}".repeat(8))));
+        }
+    }
+
+    #[test]
+    fn with_no_progress_the_directors_bottom_row_is_plain_border() {
+        let (state, app) = staged_with(160, None, Duration::from_secs(0));
+        let buffer = render_stage_frame(&state, &app, 160, 40);
+        for id in [DIR, W1, W2] {
+            let (row, rect) = bottom_row(&state, &buffer, id, 160);
+            let inner = usize::from(rect.width) - 2;
+            assert_eq!(
+                row,
+                format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner)),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_workers_tile_never_carries_the_stage_and_a_director_not_at_the_master_position_does() {
+        let (mut state, mut app, brigade, now) =
+            scene(160, [Activity::Busy, Activity::Alive, Activity::Alive]);
+        give_stage(
+            &mut state,
+            &mut app,
+            &brigade,
+            Some("review"),
+            Duration::from_secs(2 * 3600),
+            now,
+        );
+        // The Director in the stack, a Worker in the master position.
+        let Stage::Brigade { panes, .. } = &mut state.stage else {
+            panic!("a brigade is staged");
+        };
+        panes.swap(0, 1);
+        assert_ne!(panes[0], SessionKey::from_id(DIR));
+        let buffer = render_stage_frame(&state, &app, 160, 40);
+        let (director, _) = bottom_row(&state, &buffer, DIR, 160);
+        assert!(
+            director.starts_with("\u{2514}\u{2500} \u{25b8} 2h review "),
+            "{director:?}"
+        );
+        for id in [W1, W2] {
+            let (worker, _) = bottom_row(&state, &buffer, id, 160);
+            assert!(!worker.contains('\u{25b8}'), "{id}: {worker:?}");
+        }
+    }
+
+    #[test]
+    fn a_tile_with_no_content_row_above_its_border_carries_no_stage() {
+        // Terminal heights down to where the tiles run out of rows: wherever a
+        // tile is on screen with fewer than three rows, no marker is drawn.
+        let mut exercised = false;
+        for height in 3..=9u16 {
+            let (state, app) = staged_with(160, Some("review"), Duration::from_secs(0));
+            let buffer = render_stage_frame(&state, &app, 160, height);
+            let tiles = state.geometry(Rect::new(0, 0, 160, height)).tiles.clone();
+            for (key, rect) in tiles {
+                if rect.height == 0 || rect.height >= 3 {
+                    continue;
+                }
+                exercised = true;
+                for y in rect.y..rect.bottom() {
+                    let row = glyphs_at(&buffer, rect.x, y, rect.width);
+                    assert!(
+                        !row.contains('\u{25b8}'),
+                        "{height}: {key:?} is {} rows high: {row:?}",
+                        rect.height
+                    );
+                }
+            }
+        }
+        assert!(exercised, "some height left a tile of one or two rows");
     }
 
     #[test]
@@ -15090,10 +15717,15 @@ mod tests {
             Some(format!(
                 "I am director; my team is worker-1, worker-2
 
+{}
+
 {}",
-                crate::briefing::consult_paragraph(banto_core::config::GoinkyoConsult::Design)
+                crate::briefing::consult_paragraph(banto_core::config::GoinkyoConsult::Design),
+                crate::briefing::director_planner_paragraph(
+                    banto_core::config::PlannerSetting::Auto
+                )
             )),
-            "a Director's template is followed by the operator's consultation level"
+            "a Director's template is followed by the operator's consultation level and Planner setting"
         );
         assert_eq!(
             member_briefing(&deps(&config), brigade_id, "worker-1", BrigadeRole::Worker),
@@ -15175,9 +15807,9 @@ mod tests {
         let director_briefing =
             member_briefing(&deps, brigade_id, "director", BrigadeRole::Director)
                 .expect("director_prompt is non-empty");
-        assert_eq!(
-            director_briefing, "director sees: {request}",
-            "a Director's template must not have {{request}} substituted"
+        assert!(
+            director_briefing.starts_with("director sees: {request}\n\n"),
+            "a Director's template must not have {{request}} substituted: {director_briefing}"
         );
     }
 
@@ -15256,6 +15888,507 @@ mod tests {
             "{observations:?}"
         );
         observations.pop().unwrap_or(GoinkyoObservation::Unchanged)
+    }
+
+    // --- the Planner: gathering and closing ------------------------------------
+
+    /// [`staged_goinkyo`]'s brigade with a Planner row instead, and the Plan that
+    /// goes with it.
+    fn staged_planner(session: Option<&str>) -> (RefCell<Store>, EmporiumState, App) {
+        let (store, state, app) = staged_goinkyo(None);
+        {
+            let mut store = store.borrow_mut();
+            store.remove_brigade_member(1, "goinkyo").unwrap();
+            assert_eq!(
+                store
+                    .open_planner(
+                        1,
+                        "director",
+                        "Layout",
+                        "make it better",
+                        AgentKind::ClaudeCode
+                    )
+                    .unwrap(),
+                banto_io::store::OpenedPlanner::Opened { number: 1 }
+            );
+            if let Some(id) = session {
+                store
+                    .set_member_session(1, "planner", &SessionId(id.to_string()))
+                    .unwrap();
+            }
+        }
+        (store, state, app)
+    }
+
+    #[test]
+    fn a_planner_row_with_no_session_under_a_hosted_director_is_awaiting_a_spawn() {
+        let (store, state, app) = staged_planner(None);
+        let observations = gather_planner_observations(&state, &store, &app);
+        let [engine::PlannerObservation::AwaitingSpawn(candidate)] = &observations[..] else {
+            panic!("{observations:?}");
+        };
+        assert_eq!(candidate.brigade_id, 1);
+        assert_eq!(candidate.cwd, PathBuf::from("/work/alpha"));
+        assert_eq!(candidate.roster, ["director", "planner"]);
+    }
+
+    #[test]
+    fn a_planner_with_a_session_is_left_to_the_staging_and_the_goinkyo_is_not_confused_for_it() {
+        let (store, state, app) = staged_planner(Some("p1"));
+        assert!(gather_planner_observations(&state, &store, &app).is_empty());
+
+        // And the Goinkyo's gather, over the same brigade, has no Goinkyo to find.
+        assert_eq!(
+            gather_goinkyo_observations(&state, &store, &app, None),
+            [GoinkyoObservation::NoGoinkyo { brigade_id: 1 }]
+        );
+    }
+
+    #[test]
+    fn a_hosted_brigade_with_no_planner_reports_none_and_a_failed_read_reports_nothing() {
+        let (store, state, app) = staged_goinkyo(None);
+        store
+            .borrow_mut()
+            .remove_brigade_member(1, "goinkyo")
+            .unwrap();
+        assert_eq!(
+            gather_planner_observations(&state, &store, &app),
+            [engine::PlannerObservation::NoPlanner { brigade_id: 1 }]
+        );
+
+        // One row the store cannot decode fails the whole roster read.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let mut file_store = Store::open(&path).unwrap();
+        let brigade_id = file_store.create_brigade("cell").unwrap();
+        assert_eq!(brigade_id, 1);
+        file_store
+            .add_brigade_member(
+                brigade_id,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
+            .unwrap();
+        let store = RefCell::new(file_store);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE brigade_members SET role = 'wizard'", [])
+            .unwrap();
+        assert!(
+            gather_planner_observations(&state, &store, &app).is_empty(),
+            "an unreadable roster is not an absent Planner"
+        );
+    }
+
+    #[test]
+    fn approving_from_the_screen_stores_it_exports_it_and_tells_the_director_as_banto() {
+        let (store, _state, _app) = staged_planner(Some("p1"));
+        store
+            .borrow_mut()
+            .write_plan(1, "planner", "the approved body", "first")
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        let events = execute_store_intent_in(
+            StoreIntent::ApprovePlan {
+                brigade_id: 1,
+                number: 1,
+                version: 1,
+            },
+            &store,
+            Some(dir.path()),
+        );
+        let [
+            Event::PlanApprovalAnswered {
+                brigade_id: 1,
+                result:
+                    Ok(PlanApprovalReport::Approved {
+                        number: 1,
+                        version: 1,
+                        export: Ok(path),
+                    }),
+            },
+        ] = &events[..]
+        else {
+            panic!("{events:?}");
+        };
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("the approved body"), "{text}");
+        assert!(Path::new(path).starts_with(dir.path()));
+
+        let view = store.borrow().open_plan_view(1).unwrap().unwrap();
+        assert_eq!(view.plan.state, banto_core::plan::PlanState::Approved);
+        assert!(view.pending.is_none());
+        assert!(
+            store
+                .borrow()
+                .has_unseen_brigade_messages(1, "director", BrigadeRole::Director)
+                .unwrap(),
+            "the Director is told in the same transaction"
+        );
+        // Approving the same version again has nothing left to approve.
+        let again = execute_store_intent_in(
+            StoreIntent::ApprovePlan {
+                brigade_id: 1,
+                number: 1,
+                version: 1,
+            },
+            &store,
+            Some(dir.path()),
+        );
+        assert!(matches!(
+            &again[..],
+            [Event::PlanApprovalAnswered {
+                result: Ok(PlanApprovalReport::NothingToApprove),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn an_export_that_cannot_be_written_does_not_undo_the_approval() {
+        for plans_dir in [None, Some("a file, not a directory")] {
+            let (store, _state, _app) = staged_planner(Some("p1"));
+            store
+                .borrow_mut()
+                .write_plan(1, "planner", "body", "first")
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let blocker = dir.path().join("plans");
+            std::fs::write(&blocker, "in the way").unwrap();
+            let events = execute_store_intent_in(
+                StoreIntent::ApprovePlan {
+                    brigade_id: 1,
+                    number: 1,
+                    version: 1,
+                },
+                &store,
+                plans_dir.map(|_| blocker.as_path()),
+            );
+            let [
+                Event::PlanApprovalAnswered {
+                    result: Ok(PlanApprovalReport::Approved { export: Err(_), .. }),
+                    ..
+                },
+            ] = &events[..]
+            else {
+                panic!("{plans_dir:?}: {events:?}");
+            };
+            let view = store.borrow().open_plan_view(1).unwrap().unwrap();
+            assert_eq!(view.plan.state, banto_core::plan::PlanState::Approved);
+        }
+    }
+
+    #[test]
+    fn a_draft_written_after_the_screen_was_read_is_refused_and_nothing_is_approved() {
+        let (store, _state, _app) = staged_planner(Some("p1"));
+        store
+            .borrow_mut()
+            .write_plan(1, "planner", "first body", "one")
+            .unwrap();
+        store
+            .borrow_mut()
+            .write_plan(1, "planner", "second body", "two")
+            .unwrap();
+        let events = execute_store_intent_in(
+            StoreIntent::ApprovePlan {
+                brigade_id: 1,
+                number: 1,
+                version: 1,
+            },
+            &store,
+            None,
+        );
+        assert!(
+            matches!(
+                &events[..],
+                [Event::PlanApprovalAnswered {
+                    result: Ok(PlanApprovalReport::Stale { latest: 2 }),
+                    ..
+                }]
+            ),
+            "{events:?}"
+        );
+        let view = store.borrow().open_plan_view(1).unwrap().unwrap();
+        assert_eq!(view.plan.state, banto_core::plan::PlanState::Drafting);
+        assert!(view.in_force.is_none());
+        assert_eq!(view.pending.unwrap().version, 2);
+    }
+
+    #[test]
+    fn approving_a_plan_that_closed_says_it_is_no_longer_open() {
+        let (store, _state, _app) = staged_planner(Some("p1"));
+        let events = execute_store_intent_in(
+            StoreIntent::ApprovePlan {
+                brigade_id: 1,
+                number: 7,
+                version: 1,
+            },
+            &store,
+            None,
+        );
+        assert!(matches!(
+            &events[..],
+            [Event::PlanApprovalAnswered {
+                result: Ok(PlanApprovalReport::NoOpenPlan),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn the_reading_screen_read_carries_the_open_plan_and_the_tick_carries_its_glance() {
+        let (store, _state, _app) = staged_planner(Some("p1"));
+        let none = execute_store_intent(StoreIntent::ReadBrigadeReading { brigade_id: 1 }, &store);
+        let [
+            Event::BrigadeReadingRead {
+                result: Ok(reading),
+                ..
+            },
+        ] = &none[..]
+        else {
+            panic!("{none:?}");
+        };
+        let open = reading
+            .plan
+            .as_ref()
+            .expect("the Plan opened with the Planner");
+        assert_eq!(open.approvable(), None, "nothing is drafted yet");
+        assert!(open.view.pending.is_none());
+
+        store
+            .borrow_mut()
+            .write_plan(1, "planner", "a body", "a summary")
+            .unwrap();
+        let events =
+            execute_store_intent(StoreIntent::ReadBrigadeReading { brigade_id: 1 }, &store);
+        let [
+            Event::BrigadeReadingRead {
+                result: Ok(reading),
+                ..
+            },
+        ] = &events[..]
+        else {
+            panic!("{events:?}");
+        };
+        let plan = reading.plan.as_ref().expect("the open Plan");
+        assert_eq!(plan.approvable(), Some((1, 1)));
+        assert_eq!(plan.view.pending.as_ref().unwrap().body, "a body");
+        assert!(plan.read_at_ms > 0);
+        assert_eq!(
+            store
+                .borrow()
+                .open_plan_glance(1)
+                .unwrap()
+                .map(|g| (g.latest_version, g.pending)),
+            Some((1, true))
+        );
+    }
+
+    #[test]
+    fn the_approval_and_the_operators_close_notices_reach_the_message_log_when_it_is_on() {
+        let (store, _state, _app) = staged_planner(Some("p1"));
+        store
+            .borrow_mut()
+            .write_plan(1, "planner", "the body", "first")
+            .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let logs = BrigadeLog::new(data.path().join("logs"));
+        let run = |intent| {
+            execute_store_intent_with(
+                intent,
+                &store,
+                Some(data.path()),
+                Some(GoinkyoConsult::Design),
+                Some(&logs),
+            )
+        };
+        run(StoreIntent::ApprovePlan {
+            brigade_id: 1,
+            number: 1,
+            version: 1,
+        });
+        run(StoreIntent::ClosePlanner { brigade_id: 1 });
+
+        let mail = store
+            .borrow_mut()
+            .fetch_brigade_messages(1, "director", BrigadeRole::Director)
+            .unwrap();
+        assert_eq!(mail.len(), 2, "approval and close notices");
+        let text = std::fs::read_to_string(logs.path_for(1)).unwrap();
+        for message in &mail {
+            assert!(
+                text.contains(&format!(
+                    "message #{} from={} to=director bytes={}
+{}
+
+",
+                    message.id,
+                    banto_core::model::BANTO_SENDER,
+                    message.body.len(),
+                    message.body
+                )),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_the_log_off_the_notices_write_no_file() {
+        let (store, _state, _app) = staged_planner(Some("p1"));
+        store
+            .borrow_mut()
+            .write_plan(1, "planner", "the body", "first")
+            .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        execute_store_intent_in(
+            StoreIntent::ApprovePlan {
+                brigade_id: 1,
+                number: 1,
+                version: 1,
+            },
+            &store,
+            Some(data.path()),
+        );
+        assert!(!data.path().join("logs").exists());
+    }
+
+    #[test]
+    fn closing_from_the_tile_exports_the_plan_removes_the_row_and_tells_the_director() {
+        let (store, _state, _app) = staged_planner(Some("p1"));
+        store
+            .borrow_mut()
+            .write_plan(1, "planner", "the body", "first")
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        let events = execute_store_intent_in(
+            StoreIntent::ClosePlanner { brigade_id: 1 },
+            &store,
+            Some(dir.path()),
+        );
+        let [
+            Event::PlannerClosed {
+                brigade_id: 1,
+                result: Ok(Some(report)),
+            },
+        ] = &events[..]
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(report.cause, PlanCloseCause::Operator);
+        let path = report.export.as_ref().expect("exported");
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(
+            text.contains("the body"),
+            "the draft is in the export: {text}"
+        );
+        assert!(Path::new(path).starts_with(dir.path()));
+
+        assert!(
+            store
+                .borrow()
+                .brigade_member(1, "planner")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .borrow()
+                .has_unseen_brigade_messages(1, "director", BrigadeRole::Director)
+                .unwrap()
+        );
+        // Nothing left to close: said, not an error.
+        let again = execute_store_intent_in(
+            StoreIntent::ClosePlanner { brigade_id: 1 },
+            &store,
+            Some(dir.path()),
+        );
+        assert!(
+            matches!(
+                &again[..],
+                [Event::PlannerClosed {
+                    result: Ok(None),
+                    ..
+                }]
+            ),
+            "{again:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_export_is_reported_and_the_plan_is_closed_all_the_same() {
+        let (store, _state, _app) = staged_planner(Some("p1"));
+        // A file where the plans directory should be: the export cannot be written.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("plans");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let events = execute_store_intent_in(
+            StoreIntent::ClosePlanner { brigade_id: 1 },
+            &store,
+            Some(&blocker),
+        );
+        let [
+            Event::PlannerClosed {
+                result: Ok(Some(report)),
+                ..
+            },
+        ] = &events[..]
+        else {
+            panic!("{events:?}");
+        };
+        assert!(report.export.is_err(), "{report:?}");
+        assert!(store.borrow().open_plan_view(1).unwrap().is_none());
+
+        // And with no data directory at all the same words, not a panic.
+        let (store, _state, _app) = staged_planner(Some("p1"));
+        let events =
+            execute_store_intent_in(StoreIntent::ClosePlanner { brigade_id: 1 }, &store, None);
+        assert!(
+            matches!(
+                &events[..],
+                [Event::PlannerClosed { result: Ok(Some(report)), .. }] if report.export.is_err()
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn disbanding_a_brigade_with_an_open_plan_exports_it_and_reports_it_after_the_disband() {
+        let (store, _state, _app) = staged_planner(Some("p1"));
+        let dir = tempfile::tempdir().unwrap();
+        let events = execute_store_intent_in(
+            StoreIntent::Disband { brigade_id: 1 },
+            &store,
+            Some(dir.path()),
+        );
+        let [
+            Event::Disbanded { result: Ok(_), .. },
+            Event::PlannerClosed {
+                result: Ok(Some(report)),
+                ..
+            },
+        ] = &events[..]
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(report.cause, PlanCloseCause::Disband);
+        assert!(report.export.is_ok(), "{report:?}");
+        assert!(store.borrow().list_brigades().unwrap().is_empty());
+
+        // A brigade with no Plan says nothing more than the disband.
+        let (store, _state, _app) = staged_goinkyo(None);
+        let events = execute_store_intent_in(
+            StoreIntent::Disband { brigade_id: 1 },
+            &store,
+            Some(dir.path()),
+        );
+        assert!(
+            matches!(&events[..], [Event::Disbanded { result: Ok(_), .. }]),
+            "{events:?}"
+        );
     }
 
     #[test]
@@ -15741,7 +16874,7 @@ mod tests {
 
         let mut issued = Vec::new();
         while let Some(event) = next_event(&mut events, &mut goinkyo_owed, || {
-            goinkyo_events(&state, &store, &app, None, None)
+            role_events(&state, &store, &app, None, None)
         }) {
             for cmd in engine::update(&mut state, &mut app, &brigade, event, Instant::now()) {
                 if let Cmd::Store(intent) = &cmd {
@@ -17271,6 +18404,190 @@ mod tests {
                 &mut Vec::new(),
             )
         }
+    }
+
+    impl BriefingRig {
+        /// The brigade has a Planner row, as `open_planner` leaves it.
+        fn with_planner(self) -> Self {
+            self.fixture
+                .store
+                .borrow_mut()
+                .add_brigade_member(self.brigade_id, "planner", BrigadeRole::Planner, None)
+                .unwrap();
+            self
+        }
+
+        /// Opens the Planner's pane under `brigade`'s configuration, with
+        /// `enabled` the products banto may run. `id` empty is a creation.
+        fn open_planner(
+            &self,
+            agent: AgentKind,
+            id: &str,
+            first_prompt: Option<&str>,
+            brigade: &BrigadeConfig,
+            enabled: &BTreeSet<AgentKind>,
+        ) -> Vec<Event> {
+            let resolved = self.resolved();
+            let deps = Deps {
+                child: Some(&resolved),
+                brigade,
+                enabled_agents: enabled,
+                ..self.fixture.deps()
+            };
+            let Cmd::OpenEmbedded { key, target, .. } =
+                open_embedded_cmd(agent, id, self.data_dir.path())
+            else {
+                unreachable!()
+            };
+            execute_cmd(
+                Cmd::OpenEmbedded {
+                    key,
+                    target,
+                    brigade: Some((self.brigade_id, "planner".to_string(), BrigadeRole::Planner)),
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    disallowed_tools: None,
+                    autocompact: None,
+                    first_prompt: first_prompt.map(str::to_string),
+                },
+                &deps,
+                &mut HashMap::new(),
+                &mut Vec::new(),
+            )
+        }
+
+        fn planner_prompt_file(&self) -> PathBuf {
+            DataDir::new(self.data_dir.path().to_path_buf())
+                .planner_prompt_path(self.brigade_id)
+                .unwrap()
+        }
+    }
+
+    fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        let at = argv.iter().position(|a| a == flag)?;
+        argv.get(at + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn a_created_planner_is_launched_on_its_prompt_file_with_a_first_prompt_and_no_briefing() {
+        let rig = BriefingRig::new().with_planner();
+        let events = rig.open_planner(
+            AgentKind::ClaudeCode,
+            "",
+            Some("Begin."),
+            &BrigadeConfig::default(),
+            &all_agents(),
+        );
+        assert!(matches!(&events[..], [Event::Spawned { .. }]), "{events:?}");
+        let argv = rig.fixture.launches().last().unwrap().argv.clone();
+
+        let file = rig.planner_prompt_file();
+        assert_eq!(
+            flag_value(&argv, "--system-prompt-file"),
+            Some(file.to_string_lossy().as_ref())
+        );
+        assert_eq!(flag_value(&argv, "--tools"), Some("Read,Grep,Glob"));
+        for flag in ["--strict-mcp-config", "--no-chrome", "--mcp-config"] {
+            assert!(argv.iter().any(|a| a == flag), "{flag} in {argv:?}");
+        }
+        for flag in [
+            "--append-system-prompt",
+            "--autocompact",
+            "--disallowedTools",
+            "--resume",
+        ] {
+            assert!(!argv.iter().any(|a| a == flag), "{flag} in {argv:?}");
+        }
+        assert!(!has_snapshot_off(&argv), "{argv:?}");
+        assert_eq!(&argv[argv.len() - 2..], ["--", "Begin."]);
+
+        // The file is the prompt the Planner will read: the operator's role text and
+        // the path of the request, in forward slashes.
+        let text = std::fs::read_to_string(&file).unwrap();
+        let request = DataDir::new(rig.data_dir.path().to_path_buf())
+            .planner_request_path(rig.brigade_id)
+            .unwrap();
+        assert!(
+            text.contains(&launch::forward_slash_path(&request)),
+            "{text}"
+        );
+        assert!(text.contains("write_plan"), "{text}");
+    }
+
+    #[test]
+    fn a_resumed_planner_gets_the_prompt_file_rewritten_and_the_recorded_prompt_turned_off() {
+        let rig = BriefingRig::new().with_planner();
+        let mut brigade = BrigadeConfig {
+            planner_prompt: "First text for {brigade}.".to_string(),
+            ..Default::default()
+        };
+        rig.open_planner(
+            AgentKind::ClaudeCode,
+            "",
+            Some("Begin."),
+            &brigade,
+            &all_agents(),
+        );
+        assert!(
+            std::fs::read_to_string(rig.planner_prompt_file())
+                .unwrap()
+                .starts_with(&format!("First text for {}.", rig.brigade_id))
+        );
+
+        // The operator edited the text; the next launch is a resume.
+        brigade.planner_prompt = "Second text.".to_string();
+        let events = rig.open_planner(AgentKind::ClaudeCode, "p1", None, &brigade, &all_agents());
+        assert!(matches!(&events[..], [Event::Spawned { .. }]), "{events:?}");
+        let argv = rig.fixture.launches().last().unwrap().argv.clone();
+        assert_eq!(flag_value(&argv, "--resume"), Some("p1"));
+        assert!(has_snapshot_off(&argv), "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "--"), "no first prompt: {argv:?}");
+        assert!(
+            std::fs::read_to_string(rig.planner_prompt_file())
+                .unwrap()
+                .starts_with("Second text."),
+            "the file is the only way a changed text reaches a resumed Planner"
+        );
+    }
+
+    #[test]
+    fn a_planner_is_refused_in_words_when_claude_is_not_enabled_and_nothing_is_started() {
+        let rig = BriefingRig::new().with_planner();
+        let only_codex = BTreeSet::from([AgentKind::Codex]);
+        for (agent, enabled) in [
+            (AgentKind::ClaudeCode, &only_codex),
+            (AgentKind::Codex, &all_agents()),
+        ] {
+            let events = rig.open_planner(
+                agent,
+                "",
+                Some("Begin."),
+                &BrigadeConfig::default(),
+                enabled,
+            );
+            let [Event::SpawnFailed { error, refusal, .. }] = &events[..] else {
+                panic!("{events:?}");
+            };
+            assert_eq!(*refusal, SpawnRefusal::Refused);
+            assert!(error.contains("needs Claude"), "{error}");
+        }
+        assert!(rig.fixture.launches().is_empty());
+        assert!(!rig.planner_prompt_file().exists(), "nothing was written");
+    }
+
+    #[test]
+    fn a_planner_has_no_member_briefing() {
+        let rig = BriefingRig::new().with_planner();
+        let resolved = rig.resolved();
+        let deps = Deps {
+            child: Some(&resolved),
+            ..rig.fixture.deps()
+        };
+        assert_eq!(
+            member_briefing(&deps, rig.brigade_id, "planner", BrigadeRole::Planner),
+            None
+        );
     }
 
     /// A stand-in for the installed banto: a file, and the executable resolved

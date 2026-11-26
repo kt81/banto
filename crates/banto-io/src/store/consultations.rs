@@ -21,23 +21,26 @@ use banto_core::model::{AgentKind, BrigadeId, BrigadeRole, GOINKYO_TOKEN, Sessio
 use super::brigades::insert_member;
 use super::{Store, StoreError, system_time_to_unix_ms};
 
-/// Records that `session_id` was a consultation called `title`, ended now, on
-/// whatever connection or transaction the caller holds.
+/// Records that `session_id` was a `role`'s session called `title`, ended now, on
+/// whatever connection or transaction the caller holds. `role` is the Goinkyo's or
+/// the Planner's: the list labels them differently.
 ///
 /// `ON CONFLICT DO NOTHING`, like [`super::archive::archive_on`]: a session ends
 /// once, and the first record is the one that stands.
 pub(super) fn record_on(
     conn: &rusqlite::Connection,
     session_id: &SessionId,
+    role: BrigadeRole,
     title: &str,
 ) -> Result<(), StoreError> {
     conn.execute(
-        "INSERT INTO consultations (session_id, title, ended_at_ms) VALUES (?1, ?2, ?3)
+        "INSERT INTO consultations (session_id, title, ended_at_ms, role) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(session_id) DO NOTHING",
         params![
             session_id.0,
             title,
-            system_time_to_unix_ms(SystemTime::now())
+            system_time_to_unix_ms(SystemTime::now()),
+            role.as_token()
         ],
     )?;
     Ok(())
@@ -98,10 +101,23 @@ impl Store {
     /// predates titles, or one that ended before its session id was bound, which
     /// leave nothing here.
     pub fn consultation_titles(&self) -> Result<Vec<(SessionId, String)>, StoreError> {
+        self.ended_titles(BrigadeRole::Goinkyo)
+    }
+
+    /// The same for ended Planners: the session and the Plan's title, which the
+    /// list shows behind its own label.
+    pub fn planner_titles(&self) -> Result<Vec<(SessionId, String)>, StoreError> {
+        self.ended_titles(BrigadeRole::Planner)
+    }
+
+    fn ended_titles(&self, role: BrigadeRole) -> Result<Vec<(SessionId, String)>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id, title FROM consultations ORDER BY ended_at_ms, session_id",
+            "SELECT session_id, title FROM consultations WHERE role = ?1
+             ORDER BY ended_at_ms, session_id",
         )?;
-        let rows = stmt.query_map([], |row| Ok((SessionId(row.get(0)?), row.get(1)?)))?;
+        let rows = stmt.query_map([role.as_token()], |row| {
+            Ok((SessionId(row.get(0)?), row.get(1)?))
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 }

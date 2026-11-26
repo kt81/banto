@@ -13,9 +13,11 @@
 //! `view::agent_label_color`), shared rather than copied, so a tile and the
 //! sidebar dot cannot drift apart.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
+use banto_core::display_text::{display_name, shorten_to_columns};
 use banto_core::model::{Activity, AgentKind, humanize_age_compact};
+use banto_core::progress::ProgressGlance;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -244,10 +246,80 @@ pub fn render_title_status(
     used
 }
 
+/// Cells of line between the left corner and the chip.
+const STAGE_LINE_INDENT: u16 = 1;
+
+/// Columns of the bottom row the stage line never uses: the two corners, the
+/// indent, and eight cells of line at the right end, so the row still reads as a
+/// border.
+const STAGE_LINE_RESERVE: u16 = 2 + STAGE_LINE_INDENT + 8;
+
+/// Draw `└─` + ` ▸ <age> <stage> ` + `─…─┘` into the bottom border row of a
+/// Director's `tile`: one cell of line after the corner, then the chip, and the
+/// rest of the row as the border drew it. Flush against the corner the chip's
+/// `▸` fell in the column of the `⏵⏵` that opens Claude's own statusline just
+/// above, and the row still read as one more line of it; one cell of line is
+/// enough to move it off that column, and two was more margin than the operator
+/// wanted (his second and third live checks, 2026-11-26). The age is the stage's write time against `now`, the
+/// frame's own clock (the one the list's age column uses), so this reads no clock.
+///
+/// The segment is a chip: one space of padding each side, all of it on the
+/// `DarkGray` background. Without one the line sat directly under a busy Claude
+/// statusline and read as part of it (operator's live check, 2026-11-26). Named
+/// colours only, for the reason `pane_title` gives; on that background the marker
+/// and the age are `Gray`, since `DarkGray` there would vanish, and the stage keeps
+/// the terminal's own text colour. The padding is inside the width: the chip,
+/// padding included, is at most the tile's width less [`STAGE_LINE_RESERVE`].
+///
+/// The stage is cut by display width with a `…`, by grapheme and not by
+/// character, so a wide character or a flag is kept or cut whole. It is folded to
+/// one line again here, because a row hand-edited into the store never passed
+/// the write's check. Draws nothing on a tile under three rows (no content row
+/// above the border), when the stage has nothing visible, or when too little
+/// room is left for more than the cut mark.
+pub fn render_stage_line(
+    buffer: &mut Buffer,
+    tile: Rect,
+    glance: &ProgressGlance,
+    now: SystemTime,
+) {
+    if tile.height < 3 {
+        return;
+    }
+    let Some(stage) = display_name(&glance.stage) else {
+        return;
+    };
+    let written = SystemTime::UNIX_EPOCH
+        + Duration::from_millis(u64::try_from(glance.updated_at_ms).unwrap_or(0));
+    let lead = format!("\u{25b8} {} ", humanize_age_compact(written, now));
+    // What the chip may take, then what is left of it for the stage once the two
+    // padding spaces and the lead are in.
+    let chip_room = usize::from(tile.width.saturating_sub(STAGE_LINE_RESERVE));
+    let Some(stage_room) = chip_room
+        .checked_sub(lead.width() + 2)
+        .filter(|room| *room >= 2)
+    else {
+        return;
+    };
+    let stage = shorten_to_columns(&stage, stage_room);
+    let y = tile.bottom() - 1;
+    // Reset, not the default: a cell that already holds the border's colour keeps
+    // it when a style names none.
+    let chip = Style::default().bg(Color::DarkGray);
+    let plain = chip.fg(Color::Reset);
+    let dim = chip.fg(Color::Gray);
+    let mut x = tile.x.saturating_add(1 + STAGE_LINE_INDENT);
+    buffer.set_string(x, y, " ", plain);
+    x += 1;
+    buffer.set_string(x, y, &lead, dim);
+    x += lead.width() as u16;
+    buffer.set_string(x, y, &stage, plain);
+    x += stage.width() as u16;
+    buffer.set_string(x, y, " ", plain);
+}
+
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     fn row_text(buffer: &Buffer, y: u16, width: u16) -> String {
@@ -705,5 +777,148 @@ mod tests {
             0
         );
         assert_eq!(buffer, Buffer::empty(Rect::new(0, 0, 40, 1)));
+    }
+
+    fn glance(stage: &str, updated_at_ms: i64) -> ProgressGlance {
+        ProgressGlance {
+            seq: 1,
+            stage: stage.to_string(),
+            updated_at_ms,
+        }
+    }
+
+    fn stage_row(buffer: &Buffer, y: u16, width: u16) -> String {
+        row_text(buffer, y, width)
+    }
+
+    #[test]
+    fn the_stage_line_is_age_then_stage_one_cell_after_the_corner() {
+        let tile = Rect::new(0, 0, 40, 5);
+        let mut buffer = Buffer::empty(tile);
+        // Written 90 minutes before the clock.
+        render_stage_line(
+            &mut buffer,
+            tile,
+            &glance("coding", 10_000_000 - 90 * 60_000),
+            clock_at(10_000),
+        );
+        // The corner is cell 0 and the cell of line after it is 1, so the padding
+        // is cell 2 and the marker cell 3.
+        assert_eq!(
+            stage_row(&buffer, 4, 40).trim_end(),
+            "   \u{25b8} 1h coding"
+        );
+        // A chip: padding, marker, age, stage, padding, all on the one background
+        // and nothing beyond it. The marker and the age are Gray on it, the stage
+        // the terminal's own colour.
+        assert!(
+            (2..=14).all(|x| buffer[(x, 4)].bg == Color::DarkGray),
+            "{buffer:?}"
+        );
+        assert!((0..=1).all(|x| buffer[(x, 4)].bg == Color::Reset));
+        assert_eq!(buffer[(15, 4)].bg, Color::Reset);
+        assert_eq!(buffer[(14, 4)].symbol(), " ", "the closing padding");
+        for x in 3..=7 {
+            assert_eq!(buffer[(x, 4)].fg, Color::Gray, "{x}");
+        }
+        assert_eq!(buffer[(8, 4)].fg, Color::Reset);
+        // Only the bottom row is touched.
+        assert!((0..4).all(|y| stage_row(&buffer, y, 40).trim().is_empty()));
+    }
+
+    fn clock_at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn the_stage_line_needs_three_rows() {
+        for height in [0u16, 1, 2] {
+            let tile = Rect::new(0, 0, 40, height);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 3));
+            render_stage_line(&mut buffer, tile, &glance("coding", 0), clock_at(10));
+            assert!(
+                (0..3).all(|y| stage_row(&buffer, y, 40).trim().is_empty()),
+                "{height}"
+            );
+        }
+        let tile = Rect::new(0, 0, 40, 3);
+        let mut buffer = Buffer::empty(tile);
+        render_stage_line(&mut buffer, tile, &glance("coding", 0), clock_at(10));
+        assert!(stage_row(&buffer, 2, 40).contains("coding"));
+    }
+
+    #[test]
+    fn the_stage_line_is_cut_by_width_and_leaves_the_right_end_alone() {
+        let tile = Rect::new(3, 0, 30, 4);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 4));
+        render_stage_line(
+            &mut buffer,
+            tile,
+            &glance(&"\u{3042}".repeat(60), 0),
+            clock_at(10),
+        );
+        // 30 columns, less the 11 the line leaves: a chip of 19, of which the two
+        // padding spaces and `▸ now ` take 8, leaving 11 for the stage: five wide
+        // characters and the cut mark, and no more because a sixth would not fit
+        // beside the mark.
+        for column in [12, 14, 16, 18, 20] {
+            assert_eq!(buffer[(column, 3)].symbol(), "\u{3042}", "{column}");
+        }
+        assert_eq!(buffer[(22, 3)].symbol(), "\u{2026}");
+        assert_eq!(buffer[(23, 3)].symbol(), " ", "the closing padding");
+        // The corner is cell 3 and the cell after it is not the line's; the chip
+        // is cells 5 to 23 and nothing is drawn after it. The blank cell behind a
+        // wide character belongs to that character, whose own cell carries the
+        // background.
+        assert!(
+            (5..=23)
+                .filter(|x| !(13..=21).step_by(2).any(|wide| wide == *x))
+                .all(|x| buffer[(x, 3)].bg == Color::DarkGray)
+        );
+        assert!(
+            (24..40).all(|x| buffer[(x, 3)].symbol() == " " && buffer[(x, 3)].bg == Color::Reset)
+        );
+        assert!((3..=4).all(|x| buffer[(x, 3)].bg == Color::Reset));
+    }
+
+    #[test]
+    fn a_stage_with_nothing_visible_or_no_room_draws_nothing() {
+        let tile = Rect::new(0, 0, 40, 4);
+        for stage in ["", " \u{200b}\t"] {
+            let mut buffer = Buffer::empty(tile);
+            render_stage_line(&mut buffer, tile, &glance(stage, 0), clock_at(10));
+            assert!(stage_row(&buffer, 3, 40).trim().is_empty(), "{stage:?}");
+        }
+        let narrow = Rect::new(0, 0, 16, 4);
+        let mut buffer = Buffer::empty(narrow);
+        render_stage_line(&mut buffer, narrow, &glance("coding", 0), clock_at(10));
+        assert!(stage_row(&buffer, 3, 16).trim().is_empty());
+        // The edge of the room: the least that draws is the first letter and the
+        // cut mark, which takes 11 reserved columns, `▸ now ` and two paddings.
+        for (width, drawn) in [(20u16, false), (21, true)] {
+            let tile = Rect::new(0, 0, width, 4);
+            let mut buffer = Buffer::empty(tile);
+            render_stage_line(&mut buffer, tile, &glance("coding", 0), clock_at(10));
+            assert_eq!(
+                stage_row(&buffer, 3, width).contains("\u{25b8} now c\u{2026}"),
+                drawn,
+                "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_stage_with_a_line_break_in_it_is_one_line() {
+        let tile = Rect::new(0, 0, 60, 4);
+        let mut buffer = Buffer::empty(tile);
+        render_stage_line(
+            &mut buffer,
+            tile,
+            &glance("one\ntwo\u{1b}[31m", 0),
+            clock_at(10),
+        );
+        let row = stage_row(&buffer, 3, 60);
+        assert!(row.contains("now one two[31m"), "{row:?}");
+        assert!(!row.contains('\u{1b}'));
     }
 }

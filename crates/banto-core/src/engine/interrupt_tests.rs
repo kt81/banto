@@ -135,6 +135,7 @@ fn tick_reading(
         interrupts,
         roster: rig.roster.clone(),
         progress: None,
+        plan: None,
     }];
     update(
         &mut rig.state,
@@ -779,6 +780,7 @@ fn tick_brigades(
             interrupts: Some(interrupts),
             roster,
             progress: None,
+            plan: None,
         })
         .collect();
     update(

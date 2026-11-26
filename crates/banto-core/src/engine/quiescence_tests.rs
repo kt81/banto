@@ -54,6 +54,7 @@ fn listed(state: &EmporiumState) -> Vec<BrigadeNameFacts> {
             interrupts: None,
             roster: Vec::new(),
             progress: None,
+            plan: None,
         })
         .collect()
 }
@@ -3439,6 +3440,7 @@ fn a_brigade_nothing_hosts_yet_shows_its_stored_request_on_its_directors_row_wit
         interrupts: None,
         roster: Vec::new(),
         progress: None,
+        plan: None,
     };
     let cmds = send(
         &mut state,
@@ -11149,4 +11151,227 @@ fn the_pane_log_facts_cannot_see_banto_own_writes_though_the_quit_question_count
         state.pane_facts(&app, &a, at + SECOND).input_ago_ms,
         Some(1000)
     );
+}
+
+// --- the Planner's pane and the quiet bell -------------------------------------------
+
+/// The quiet fixture with a Planner hosted beside the Director and a Worker, the
+/// operator inside the Planner's pane (the Planner is the tile at index 2).
+fn planner_fixture() -> (
+    EmporiumState,
+    App,
+    SessionKey,
+    SessionKey,
+    SessionKey,
+    Instant,
+) {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let director = host(&mut state, 1, DIRECTOR_TOKEN, "dir");
+    let worker = host(&mut state, 1, "worker-1", "w1");
+    let planner = host(&mut state, 1, PLANNER_TOKEN, "pl");
+    state.stage = Stage::Brigade {
+        id: 1,
+        director: Some(director.clone()),
+        panes: vec![director.clone(), worker.clone(), planner.clone()],
+        focused: 2,
+    };
+    state.focus = Focus::Pane;
+    state.size = (120, 40);
+    let at = t0();
+    tick(&mut state, &mut app, at);
+    (state, app, director, worker, planner, at)
+}
+
+/// Only `busy` reads not idle at `at`, everyone is idle from `at + 1 s`; whether
+/// the brigade rang once the settle had passed.
+fn rings_after_only_working(
+    state: &mut EmporiumState,
+    app: &mut App,
+    members: [&SessionKey; 3],
+    busy: &SessionKey,
+    at: Instant,
+) -> bool {
+    let reading = |busy_now: bool| -> Vec<(&SessionKey, Quiescence)> {
+        members
+            .iter()
+            .map(|m| {
+                (
+                    *m,
+                    if busy_now && *m == busy {
+                        NotIdle
+                    } else {
+                        Idle
+                    },
+                )
+            })
+            .collect()
+    };
+    sample(state, app, &reading(true), at);
+    let idle_from = at + SECOND;
+    sample(state, app, &reading(false), idle_from);
+    rang(&sample(
+        state,
+        app,
+        &reading(false),
+        idle_from + BRIGADE_QUIET_SETTLE,
+    ))
+}
+
+#[test]
+fn a_turn_the_operator_types_in_the_planners_pane_does_not_arm_the_bell() {
+    let (mut state, mut app, director, worker, planner, at) = planner_fixture();
+    press(&mut state, &mut app, KeyCode::Char('x'), at);
+    assert!(
+        state.last_given_input.contains_key(&planner),
+        "the key went to the Planner's pane"
+    );
+    assert!(
+        !rings_after_only_working(
+            &mut state,
+            &mut app,
+            [&director, &worker, &planner],
+            &planner,
+            at + SECOND
+        ),
+        "a conversation with the Planner is not the brigade's work ending"
+    );
+}
+
+#[test]
+fn a_paste_into_the_planners_pane_does_not_arm_the_bell_either() {
+    let (mut state, mut app, director, worker, planner, at) = planner_fixture();
+    send(
+        &mut state,
+        &mut app,
+        Event::Input(InputEvent::Paste("a plan".to_string())),
+        at,
+    );
+    assert!(state.last_given_input.contains_key(&planner));
+    assert!(!rings_after_only_working(
+        &mut state,
+        &mut app,
+        [&director, &worker, &planner],
+        &planner,
+        at + SECOND
+    ));
+}
+
+#[test]
+fn a_turn_banto_starts_in_the_planners_pane_arms_the_bell_as_today() {
+    let (mut state, mut app, director, worker, planner, at) = planner_fixture();
+    // A relay wake, or the first prompt.
+    state.last_prompted.insert(planner.clone(), at);
+    assert!(rings_after_only_working(
+        &mut state,
+        &mut app,
+        [&director, &worker, &planner],
+        &planner,
+        at + SECOND
+    ));
+}
+
+#[test]
+fn the_later_of_banto_and_the_operator_says_who_started_the_planners_turn() {
+    let (mut state, _app, _director, _worker, planner, at) = planner_fixture();
+    assert!(
+        !state.planner_turn_is_banto(&planner),
+        "nothing was written at all"
+    );
+    state.last_prompted.insert(planner.clone(), at);
+    assert!(state.planner_turn_is_banto(&planner));
+    state.last_given_input.insert(planner.clone(), at + SECOND);
+    assert!(
+        !state.planner_turn_is_banto(&planner),
+        "the operator wrote last"
+    );
+    state.last_prompted.insert(planner.clone(), at + 2 * SECOND);
+    assert!(
+        state.planner_turn_is_banto(&planner),
+        "banto woke it after the operator had typed"
+    );
+}
+
+#[test]
+fn a_planner_process_that_has_only_been_read_idle_before_does_not_arm_the_bell_by_itself() {
+    // The ordinary rule would take a long-running, once-idle process reading busy
+    // for work. The Planner's busy readings are the operator's own conversation
+    // unless banto started them.
+    let (mut state, mut app, director, worker, planner, at) = planner_fixture();
+    assert!(state.seen_idle.contains(&state.spawn_order[&planner]));
+    assert!(!rings_after_only_working(
+        &mut state,
+        &mut app,
+        [&director, &worker, &planner],
+        &planner,
+        at + SECOND
+    ));
+}
+
+#[test]
+fn worker_work_arms_the_bell_as_today_with_a_planner_in_the_brigade() {
+    let (mut state, mut app, director, worker, planner, at) = planner_fixture();
+    // The operator is conversing with the Planner too; the Worker's turn is what
+    // arms.
+    press(&mut state, &mut app, KeyCode::Char('x'), at);
+    state.last_prompted.insert(worker.clone(), at);
+    assert!(rings_after_only_working(
+        &mut state,
+        &mut app,
+        [&director, &worker, &planner],
+        &worker,
+        at + SECOND
+    ));
+}
+
+#[test]
+fn a_planner_that_is_working_keeps_the_brigade_from_being_quiet() {
+    let (mut state, mut app, director, worker, planner, at) = planner_fixture();
+    state.last_prompted.insert(worker.clone(), at);
+    sample(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, NotIdle), (&planner, Idle)],
+        at,
+    );
+    let idle_from = at + SECOND;
+    // The Worker is done; the Planner is busy for as long as the settle lasts.
+    for step in 0..=BRIGADE_QUIET_SETTLE.as_secs() + 1 {
+        let cmds = sample(
+            &mut state,
+            &mut app,
+            &[(&director, Idle), (&worker, Idle), (&planner, NotIdle)],
+            idle_from + Duration::from_secs(step),
+        );
+        assert!(
+            !rang(&cmds),
+            "a busy member is not a quiet brigade: {cmds:?}"
+        );
+    }
+}
+
+#[test]
+fn typing_in_the_planners_pane_does_not_spend_what_a_request_spent_but_the_directors_does() {
+    forget_stored_requests();
+    let (mut state, _app, director, _worker, planner, _at) = planner_fixture();
+    state.request_spent.insert(1);
+    operator_gave_work(&mut state, &planner);
+    assert!(
+        state.request_spent.contains(&1),
+        "the operator talking with the Planner leaves the request's quiet point alone"
+    );
+    operator_gave_work(&mut state, &director);
+    assert!(
+        state.request_spent.is_empty(),
+        "work the operator gave the Director is his stretch"
+    );
+}
+
+#[test]
+fn a_key_typed_into_the_planners_pane_leaves_a_requests_spending_standing() {
+    forget_stored_requests();
+    let (mut state, mut app, _director, _worker, _planner, at) = planner_fixture();
+    state.request_spent.insert(1);
+    press(&mut state, &mut app, KeyCode::Char('x'), at);
+    assert!(state.request_spent.contains(&1));
 }

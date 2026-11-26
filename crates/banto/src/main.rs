@@ -303,7 +303,11 @@ fn main() -> Result<()> {
             // request written here, the member configs and the message log all sit
             // where the emporium that reads and sweeps them looks.
             let data_dir = resolved.data_dir();
-            let goinkyo_dir = data_dir.as_ref().map(|dir| dir.goinkyo_dir());
+            let dirs = mcp::MemberDirs {
+                goinkyo: data_dir.as_ref().map(|dir| dir.goinkyo_dir()),
+                planner: data_dir.as_ref().map(|dir| dir.planner_dir()),
+                plans: data_dir.as_ref().map(|dir| dir.plans_dir()),
+            };
             let identity = mcp::Identity {
                 session,
                 brigade,
@@ -320,7 +324,7 @@ fn main() -> Result<()> {
                 identity,
                 claude_home,
                 codex_home,
-                goinkyo_dir,
+                dirs,
                 mcp::GoinkyoPolicy {
                     setting: config.brigade.goinkyo_agent,
                     enabled: resolved_agents.enabled.clone(),

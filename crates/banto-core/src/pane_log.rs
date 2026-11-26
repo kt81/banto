@@ -230,6 +230,9 @@ pub fn event_name(ev: &Event) -> &'static str {
         Event::Tick { .. } => "Tick",
         Event::QuiescenceSampled { .. } => "QuiescenceSampled",
         Event::GoinkyoAwaitingSpawn { .. } => "GoinkyoAwaitingSpawn",
+        Event::PlannerObserved { .. } => "PlannerObserved",
+        Event::PlannerClosed { .. } => "PlannerClosed",
+        Event::PlanApprovalAnswered { .. } => "PlanApprovalAnswered",
         Event::WindowFocusChanged { .. } => "WindowFocusChanged",
     }
 }
@@ -277,6 +280,9 @@ pub fn pane_facts_key(ev: &Event) -> Option<&SessionKey> {
         | Event::Tick { .. }
         | Event::QuiescenceSampled { .. }
         | Event::GoinkyoAwaitingSpawn { .. }
+        | Event::PlannerObserved { .. }
+        | Event::PlannerClosed { .. }
+        | Event::PlanApprovalAnswered { .. }
         | Event::WindowFocusChanged { .. } => None,
     }
 }
@@ -454,6 +460,9 @@ pub fn event_lines(ev: &Event, facts: &PaneFacts) -> Vec<Line> {
         | Event::Tick { .. }
         | Event::QuiescenceSampled { .. }
         | Event::GoinkyoAwaitingSpawn { .. }
+        | Event::PlannerObserved { .. }
+        | Event::PlannerClosed { .. }
+        | Event::PlanApprovalAnswered { .. }
         | Event::WindowFocusChanged { .. } => Vec::new(),
     }
 }
@@ -602,6 +611,20 @@ fn store_line(intent: &StoreIntent, by: &'static str) -> Option<Line> {
             .word("intent", "Disband")
             .word("by", by)
             .num("brigade", brigade_id),
+        StoreIntent::ClosePlanner { brigade_id } => Line::new("Store")
+            .word("intent", "ClosePlanner")
+            .word("by", by)
+            .num("brigade", brigade_id),
+        StoreIntent::ApprovePlan {
+            brigade_id,
+            number,
+            version,
+        } => Line::new("Store")
+            .word("intent", "ApprovePlan")
+            .word("by", by)
+            .num("brigade", brigade_id)
+            .num("plan", number)
+            .num("version", version),
         StoreIntent::DismissWorker { brigade_id, token } => Line::new("Store")
             .word("intent", "DismissWorker")
             .word("by", by)

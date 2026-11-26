@@ -209,6 +209,7 @@ impl Scene {
             interrupts: None,
             roster: Vec::new(),
             progress: None,
+            plan: None,
         };
         self.feed(Event::Tick {
             relay,

@@ -30,6 +30,7 @@
 use unicode_width::UnicodeWidthStr;
 
 use crate::display_text::display_name;
+use crate::model::BANTO_SENDER;
 
 /// The widest a name may be, in display columns.
 pub const MEMBER_NAME_COLUMNS: usize = 24;
@@ -76,8 +77,8 @@ impl std::fmt::Display for NameRejection {
             NameRejection::LooksLikeToken => write!(
                 f,
                 "The name is, or looks like, a member token (\"director\", \"goinkyo\", \
-                 \"worker-<number>\"). A name is not an address: pick something that says \
-                 what the Worker is for."
+                 \"planner\", \"worker-<number>\") or banto's own sender word (\"banto\"). A \
+                 name is not an address: pick something that says what the Worker is for."
             ),
             NameRejection::Taken { by } => {
                 write!(
@@ -89,11 +90,13 @@ impl std::fmt::Display for NameRejection {
     }
 }
 
-/// Whether `text` is a token, or reads like one: `director`, `goinkyo`, or
-/// `worker-` followed by digits, in any case.
+/// Whether `text` is a token, or reads like one: `director`, `goinkyo`,
+/// `planner`, or `worker-` followed by digits, in any case. Also banto's own
+/// sender word ([`BANTO_SENDER`]), which is no member's token but heads the
+/// messages banto writes itself: a Worker named that could be taken for banto.
 pub fn looks_like_token(text: &str) -> bool {
     let lower = text.to_lowercase();
-    if lower == "director" || lower == "goinkyo" {
+    if lower == "director" || lower == "goinkyo" || lower == "planner" || lower == BANTO_SENDER {
         return true;
     }
     lower
@@ -275,6 +278,10 @@ mod tests {
             "worker-7",
             "Worker-12",
             "worker-007",
+            "planner",
+            "Planner",
+            "banto",
+            "BANTO",
         ] {
             assert_eq!(
                 validate(bad, "worker-2", &roster()),

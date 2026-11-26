@@ -30,6 +30,34 @@ fn decode<T: serde::de::DeserializeOwned>(column: usize, text: &str) -> rusqlite
     })
 }
 
+/// The brigade's Progress on whatever connection or transaction the caller holds:
+/// what a Plan's close reads, in its own transaction, to decide whether the work is
+/// done.
+pub(super) fn read_progress_on(
+    conn: &rusqlite::Connection,
+    brigade_id: BrigadeId,
+) -> Result<Option<ProgressRecord>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT stage, tasks, off_plan, CAST(seq AS INTEGER),              CAST(updated_at_ms AS INTEGER)              FROM brigade_progress WHERE brigade_id = ?1",
+            [brigade_id],
+            |row| {
+                let tasks: String = row.get(1)?;
+                let off_plan: String = row.get(2)?;
+                Ok(ProgressRecord {
+                    progress: Progress {
+                        stage: row.get(0)?,
+                        tasks: decode(1, &tasks)?,
+                        off_plan: decode(2, &off_plan)?,
+                    },
+                    seq: row.get(3)?,
+                    updated_at_ms: row.get(4)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 impl Store {
     /// Replaces the brigade's Progress with `progress` and stamps the time. The
     /// sequence goes up by one on every write, so a write that changes nothing is
@@ -90,31 +118,10 @@ impl Store {
         &self,
         brigade_id: BrigadeId,
     ) -> Result<Option<ProgressRecord>, StoreError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT stage, tasks, off_plan, CAST(seq AS INTEGER), \
-                 CAST(updated_at_ms AS INTEGER) \
-                 FROM brigade_progress WHERE brigade_id = ?1",
-                [brigade_id],
-                |row| {
-                    let tasks: String = row.get(1)?;
-                    let off_plan: String = row.get(2)?;
-                    Ok(ProgressRecord {
-                        progress: Progress {
-                            stage: row.get(0)?,
-                            tasks: decode(1, &tasks)?,
-                            off_plan: decode(2, &off_plan)?,
-                        },
-                        seq: row.get(3)?,
-                        updated_at_ms: row.get(4)?,
-                    })
-                },
-            )
-            .optional()?)
+        read_progress_on(&self.conn, brigade_id)
     }
 
-    /// The sequence and stage line of the brigade's Progress, for the tick; `None`
+    /// The sequence, stage line and write time of the brigade's Progress, for the tick; `None`
     /// when none has been written. The body is not read: a Progress is up to a few
     /// kilobytes and this runs every second for every brigade.
     pub fn brigade_progress_glance(
@@ -124,12 +131,13 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT CAST(seq AS INTEGER), stage FROM brigade_progress WHERE brigade_id = ?1",
+                "SELECT CAST(seq AS INTEGER), stage, CAST(updated_at_ms AS INTEGER)                  FROM brigade_progress WHERE brigade_id = ?1",
                 [brigade_id],
                 |row| {
                     Ok(ProgressGlance {
                         seq: row.get(0)?,
                         stage: row.get(1)?,
+                        updated_at_ms: row.get(2)?,
                     })
                 },
             )
@@ -196,6 +204,30 @@ mod tests {
         assert!(record.updated_at_ms >= before, "{record:?}");
         let glance = store.brigade_progress_glance(br).unwrap().unwrap();
         assert_eq!((glance.seq, glance.stage.as_str()), (1, "実装中"));
+        // The same stamp the full record carries, so the tile's age and the
+        // reading screen's agree.
+        assert_eq!(glance.updated_at_ms, record.updated_at_ms);
+    }
+
+    #[test]
+    fn a_stage_stored_over_the_write_limit_is_still_read() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = briefed(&mut store);
+        let long = "あ".repeat(banto_core::progress::STAGE_MAX_CHARS * 2);
+        store
+            .conn
+            .execute(
+                "INSERT INTO brigade_progress (brigade_id, stage, tasks, off_plan, seq, updated_at_ms) \
+                 VALUES (?1, ?2, '[]', '[]', 1, 5)",
+                params![br, long],
+            )
+            .unwrap();
+        let glance = store.brigade_progress_glance(br).unwrap().unwrap();
+        assert_eq!((glance.stage, glance.updated_at_ms), (long.clone(), 5));
+        assert_eq!(
+            store.brigade_progress(br).unwrap().unwrap().progress.stage,
+            long
+        );
     }
 
     #[test]

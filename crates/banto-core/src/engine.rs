@@ -39,14 +39,15 @@ use crate::key_encode::{
 use crate::member_name;
 use crate::model::Activity;
 use crate::model::{
-    AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN, InterruptOutcome,
-    InterruptWhy, MemberGlance, MemberToken, MessageGlance, PtyExitReason, Quiescence, SessionRow,
-    SessionToOpen, StoredLayout,
+    AgentKind, BANTO_SENDER, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN,
+    InterruptOutcome, InterruptWhy, MemberGlance, MemberToken, MessageGlance, PLANNER_TOKEN,
+    PtyExitReason, Quiescence, SessionRow, SessionToOpen, StoredLayout,
 };
 use crate::pane_log::PaneFacts;
+use crate::plan::{PlanApprovalReport, PlanCloseCause, PlanCloseReport, PlanGlance};
 use crate::program_state::ReportedState;
 use crate::progress::{BrigadeReading, ProgressGlance};
-use crate::reading::{ReadingState, reading_max_scroll, reading_text_size};
+use crate::reading::{ReadingState, ReadingTrigger, reading_max_scroll, reading_text_size};
 
 pub use crate::layout::{
     Areas, Axis, Boundary, BrigadeLayout, ButtonKind, COLLAPSED_TILE_HEIGHT,
@@ -606,11 +607,18 @@ pub struct BrigadeNameFacts {
     /// The write count and stage line of the brigade's Director's Progress, as the
     /// store held them when the tick read it (`None`: none written, or a stream
     /// recorded before Progress existed). The count says whether the reading
-    /// screen's body is stale; nothing draws the stage line yet (the list row
-    /// was too narrow for it, "Decision (2026-11-26)"). The rest of the Progress
-    /// is read only while the screen is open.
+    /// screen's body is stale; the stage line is drawn on the Director's tile
+    /// ([`EmporiumState::director_progress`]). The rest of the Progress is read
+    /// only while the screen is open.
     #[serde(default)]
     pub progress: Option<ProgressGlance>,
+    /// The brigade's open Plan, as the store held it when the tick read it: the
+    /// newest version, the state, whether that version is a draft. No body: the
+    /// reading screen reads that while it is open, and asks again when this
+    /// changes. `None`: no Plan is open, the store could not be read, or a stream
+    /// recorded before Plans existed.
+    #[serde(default)]
+    pub plan: Option<PlanGlance>,
 }
 
 /// One `interrupt_worker` request the UI has not decided or its Worker has not
@@ -879,6 +887,79 @@ pub fn decide_goinkyo(look: &GoinkyoLook) -> Option<GoinkyoObservation> {
     }
 }
 
+/// A brigade's Planner member row that has no session id yet, and what
+/// [`update_planner_observed`] needs to launch it. Read shell-side like
+/// [`GoinkyoSpawnCandidate`], for the same reason: the row is written by the
+/// Director's own `_mcp` process (`open_planner`), which no event reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannerSpawnCandidate {
+    pub brigade_id: BrigadeId,
+    pub cwd: PathBuf,
+    /// The brigade's members' tokens in join order, the Planner among them. The
+    /// Planner joins last, so it is the newest member and its tile enters at the
+    /// bottom of the stack.
+    #[serde(default)]
+    pub roster: Vec<MemberToken>,
+}
+
+/// What the shell observed about one brigade's Planner this tick, the Planner's
+/// counterpart of [`GoinkyoObservation`] and handled the same way: a row that
+/// vanished from under a pane is the one signal that its Plan was closed by
+/// someone else (the Director's `close_planner`, or `release_plan`), and the
+/// observation is read only once every event queued ahead of it has been
+/// handled (`next_event`), so the pane-rekey and `SetMemberSession` pair is never
+/// seen half done.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlannerObservation {
+    /// The brigade has no Planner row, and either its Director is hosted or banto
+    /// still holds a Planner pane for it: whatever is left of a Planner is released.
+    NoPlanner { brigade_id: BrigadeId },
+    /// A Planner row with no session id yet, and the brigade's Director is hosted.
+    AwaitingSpawn(PlannerSpawnCandidate),
+}
+
+/// One brigade's Planner situation as the shell read it this tick. It reuses the
+/// Goinkyo's row and guard shapes ([`GoinkyoRow`], [`GoinkyoGuardFacts`]): the
+/// facts are the same three, and a second pair of enums would only say them again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerLook {
+    pub brigade_id: BrigadeId,
+    /// False when the store could not list the members: `row` and
+    /// `director_hosted` are then placeholders and the decision ignores them.
+    pub roster_read: bool,
+    pub row: GoinkyoRow,
+    pub director_hosted: bool,
+    pub guard: GoinkyoGuardFacts,
+    /// Only meaningful when the row is awaiting a session and the Director is hosted.
+    pub cwd: PathBuf,
+    pub roster: Vec<MemberToken>,
+}
+
+/// The observation this tick's [`PlannerLook`] calls for, or `None` when there is
+/// nothing to tell the core. A Planner whose row holds a session id is left alone
+/// whether or not it has a pane: the way back for one without is staging the
+/// brigade again (`stage_brigade`), not the tick.
+pub fn decide_planner(look: &PlannerLook) -> Option<PlannerObservation> {
+    if !look.roster_read {
+        return None;
+    }
+    match &look.row {
+        GoinkyoRow::Absent => (look.director_hosted || look.guard.guard.is_some()).then_some(
+            PlannerObservation::NoPlanner {
+                brigade_id: look.brigade_id,
+            },
+        ),
+        GoinkyoRow::NoSession => look.director_hosted.then(|| {
+            PlannerObservation::AwaitingSpawn(PlannerSpawnCandidate {
+                brigade_id: look.brigade_id,
+                cwd: look.cwd.clone(),
+                roster: look.roster.clone(),
+            })
+        }),
+        GoinkyoRow::Session(_) => None,
+    }
+}
+
 /// Shows a status message again and again for as long as a condition holds,
 /// without ever covering another message or leaving the key guidance hidden:
 /// one showing, then [`STATUS_TIMEOUT`] of notice, then
@@ -949,6 +1030,15 @@ const FIRST_TURN_NOTICE_AFTER: Duration = Duration::from_secs(15);
 /// information. ASCII-only and quote-free for the same reasons as
 /// [`CODEX_WORKER_FIRST_PROMPT`].
 const GOINKYO_FIRST_PROMPT: &str = "[banto] This pane just started as your brigade's Goinkyo.";
+
+/// The fixed first prompt a freshly created Planner gets on its command line. It
+/// is the trigger and little more, as the Goinkyo's is: Claude does nothing with a
+/// system prompt alone until it has a turn. It names the request file because the
+/// Planner's banto tools are not connected on its first turn (the `_mcp` server
+/// starts with the session, after the first prompt is read), so the file is the
+/// one way the request reaches it. ASCII-only and quote-free like
+/// [`GOINKYO_FIRST_PROMPT`], so it survives a command line on any platform.
+const PLANNER_FIRST_PROMPT: &str = "[banto] This pane just started as your brigade's Planner. Read the request file named in your system prompt first.";
 
 /// A member banto created with a first prompt on its command line
 /// ([`Cmd::OpenEmbedded::first_prompt`]), until that prompt is known to have
@@ -1581,6 +1671,16 @@ pub struct EmporiumState {
     /// brigade whose member token is a Worker's or the Goinkyo's), so the kill
     /// that arm issues names a pane already on its way out, which costs nothing.
     goinkyo_pane: HashMap<BrigadeId, SessionKey>,
+    /// The Planner's counterpart of [`Self::goinkyo_pane`]: the one-shot spawn guard
+    /// and the record of which pane is a brigade's Planner, kept the same way
+    /// (seeded by `stage_brigade`, renamed by a rekey, released by
+    /// [`PlannerObservation::NoPlanner`]). Where it differs is the exit: a Planner
+    /// that dies keeps its row and its Plan, so a guard still holding the
+    /// placeholder key of a Planner that never spoke survives the exit. That is
+    /// the "do not retry" half of the guard doing its job: a Planner that cannot
+    /// start would otherwise be created again every tick. Staging the brigade
+    /// again clears it (`stage_brigade`), and that is the one way back.
+    planner_pane: HashMap<BrigadeId, SessionKey>,
     /// Durable brigade member identity carried alongside a live pane key.
     /// Every key in `Stage::Brigade::panes` has one entry here; `panes`
     /// deliberately remains geometry-only, so the renderer reads this map
@@ -1868,6 +1968,7 @@ impl EmporiumState {
             window_focused: true,
             last_focus_notified: None,
             goinkyo_pane: HashMap::new(),
+            planner_pane: HashMap::new(),
             member_tokens: HashMap::new(),
             refused_session_moves: HashSet::new(),
             member_brigades: HashMap::new(),
@@ -1907,6 +2008,13 @@ impl EmporiumState {
     /// to hand a fold that gets replayed.
     pub fn goinkyo_brigades(&self) -> Vec<BrigadeId> {
         let mut ids: Vec<BrigadeId> = self.goinkyo_pane.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The Planner's counterpart of [`Self::goinkyo_brigades`].
+    pub fn planner_brigades(&self) -> Vec<BrigadeId> {
+        let mut ids: Vec<BrigadeId> = self.planner_pane.keys().copied().collect();
         ids.sort_unstable();
         ids
     }
@@ -2023,6 +2131,11 @@ impl EmporiumState {
             self.member_brigades.insert(new_key.clone(), value);
         }
         for key in self.goinkyo_pane.values_mut() {
+            if key == old_key {
+                *key = new_key.clone();
+            }
+        }
+        for key in self.planner_pane.values_mut() {
             if key == old_key {
                 *key = new_key.clone();
             }
@@ -2308,6 +2421,28 @@ impl EmporiumState {
         }
     }
 
+    /// `brigade_id`'s Planner pane, if [`Self::planner_pane`] tracks one.
+    pub fn planner_pane_for(&self, brigade_id: BrigadeId) -> Option<&SessionKey> {
+        self.planner_pane.get(&brigade_id)
+    }
+
+    /// The Planner one-shot guard of `brigade_id` as plain values, read by the
+    /// shell's gather: see [`Self::goinkyo_guard_facts`].
+    pub fn planner_guard_facts(&self, brigade_id: BrigadeId) -> GoinkyoGuardFacts {
+        let guard = self.planner_pane.get(&brigade_id).cloned();
+        let pane = guard
+            .as_ref()
+            .is_some_and(|key| self.screens.contains_key(key));
+        let opening = guard
+            .as_ref()
+            .is_some_and(|key| self.pending_opens.contains_key(key));
+        GoinkyoGuardFacts {
+            guard,
+            pane,
+            opening,
+        }
+    }
+
     /// What the pane log says about the pane at `key`, read before the Event
     /// about it is folded: whether its exit was asked for, the member it
     /// belongs to, what its activity read as ([`Self::quiescence_of`], the reading
@@ -2422,6 +2557,18 @@ impl EmporiumState {
         self.member_brigades
             .get(director)
             .is_some_and(|brigade_id| self.requests.contains_key(brigade_id))
+    }
+
+    /// The Progress glance of `key`'s brigade when `key` is that brigade's Director,
+    /// else `None`. By the member token and not by stack position: the Director's
+    /// tile is not guaranteed to be the first of the stack, and a Worker's tile
+    /// never shows its brigade's stage.
+    pub fn director_progress(&self, key: &SessionKey) -> Option<&ProgressGlance> {
+        if self.member_tokens.get(key).map(String::as_str) != Some(DIRECTOR_TOKEN) {
+            return None;
+        }
+        let brigade_id = self.member_brigades.get(key)?;
+        self.brigade_names.get(brigade_id)?.progress.as_ref()
     }
 
     /// The durable brigade token associated with a currently staged pane.
@@ -3046,6 +3193,42 @@ impl EmporiumState {
             .into_iter()
             .flatten()
             .any(|at| started.is_none_or(|started| at >= started))
+    }
+
+    /// Whether a not-idle reading of `key` is work the brigade-quiet watch arms
+    /// on. For most members: the process was read idle before and is past its
+    /// start-up, or was given work ([`Self::was_given_work`]). A Planner's pane is
+    /// the exception, and arms only when banto started the turn it is in
+    /// ([`Self::planner_turn_is_banto`]): the operator talks with it at length, and
+    /// ringing the bell when a brigade's Workers have done nothing, because a
+    /// conversation in the Planner's pane ended, would call the operator to a pane
+    /// they are already looking at.
+    fn working_is_real_work(&self, key: &SessionKey, process: Option<u64>, now: Instant) -> bool {
+        if self.member_tokens.get(key).map(String::as_str) == Some(PLANNER_TOKEN) {
+            return self.planner_turn_is_banto(key);
+        }
+        process.is_some_and(|id| self.seen_idle.contains(&id)) && self.past_start_up(key, now)
+            || self.was_given_work(key)
+    }
+
+    /// Whether the last thing written into `key`'s pane, since its process started,
+    /// was banto's (its first prompt, a relay wake) and not the operator's key or
+    /// paste: the turn it is in was banto's to start. Both stamps are already kept
+    /// apart ([`Self::last_prompted`], [`Self::last_given_input`]), so the later of
+    /// the two says who began the turn. A turn banto began that the operator then
+    /// joins is still judged on the samples before they typed: the watch's armed
+    /// flag only ever gains here.
+    fn planner_turn_is_banto(&self, key: &SessionKey) -> bool {
+        let Some(prompted) = self.last_prompted.get(key) else {
+            return false;
+        };
+        self.process_started
+            .get(key)
+            .is_none_or(|started| prompted >= started)
+            && self
+                .last_given_input
+                .get(key)
+                .is_none_or(|typed| prompted >= typed)
     }
 
     /// Whether `key`'s member has unread brigade mail that the relay is still
@@ -3835,6 +4018,21 @@ pub enum StoreIntent {
         brigade_id: BrigadeId,
         token: MemberToken,
     },
+    /// The operator's confirmed prefix-`x` on a Planner's tile: close the brigade's
+    /// open Plan, which removes the Planner's row in the same transaction, and write
+    /// the Plan's export. Answered by [`Event::PlannerClosed`].
+    ClosePlanner {
+        brigade_id: BrigadeId,
+    },
+    /// The operator's capital `A` on the reading screen: approve version `version`
+    /// of Plan `number`, which is the draft the screen showed, and, in the same
+    /// transaction, tell the Director in banto's own words. Answered by
+    /// [`Event::PlanApprovalAnswered`], after the Plan's export is written.
+    ApprovePlan {
+        brigade_id: BrigadeId,
+        number: i64,
+        version: i64,
+    },
     /// Remove a Worker whose pane ended without banto asking and could not be
     /// relaunched (`update_pty_exited`): the same store operation as
     /// [`Self::DismissWorker`], answered by [`Event::ExitedWorkerDismissed`],
@@ -4201,6 +4399,9 @@ pub enum SpawnRefusal {
     AlreadyRunning,
     /// The brigade's MCP channel config could not be written.
     ChannelWiring,
+    /// The launch was refused before anything was written or started, for a reason
+    /// the operator can change: a Planner's product (Claude) is not enabled.
+    Refused,
 }
 
 impl SpawnRefusal {
@@ -4213,6 +4414,7 @@ impl SpawnRefusal {
             Self::CodexIdentifying => "codex_identifying",
             Self::AlreadyRunning => "already_running",
             Self::ChannelWiring => "channel_wiring",
+            Self::Refused => "refused",
         }
     }
 }
@@ -4583,6 +4785,26 @@ pub enum Event {
     /// [`GoinkyoObservation`]'s own doc for what each case means.
     GoinkyoAwaitingSpawn {
         observation: GoinkyoObservation,
+    },
+    /// ~1/s, once per brigade with something to say: what the shell observed
+    /// about that brigade's Planner. The Planner's counterpart of
+    /// [`Event::GoinkyoAwaitingSpawn`], read at the same moment for the same reason
+    /// (`next_event`), and appended after it so a capture recorded before the
+    /// Planner existed still decodes.
+    PlannerObserved {
+        observation: PlannerObservation,
+    },
+    /// The answer to [`StoreIntent::ClosePlanner`], and, after a disband that closed
+    /// an open Plan, the report of that Plan's export. `Ok(None)`: there was no open
+    /// Plan (it was closed by someone else a moment ago).
+    PlannerClosed {
+        brigade_id: BrigadeId,
+        result: Result<Option<PlanCloseReport>, String>,
+    },
+    /// The answer to [`StoreIntent::ApprovePlan`].
+    PlanApprovalAnswered {
+        brigade_id: BrigadeId,
+        result: Result<PlanApprovalReport, String>,
     },
     /// banto's own process gained or lost OS focus (crossterm's
     /// `FocusGained`/`FocusLost`, reported only once `EnableFocusChange` is
@@ -4961,6 +5183,15 @@ pub fn update(
         Event::GoinkyoAwaitingSpawn { observation } => {
             update_goinkyo_awaiting_spawn(state, brigade, observation)
         }
+        Event::PlannerObserved { observation } => {
+            update_planner_observed(state, brigade, observation)
+        }
+        Event::PlannerClosed { brigade_id, result } => {
+            update_planner_closed(state, brigade_id, result, now)
+        }
+        Event::PlanApprovalAnswered { brigade_id, result } => {
+            update_plan_approval_answered(state, app, brigade_id, result, now)
+        }
         Event::WindowFocusChanged { focused } => {
             state.window_focused = focused;
             // Focus leaving the window is the one way a release can be lost
@@ -5223,7 +5454,13 @@ fn apply_request_fact(
 /// its brigade is spent no longer, since from here the stretch of work is his and
 /// its end rings as usual. banto's own nudges and first prompts do not come
 /// through here.
+///
+/// Not for the Planner's pane: the operator talks with it as a matter of course, and
+/// a request waits on the brigade, not on that conversation.
 fn operator_gave_work(state: &mut EmporiumState, pane: &SessionKey) {
+    if state.member_tokens.get(pane).map(String::as_str) == Some(PLANNER_TOKEN) {
+        return;
+    }
     if let Some(brigade_id) = state.member_brigades.get(pane) {
         state.request_spent.remove(brigade_id);
     }
@@ -5406,11 +5643,7 @@ fn update_brigade_quiet(
         // fact (this process was read idle): a process read idle at its first
         // sample and not idle again after the grace is the ordinary case, and
         // only the decision to call a reading work waits.
-        if sampled.is_working()
-            && (process.is_some_and(|id| state.seen_idle.contains(&id))
-                && state.past_start_up(key, now)
-                || state.was_given_work(key))
-        {
+        if sampled.is_working() && state.working_is_real_work(key, process, now) {
             brigade.real_work = true;
         }
         brigade.last_prompted = brigade
@@ -5608,19 +5841,19 @@ fn sync_request_rows(state: &EmporiumState, app: &mut App) {
     app.set_request_rows(rows);
 }
 
-/// The two counters whose change makes the reading screen's body stale, as the
-/// last tick read them: the open request's sequence number (the question is
-/// stored with it, so it cannot change under the same number) and the Progress
-/// write count.
-fn reading_trigger(state: &EmporiumState, brigade_id: BrigadeId) -> (Option<i64>, Option<i64>) {
-    (
-        state.requests.get(&brigade_id).copied(),
-        state
-            .brigade_names
-            .get(&brigade_id)
+/// What makes the reading screen's body stale when it changes, as the last tick
+/// read it: the open request's sequence number (the question is stored with it, so
+/// it cannot change under the same number), the Progress write count, and the Plan's
+/// glance (a new draft, an approval and a release each change it).
+fn reading_trigger(state: &EmporiumState, brigade_id: BrigadeId) -> ReadingTrigger {
+    let facts = state.brigade_names.get(&brigade_id);
+    ReadingTrigger {
+        request: state.requests.get(&brigade_id).copied(),
+        progress: facts
             .and_then(|facts| facts.progress.as_ref())
             .map(|glance| glance.seq),
-    )
+        plan: facts.and_then(|facts| facts.plan.clone()),
+    }
 }
 
 /// The brigade F5 reads: with a pane focused, the staged one; from the list, the
@@ -5680,7 +5913,7 @@ fn refresh_reading(state: &EmporiumState, app: &mut App) -> Vec<Cmd> {
     };
     let brigade_id = reading.brigade_id();
     let now_trigger = reading_trigger(state, brigade_id);
-    if reading.asked() == now_trigger {
+    if *reading.asked() == now_trigger {
         return Vec::new();
     }
     reading.set_asked(now_trigger);
@@ -5725,6 +5958,30 @@ fn update_reading_read(
     Vec::new()
 }
 
+/// Answers [`StoreIntent::ApprovePlan`]. Whatever the answer, the screen reads its
+/// body again: an approval changes what is in force, and a refusal means what is
+/// on screen is not what the store holds.
+fn update_plan_approval_answered(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade_id: BrigadeId,
+    result: Result<PlanApprovalReport, String>,
+    now: Instant,
+) -> Vec<Cmd> {
+    match result {
+        Ok(report) => state.set_status(report.status_line(), now),
+        Err(error) => state.set_status(format!("failed to approve the Plan: {error}"), now),
+    }
+    let open_here = app
+        .reading_mut()
+        .is_some_and(|reading| reading.brigade_id() == brigade_id);
+    if open_here {
+        vec![Cmd::Store(StoreIntent::ReadBrigadeReading { brigade_id })]
+    } else {
+        Vec::new()
+    }
+}
+
 /// A key on the reading screen: scroll, Esc to close, Enter to go to the
 /// Director's pane while a decision is open. Nothing else does anything, and
 /// nothing reaches a pane.
@@ -5757,6 +6014,23 @@ fn update_reading_key(
         KeyCode::PageDown => reading.set_scroll((at + page).min(max)),
         KeyCode::Home => reading.set_scroll(0),
         KeyCode::End => reading.set_scroll(max),
+        // Capital only, and only for the draft the screen shows: the version goes
+        // with the key, so a draft that arrived after this body was read is refused
+        // by the store and read again, never approved unseen.
+        KeyCode::Char('A') => {
+            let brigade_id = reading.brigade_id();
+            return match reading.approvable() {
+                Some((number, version)) => vec![Cmd::Store(StoreIntent::ApprovePlan {
+                    brigade_id,
+                    number,
+                    version,
+                })],
+                None => {
+                    state.set_status("Nothing to approve: no draft is on this screen", now);
+                    Vec::new()
+                }
+            };
+        }
         KeyCode::Enter => {
             if !reading.decision_open() {
                 return Vec::new();
@@ -6648,6 +6922,16 @@ fn resolve_armed_prefix(
             if let Some(brigade_id) = state.directed_brigade(&target) {
                 return open_close_brigade(state, app, brigade_id);
             }
+            // A Planner's pane closes its Plan, with its own dialog: the member
+            // leaves with the Plan or not at all, and a dismissal has no way to say
+            // that.
+            if let Stage::Brigade { id, .. } = &state.stage
+                && state.member_tokens.get(&target).map(String::as_str) == Some(PLANNER_TOKEN)
+            {
+                let (brigade_id, name) = (*id, state.brigade_name(app, *id));
+                app.open_confirm_close_planner_modal(brigade_id, name);
+                return Vec::new();
+            }
             let title = app
                 .row_for_id(target.as_str())
                 .map(SessionRow::sentence_name)
@@ -6800,6 +7084,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App, now: Instant) -> Vec<
         New,
         Disband,
         CloseBrigade,
+        ClosePlanner,
         Kill,
         WorkerAgent,
         CodexTrust,
@@ -6813,6 +7098,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App, now: Instant) -> Vec<
         Some(Modal::NewSession(_)) => Some(Kind::New),
         Some(Modal::ConfirmDisband { .. }) => Some(Kind::Disband),
         Some(Modal::ConfirmCloseBrigade { .. }) => Some(Kind::CloseBrigade),
+        Some(Modal::ConfirmClosePlanner { .. }) => Some(Kind::ClosePlanner),
         Some(Modal::ConfirmKill { .. }) => Some(Kind::Kill),
         Some(Modal::WorkerAgentPicker(_)) => Some(Kind::WorkerAgent),
         Some(Modal::ConfirmCodexTrust) => Some(Kind::CodexTrust),
@@ -6829,6 +7115,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App, now: Instant) -> Vec<
         Some(Kind::New) => confirm_new_session_modal(app),
         Some(Kind::Disband) => confirm_disband_modal(state, app),
         Some(Kind::CloseBrigade) => confirm_close_brigade_modal(state, app, now),
+        Some(Kind::ClosePlanner) => confirm_close_planner_modal(state, app),
         Some(Kind::Kill) => confirm_kill_modal(state, app),
         Some(Kind::WorkerAgent) => confirm_worker_agent_modal(state, app),
         Some(Kind::CodexTrust) => confirm_codex_trust_modal(state, app),
@@ -7190,6 +7477,24 @@ fn close_key(state: &mut EmporiumState, app: &App) -> Vec<Cmd> {
 /// [`update_worker_dismissed`] knows which pane to actually remove once the
 /// dismissal (or its round trip) comes back. The passive `Event::PtyExited` fold
 /// (see `update_pty_exited`) is what cleans up a pane that was only killed.
+/// Confirm the close-the-Plan dialog. A brigade that is being closed or disbanded
+/// is ending its panes already, and a Plan closed from under that would race the
+/// disband's own close of it, so it is refused with a line instead.
+fn confirm_close_planner_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
+    let Some(Modal::ConfirmClosePlanner { brigade_id, name }) = app.modal() else {
+        return Vec::new();
+    };
+    let (brigade_id, name) = (*brigade_id, name.clone());
+    app.close_modal();
+    if state.closing.contains_key(&brigade_id) || state.disbanding.contains(&brigade_id) {
+        state.status = Some(format!(
+            "{name} is closing \u{2014} its Plan was left as it is"
+        ));
+        return Vec::new();
+    }
+    vec![Cmd::Store(StoreIntent::ClosePlanner { brigade_id })]
+}
+
 fn confirm_kill_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     let Some(Modal::ConfirmKill { key, dismisses, .. }) = app.modal() else {
         return Vec::new();
@@ -7295,6 +7600,19 @@ fn update_membership_resolved(
                 );
                 Vec::new()
             }
+            // A Planner is not dismissed: its row leaves only with the Plan it
+            // belongs to, in the transaction that closes it. Prefix+x on its tile
+            // opens that dialog and never reaches here; this is for a dismissal that
+            // was asked for some other way.
+            Some((_, _, BrigadeRole::Planner)) => {
+                state.pending_dismiss = None;
+                state.pending_dismiss_member = None;
+                state.status = Some(
+                    "the Planner leaves with its Plan \u{2014} Prefix+x on its tile closes the Plan"
+                        .to_string(),
+                );
+                Vec::new()
+            }
             None => {
                 state.pending_dismiss = None;
                 state.pending_dismiss_member = None;
@@ -7327,14 +7645,13 @@ fn update_membership_resolved(
             // solo, same as a Worker does. Not while its brigade is closing:
             // the pane is on its way out, and showing it would hand the
             // operator a pane that dies under their hands.
-            Some((brigade_id, _, BrigadeRole::Worker | BrigadeRole::Goinkyo))
-                if refuse_while_closing(state, app, brigade_id) =>
-            {
-                Vec::new()
-            }
-            Some((_, _, BrigadeRole::Worker | BrigadeRole::Goinkyo)) | None => {
-                open_solo(state, &row)
-            }
+            Some((
+                brigade_id,
+                _,
+                BrigadeRole::Worker | BrigadeRole::Goinkyo | BrigadeRole::Planner,
+            )) if refuse_while_closing(state, app, brigade_id) => Vec::new(),
+            Some((_, _, BrigadeRole::Worker | BrigadeRole::Goinkyo | BrigadeRole::Planner))
+            | None => open_solo(state, &row),
         },
         // `x` on a row. A Director's row closes its brigade, whichever of its
         // panes are hosted and wherever (the Director's own may be gone). A
@@ -7350,10 +7667,10 @@ fn update_membership_resolved(
             Some((brigade_id, _, BrigadeRole::Director)) => {
                 open_close_brigade(state, app, brigade_id)
             }
-            Some((_, _, BrigadeRole::Worker | BrigadeRole::Goinkyo)) => {
+            Some((_, _, BrigadeRole::Worker | BrigadeRole::Goinkyo | BrigadeRole::Planner)) => {
                 state.status = Some(
-                    "that session is a brigade's Worker or Goinkyo \u{2014} dismiss it with \
-                     Prefix+x on its tile"
+                    "that session is a brigade's Worker, Goinkyo or Planner \u{2014} dismiss \
+                     (or close) it with Prefix+x on its tile"
                         .to_string(),
                 );
                 Vec::new()
@@ -7387,6 +7704,10 @@ fn update_membership_resolved(
             // tell the operator something false about who was refused.
             Some((_, _, BrigadeRole::Goinkyo)) => {
                 state.status = Some("a goinkyo can't be promoted to Director directly".to_string());
+                Vec::new()
+            }
+            Some((_, _, BrigadeRole::Planner)) => {
+                state.status = Some("a planner can't be promoted to Director directly".to_string());
                 Vec::new()
             }
             // Outranks the two gates inside `begin_brigade_formation`
@@ -7738,6 +8059,7 @@ impl RoleLaunch {
             permission_mode: match role {
                 BrigadeRole::Worker => brigade.worker_permission_mode(),
                 BrigadeRole::Goinkyo => brigade.goinkyo_permission_mode(),
+                BrigadeRole::Planner => brigade.planner_permission_mode(),
                 BrigadeRole::Director => None,
             }
             .map(str::to_string),
@@ -7952,9 +8274,7 @@ fn stage_brigade(
                 state.unstage(duplicate);
                 duplicates += 1;
             }
-            if *role == BrigadeRole::Goinkyo {
-                state.goinkyo_pane.insert(brigade_id, survivor.clone());
-            }
+            seed_role_guard(state, *role, brigade_id, &survivor);
             // The store should name the pane the operator sees, so the relay and
             // the MCP's liveness address it: a real id that differs from the
             // roster's is recorded (a placeholder key is discovery's to resolve).
@@ -7997,9 +8317,7 @@ fn stage_brigade(
                 // seeded for a Worker or Director — `goinkyo_pane` only ever
                 // means "the current brigade's Goinkyo", nothing else reads
                 // it for any other role.
-                if *role == BrigadeRole::Goinkyo {
-                    state.goinkyo_pane.insert(brigade_id, key.clone());
-                }
+                seed_role_guard(state, *role, brigade_id, &key);
                 if state.screens.contains_key(&key) {
                     panes.push(key);
                 } else {
@@ -8095,7 +8413,9 @@ fn stage_brigade(
             // `AwaitingSpawn` check (which only fires on `session_id: None`)
             // never sees this row as spawnable again — a member the
             // operator can't restart short of dismissing it outright.
-            None if *role == BrigadeRole::Goinkyo && session_id.is_some() => {
+            None if matches!(*role, BrigadeRole::Goinkyo | BrigadeRole::Planner)
+                && session_id.is_some() =>
+            {
                 let key = SessionKey::from_id(session_id.as_deref().unwrap());
                 state.member_tokens.insert(key.clone(), token.clone());
                 state.member_brigades.insert(key.clone(), brigade_id);
@@ -8124,7 +8444,7 @@ fn stage_brigade(
                     // it too — not just a resume through the other one — or
                     // the guard stays unset for a Goinkyo this build never
                     // saw spawn.
-                    state.goinkyo_pane.insert(brigade_id, key.clone());
+                    seed_role_guard(state, *role, brigade_id, &key);
                     panes.push(key);
                 } else {
                     // Truly stranded, not a timing window: no live pane is
@@ -8141,6 +8461,22 @@ fn stage_brigade(
                         brigade_id,
                         token: token.clone(),
                     }));
+                }
+            }
+            // A Planner with no session id and no pane is the tick's to create
+            // (`update_planner_observed`), not this staging's: what staging adds is
+            // the way back. A launch that failed or died before it was ever
+            // identified left its placeholder key in the guard, which the tick reads
+            // as "do not retry". Staging the brigade again is the one thing that
+            // lifts that, so a Planner that could not start is tried again exactly
+            // when the operator opens the brigade, never in a loop of its own.
+            None if *role == BrigadeRole::Planner => {
+                let key = SessionKey::new_worker(brigade_id, token);
+                if state.planner_pane.get(&brigade_id) == Some(&key)
+                    && !state.screens.contains_key(&key)
+                    && !state.pending_opens.contains_key(&key)
+                {
+                    forget_unopened_worker(state, brigade_id, token);
                 }
             }
             None => missing += 1,
@@ -9433,6 +9769,26 @@ fn creation_still_wanted(state: &EmporiumState, brigade_id: BrigadeId, token: &s
         )
 }
 
+/// Records `key` as the one-shot guard of a Goinkyo's or a Planner's pane, the two
+/// roles that have one. Every role is answered here and not through a catch-all:
+/// a role added later has to say whether its pane needs a guard.
+fn seed_role_guard(
+    state: &mut EmporiumState,
+    role: BrigadeRole,
+    brigade_id: BrigadeId,
+    key: &SessionKey,
+) {
+    match role {
+        BrigadeRole::Goinkyo => {
+            state.goinkyo_pane.insert(brigade_id, key.clone());
+        }
+        BrigadeRole::Planner => {
+            state.planner_pane.insert(brigade_id, key.clone());
+        }
+        BrigadeRole::Director | BrigadeRole::Worker => {}
+    }
+}
+
 /// Undo exactly what [`open_worker`] registered for a creation that will not be
 /// carried out: the maps and the pending open under the placeholder key it was
 /// made for. (Its first-turn watch and its discovery are only registered once
@@ -9458,6 +9814,11 @@ fn forget_unopened_worker(state: &mut EmporiumState, brigade_id: BrigadeId, toke
     // a real pane is not this key and is not touched.
     if token == GOINKYO_TOKEN && state.goinkyo_pane.get(&brigade_id) == Some(&key) {
         state.goinkyo_pane.remove(&brigade_id);
+    }
+    // The Planner's, for the same reason, and the one `stage_brigade` lifts when it
+    // is staged again.
+    if token == PLANNER_TOKEN && state.planner_pane.get(&brigade_id) == Some(&key) {
+        state.planner_pane.remove(&brigade_id);
     }
 }
 
@@ -10051,9 +10412,25 @@ fn relaunch_open(
             first_turn: None,
         },
     );
-    let launch = RoleLaunch::of(BrigadeRole::Worker, row.agent, brigade);
+    // The Planner comes back the way a Worker does, in place and once per
+    // cooldown, but as itself: its own launch settings, and its own words, since
+    // the operator did not name it.
+    let role = if token == PLANNER_TOKEN {
+        BrigadeRole::Planner
+    } else {
+        BrigadeRole::Worker
+    };
+    let launch = RoleLaunch::of(role, row.agent, brigade);
     let call = state.member_call(Some(brigade_id), token);
-    state.set_status(format!("worker {call} exited — restarting"), now);
+    state.set_status(
+        match role {
+            BrigadeRole::Planner => "the Planner exited \u{2014} restarting".to_string(),
+            BrigadeRole::Director | BrigadeRole::Worker | BrigadeRole::Goinkyo => {
+                format!("worker {call} exited \u{2014} restarting")
+            }
+        },
+        now,
+    );
     Cmd::OpenEmbedded {
         key: key.clone(),
         target: SessionToOpen {
@@ -10062,7 +10439,7 @@ fn relaunch_open(
             title: row.sentence_name(),
             cwd,
         },
-        brigade: Some((brigade_id, token.clone(), BrigadeRole::Worker)),
+        brigade: Some((brigade_id, token.clone(), role)),
         // A resume (`RoleLaunch`'s doc): the session keeps what it last used.
         model: None,
         effort: None,
@@ -10230,6 +10607,14 @@ fn update_pty_exited(
     // the next reload, which any transcript write under the agent homes brings
     // (the watch in `banto_io::watch::live`, debounced 250ms).
     state.goinkyo_pane.retain(|_, pane| *pane != key);
+    // The Planner's guard is released the same way for a pane that had been
+    // identified, but a placeholder key stays: a Planner that died before it was
+    // ever identified, or that failed to start, would otherwise be created again on
+    // the next tick, and again, for as long as the cause lasts. Staging the
+    // brigade again lifts it (`stage_brigade`).
+    state
+        .planner_pane
+        .retain(|_, pane| *pane != key || pane.is_synthetic());
     // A Director-reopen confirm killed exactly this pane and is waiting for
     // it to actually be gone before reopening it wired — see
     // `confirm_director_reopen_modal`'s doc for why "gone" can't be assumed
@@ -10337,6 +10722,9 @@ fn update_pty_output_lost(
     state.quiescence.remove(&key);
     state.unstage(&key);
     state.goinkyo_pane.retain(|_, pane| *pane != key);
+    state
+        .planner_pane
+        .retain(|_, pane| *pane != key || pane.is_synthetic());
     if was_expected {
         return cmds;
     }
@@ -10393,9 +10781,13 @@ fn unrequested_worker_exit(
 fn departing_worker(state: &EmporiumState, key: &SessionKey) -> Option<(BrigadeId, MemberToken)> {
     let brigade_id = *state.member_brigades.get(key)?;
     let token = state.member_tokens.get(key)?.clone();
+    // Not the Planner either: it leaves with its Plan, through the transaction that
+    // closes it (`Store::close_plan`), and a process that died is not that.
     if token == DIRECTOR_TOKEN
         || token == GOINKYO_TOKEN
+        || token == PLANNER_TOKEN
         || state.goinkyo_pane.values().any(|pane| pane == key)
+        || state.planner_pane.values().any(|pane| pane == key)
         || state.disbanding.contains(&brigade_id)
         || state.closing.contains_key(&brigade_id)
         || state.pending_dismiss.as_ref() == Some(key)
@@ -10734,6 +11126,7 @@ fn update_brigade_formed(
             interrupts: None,
             roster: Vec::new(),
             progress: None,
+            plan: None,
         },
     );
     // A brigade formed in this run had no request when it was formed, so one that
@@ -11237,6 +11630,9 @@ fn nudge_prompt(state: &EmporiumState, brigade_id: BrigadeId, message: &MessageG
     };
     let line = shorten_to_columns(&line, NUDGE_PROMPT_COLUMNS);
     match &message.from_token {
+        // banto's own record (an approval, a close) is no member: no name a Director
+        // gave anyone is looked up for it, and it reads as banto's.
+        Some(sender) if sender == BANTO_SENDER => format!(" \u{2190} {BANTO_SENDER}: {line}"),
         Some(sender) => format!(
             " \u{2190} {}: {line}",
             state.member_call(Some(brigade_id), sender)
@@ -12229,6 +12625,184 @@ fn update_first_turn_watch(
     }
 }
 
+/// Lets go of everything banto holds for `brigade_id`'s Planner once its Plan is
+/// closed: the roster entry, its facts, the one-shot guard, and the pane, ended
+/// wherever it is. The reload is asked for when anything was held, because closing
+/// the Plan archived the Planner's session and the hidden set is read once.
+fn release_planner(state: &mut EmporiumState, brigade_id: BrigadeId) -> Vec<Cmd> {
+    let was_member = state
+        .member_order
+        .get_mut(&brigade_id)
+        .is_some_and(|joined| {
+            let before = joined.len();
+            joined.retain(|listed| listed != PLANNER_TOKEN);
+            joined.len() != before
+        });
+    state
+        .member_facts
+        .remove(&(brigade_id, PLANNER_TOKEN.to_string()));
+    let Some(key) = state.planner_pane.remove(&brigade_id) else {
+        return if was_member {
+            vec![Cmd::Reload]
+        } else {
+            Vec::new()
+        };
+    };
+    // Unstaging applies only to a pane that is on stage; ending it applies either
+    // way, as for the Goinkyo's (`update_goinkyo_awaiting_spawn`).
+    let staged = matches!(
+        &state.stage,
+        Stage::Brigade { id, panes, .. } if *id == brigade_id && panes.contains(&key)
+    );
+    let kill = kill_pane(state, key.clone());
+    if staged {
+        state.unstage(&key);
+    }
+    kill.into_iter().chain([Cmd::Reload]).collect()
+}
+
+/// Answers [`Event::PlannerClosed`]. An operator's close ends the pane at once
+/// (the next tick's `NoPlanner` would, a second later) and says what happened. A
+/// disband's pane was ended by [`update_disbanded`] already, so only a failed export
+/// is worth a line.
+fn update_planner_closed(
+    state: &mut EmporiumState,
+    brigade_id: BrigadeId,
+    result: Result<Option<PlanCloseReport>, String>,
+    now: Instant,
+) -> Vec<Cmd> {
+    match result {
+        Err(error) => {
+            state.set_status(format!("could not close the Plan: {error}"), now);
+            Vec::new()
+        }
+        Ok(None) => {
+            state.set_status("the brigade has no open Plan to close", now);
+            Vec::new()
+        }
+        Ok(Some(report)) => {
+            let cmds = match report.cause {
+                PlanCloseCause::Operator => release_planner(state, brigade_id),
+                PlanCloseCause::Disband => Vec::new(),
+            };
+            if let Some(line) = report.status_line() {
+                let line = match (report.cause, state.status.take()) {
+                    (PlanCloseCause::Disband, Some(earlier)) => format!("{earlier}; {line}"),
+                    _ => line,
+                };
+                state.set_status(line, now);
+            }
+            cmds
+        }
+    }
+}
+
+/// Answers `Event::PlannerObserved`: start the Planner the observation names, at
+/// most once until the brigade is staged again, and release whatever is left of
+/// one whose row is gone.
+///
+/// It is [`update_goinkyo_awaiting_spawn`]'s shape, and its guard
+/// ([`EmporiumState::planner_pane`]) is read the same way: a synthetic key is a
+/// launch in flight or one that failed, so it is not retried; a real key beside a
+/// row with no session id is a pane of a Plan that ended and was replaced, which is
+/// torn down rather than adopted. Three things differ, all because a Planner
+/// outlives its panes. There is no Codex path, since the Planner is Claude's alone.
+/// The `NoPlanner` arm is how the UI learns of a Plan closed by another process (the
+/// Director's `close_planner` or `release_plan`), and it also reloads when the
+/// roster still listed the Planner, because closing the Plan archived its session
+/// and the hidden set is read once. And nothing here removes the row: a Planner
+/// that cannot start keeps its row and its Plan, and says so through
+/// `brigade_status`, because the Plan is the operator's and a failed process must
+/// not be what ends it.
+fn update_planner_observed(
+    state: &mut EmporiumState,
+    brigade: &BrigadeConfig,
+    observation: PlannerObservation,
+) -> Vec<Cmd> {
+    let candidate = match observation {
+        PlannerObservation::NoPlanner { brigade_id } => {
+            return release_planner(state, brigade_id);
+        }
+        // A brigade being closed is not running: its Planner starts, like any
+        // member without a session, when the brigade is opened again.
+        PlannerObservation::AwaitingSpawn(candidate)
+            if state.closing.contains_key(&candidate.brigade_id) =>
+        {
+            return Vec::new();
+        }
+        PlannerObservation::AwaitingSpawn(candidate) => candidate,
+    };
+    if candidate.roster.is_empty() {
+        record_join(state, candidate.brigade_id, PLANNER_TOKEN);
+    } else {
+        state
+            .member_order
+            .insert(candidate.brigade_id, candidate.roster.clone());
+    }
+    if let Some(existing) = state.planner_pane.get(&candidate.brigade_id).cloned() {
+        if existing.is_synthetic() {
+            return Vec::new();
+        }
+        // The Goinkyo's reasoning holds word for word: a real key beside a row
+        // with no session id is a pane from a Plan that ended without the
+        // `NoPlanner` that would have released it (closed and opened again inside
+        // one tick, or a restart that seeded the guard first), and a late
+        // discovery would adopt it into the new Plan's row.
+        state.planner_pane.remove(&candidate.brigade_id);
+        let staged = matches!(
+            &state.stage,
+            Stage::Brigade { id, panes, .. }
+                if *id == candidate.brigade_id && panes.contains(&existing)
+        );
+        let kill = kill_pane(state, existing.clone());
+        if staged {
+            state.unstage(&existing);
+        }
+        return kill.into_iter().chain([Cmd::Reload]).collect();
+    }
+    state
+        .member_facts
+        .remove(&(candidate.brigade_id, PLANNER_TOKEN.to_string()));
+    let key = SessionKey::new_worker(candidate.brigade_id, PLANNER_TOKEN);
+    if state.screens.contains_key(&key) || state.pending_opens.contains_key(&key) {
+        return Vec::new();
+    }
+    state.planner_pane.insert(candidate.brigade_id, key.clone());
+    state
+        .member_tokens
+        .insert(key.clone(), PLANNER_TOKEN.to_string());
+    state
+        .member_brigades
+        .insert(key.clone(), candidate.brigade_id);
+    state.pending_opens.insert(
+        key.clone(),
+        PendingOpen::BrigadeMember {
+            brigade_id: candidate.brigade_id,
+            first_turn: Some(AgentKind::ClaudeCode),
+        },
+    );
+    vec![Cmd::OpenEmbedded {
+        key,
+        target: SessionToOpen {
+            id: String::new(),
+            agent: AgentKind::ClaudeCode,
+            title: PLANNER_TOKEN.to_string(),
+            cwd: candidate.cwd,
+        },
+        brigade: Some((
+            candidate.brigade_id,
+            PLANNER_TOKEN.to_string(),
+            BrigadeRole::Planner,
+        )),
+        model: brigade.planner_model().map(str::to_string),
+        effort: brigade.planner_effort().map(str::to_string),
+        permission_mode: brigade.planner_permission_mode().map(str::to_string),
+        disallowed_tools: None,
+        autocompact: None,
+        first_prompt: Some(PLANNER_FIRST_PROMPT.to_string()),
+    }]
+}
+
 /// Answers `Event::GoinkyoAwaitingSpawn`: spawn the Goinkyo `observation`
 /// names, at most once per consultation, for a brigade on stage or not; once
 /// a consultation is observed to have ended, release the guard and close
@@ -12546,6 +13120,9 @@ mod untitled_session_tests;
 
 #[cfg(test)]
 mod reading_tests;
+
+#[cfg(test)]
+mod planner_tests;
 
 #[cfg(test)]
 mod tests {
@@ -23463,6 +24040,7 @@ mod tests {
             interrupts: None,
             roster: Vec::new(),
             progress: None,
+            plan: None,
         }
     }
 
@@ -24079,6 +24657,20 @@ mod tests {
     }
 
     #[test]
+    fn a_message_banto_wrote_itself_is_quoted_as_banto_and_as_nobody_else() {
+        let (state, _, _, _, _) = reading_fixture();
+        let message = MessageGlance {
+            created_at_ms: 1,
+            line: "The operator approved Plan 3, version 2".to_string(),
+            from_token: Some(BANTO_SENDER.to_string()),
+        };
+        assert_eq!(
+            nudge_prompt(&state, 1, &message),
+            " \u{2190} banto: The operator approved Plan 3, version 2"
+        );
+    }
+
+    #[test]
     fn the_nudge_status_is_the_short_form_when_there_is_nothing_to_quote() {
         let short = "relay: nudged director of \"Fix the relay draft guard\"";
         // No glance at all.
@@ -24156,6 +24748,75 @@ mod tests {
         };
         let json = serde_json::to_string(&new).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), new);
+    }
+
+    #[test]
+    fn a_recorded_tick_whose_stage_has_no_write_time_still_parses_as_written_long_ago() {
+        let mut facts = name_facts(3, "A title", Some("dir"));
+        facts.progress = Some(ProgressGlance {
+            seq: 2,
+            stage: "review".to_string(),
+            updated_at_ms: 1_700_000_000_000,
+        });
+        let tick = Event::Tick {
+            relay: vec![],
+            brigades: vec![facts],
+        };
+        let mut json: serde_json::Value = serde_json::to_value(&tick).unwrap();
+        let glance = &mut json["Tick"]["brigades"][0]["progress"];
+        assert!(
+            glance
+                .as_object_mut()
+                .unwrap()
+                .remove("updated_at_ms")
+                .is_some()
+        );
+        let Event::Tick { brigades, .. } = serde_json::from_value(json).unwrap() else {
+            panic!("a tick");
+        };
+        let glance = brigades[0].progress.as_ref().unwrap();
+        assert_eq!(
+            (glance.seq, glance.stage.as_str(), glance.updated_at_ms),
+            (2, "review", 0)
+        );
+    }
+
+    #[test]
+    fn only_a_directors_pane_reads_its_brigades_stage_wherever_it_stands_in_the_stack() {
+        let mut state = state_with_facts(vec![name_facts(1, "cell", Some("dir"))]);
+        state.brigade_names.get_mut(&1).unwrap().progress = Some(ProgressGlance {
+            seq: 1,
+            stage: "review".to_string(),
+            updated_at_ms: 7,
+        });
+        let host = |state: &mut EmporiumState, id: &str, token: &str, brigade: BrigadeId| {
+            let key = SessionKey::from_id(id);
+            state.member_tokens.insert(key.clone(), token.to_string());
+            state.member_brigades.insert(key.clone(), brigade);
+            key
+        };
+        let worker = host(&mut state, "w1", "worker-1", 1);
+        let director = host(&mut state, "dir", DIRECTOR_TOKEN, 1);
+        // The Worker is first in the stack, and so is the one a position-based rule
+        // would have picked.
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(director.clone()),
+            panes: vec![worker.clone(), director.clone()],
+            focused: 0,
+        };
+        assert_eq!(
+            state.director_progress(&director).map(|g| g.updated_at_ms),
+            Some(7)
+        );
+        assert_eq!(state.director_progress(&worker), None);
+        assert_eq!(
+            state.director_progress(&SessionKey::from_id("stranger")),
+            None
+        );
+        // A brigade with no Progress has nothing to show.
+        state.brigade_names.get_mut(&1).unwrap().progress = None;
+        assert_eq!(state.director_progress(&director), None);
     }
 
     #[test]

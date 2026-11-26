@@ -10,11 +10,15 @@ use crate::app::App;
 use crate::config::BrigadeConfig;
 use crate::input::{KeyCode, KeyEvent, Modifiers};
 use crate::model::{Activity, AgentKind, SessionRow};
+use crate::plan::{
+    Plan, PlanApprovalReport, PlanGlance, PlanReading, PlanState, PlanVersion, PlanView,
+    VersionKind,
+};
 use crate::progress::{
     BrigadeReading, DecisionReading, Progress, ProgressGlance, ProgressReading, ProgressTask,
     TaskState,
 };
-use crate::reading::ReadingBody;
+use crate::reading::{ReadingBody, ReadingTrigger};
 use crate::screen::Screen;
 
 use super::*;
@@ -65,7 +69,9 @@ fn facts(brigade_id: BrigadeId, director: &str, progress_seq: Option<i64>) -> Br
         progress: progress_seq.map(|seq| ProgressGlance {
             seq,
             stage: format!("stage {seq}"),
+            updated_at_ms: 0,
         }),
+        plan: None,
     }
 }
 
@@ -179,6 +185,7 @@ fn loaded(
 
 fn with_decision(question: Option<&str>) -> BrigadeReading {
     BrigadeReading {
+        plan: None,
         decision: Some(decision(4, question)),
         progress: Some(progress_reading(2, 1)),
     }
@@ -348,7 +355,14 @@ fn it_reads_again_only_while_open_and_only_when_a_counter_moved() {
     assert!(read_cmds(&cmds).is_empty());
 
     press(&mut state, &mut app, KeyCode::F(5), t);
-    assert_eq!(app.reading().unwrap().asked(), (None, Some(1)));
+    assert_eq!(
+        *app.reading().unwrap().asked(),
+        ReadingTrigger {
+            request: None,
+            progress: Some(1),
+            plan: None
+        }
+    );
 
     // The same counters: nothing.
     cmds = send(
@@ -399,7 +413,14 @@ fn it_reads_again_only_while_open_and_only_when_a_counter_moved() {
         t + Duration::from_secs(4),
     );
     assert_eq!(read_cmds(&cmds), vec![1]);
-    assert_eq!(app.reading().unwrap().asked(), (Some(7), Some(2)));
+    assert_eq!(
+        *app.reading().unwrap().asked(),
+        ReadingTrigger {
+            request: Some(7),
+            progress: Some(2),
+            plan: None
+        }
+    );
 
     // Closed again: back to costing nothing.
     press(
@@ -430,6 +451,7 @@ fn a_read_that_lands_after_the_operator_answered_does_not_show_that_decision() {
     assert!(!app.reading().unwrap().decision_open());
     // A newer request than the answered one is still shown.
     let newer = BrigadeReading {
+        plan: None,
         decision: Some(decision(5, Some("new"))),
         progress: None,
     };
@@ -520,6 +542,7 @@ fn enter_with_no_decision_open_does_nothing() {
         &mut app,
         1,
         BrigadeReading {
+            plan: None,
             decision: None,
             progress: Some(progress_reading(1, 1)),
         },
@@ -539,7 +562,7 @@ fn enter_says_so_when_the_directors_row_is_not_in_the_list() {
     app.open_reading_modal(crate::reading::ReadingState::new(
         2,
         "b".to_string(),
-        (None, None),
+        ReadingTrigger::default(),
     ));
     let t = now();
     loaded(&mut state, &mut app, 2, with_decision(None), t);
@@ -566,6 +589,7 @@ fn the_scroll_keys_stay_inside_the_text() {
         &mut app,
         1,
         BrigadeReading {
+            plan: None,
             decision: None,
             progress: Some(progress_reading(1, 30)),
         },
@@ -607,6 +631,7 @@ fn a_refresh_that_shortens_the_text_pulls_the_scroll_back_inside_it() {
         &mut app,
         1,
         BrigadeReading {
+            plan: None,
             decision: None,
             progress: Some(progress_reading(1, 30)),
         },
@@ -618,6 +643,7 @@ fn a_refresh_that_shortens_the_text_pulls_the_scroll_back_inside_it() {
         &mut app,
         1,
         BrigadeReading {
+            plan: None,
             decision: None,
             progress: Some(progress_reading(2, 2)),
         },
@@ -632,4 +658,242 @@ fn a_recording_that_predates_progress_still_parses() {
     let old = r#"{"brigade_id":1,"name":"alpha","director_session":null}"#;
     let facts: BrigadeNameFacts = serde_json::from_str(old).unwrap();
     assert_eq!(facts.progress, None);
+}
+
+// ---- the Plan on the reading screen, and the approval key ----
+
+fn plan_version(version: i64, kind: VersionKind, body: &str) -> PlanVersion {
+    PlanVersion {
+        version,
+        body: body.to_string(),
+        summary: format!("summary {version}"),
+        kind,
+        created_at_ms: 1_000,
+        approved_at_ms: (kind == VersionKind::OperatorApproved).then_some(2_000),
+    }
+}
+
+fn plan_reading(pending: Option<PlanVersion>, in_force: Option<PlanVersion>) -> PlanReading {
+    PlanReading {
+        view: PlanView {
+            plan: Plan {
+                number: 3,
+                title: "Split the store".to_string(),
+                request: "split it".to_string(),
+                state: if in_force.is_some() {
+                    PlanState::Approved
+                } else {
+                    PlanState::Drafting
+                },
+                result: None,
+                closed_by: None,
+                opened_at_ms: 500,
+                closed_at_ms: None,
+            },
+            in_force,
+            pending,
+        },
+        read_at_ms: 10_000,
+    }
+}
+
+fn glance(latest: i64, pending: bool) -> PlanGlance {
+    PlanGlance {
+        number: 3,
+        latest_version: latest,
+        state: PlanState::Drafting,
+        pending,
+    }
+}
+
+fn approvals(cmds: &[Cmd]) -> Vec<(BrigadeId, i64, i64)> {
+    cmds.iter()
+        .filter_map(|cmd| match cmd {
+            Cmd::Store(StoreIntent::ApprovePlan {
+                brigade_id,
+                number,
+                version,
+            }) => Some((*brigade_id, *number, *version)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn open_with_plan(plan: Option<PlanReading>) -> (EmporiumState, App) {
+    let plan = plan.map(Box::new);
+    let (mut state, mut app) = staged();
+    let t = now();
+    press(&mut state, &mut app, KeyCode::F(5), t);
+    loaded(
+        &mut state,
+        &mut app,
+        1,
+        BrigadeReading {
+            decision: None,
+            progress: None,
+            plan,
+        },
+        t,
+    );
+    (state, app)
+}
+
+fn press_capital_a(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
+    press_with(state, app, KeyCode::Char('A'), Modifiers::SHIFT, now())
+}
+
+#[test]
+fn capital_a_approves_exactly_the_version_the_screen_shows() {
+    let draft = plan_version(2, VersionKind::Draft, "the second draft");
+    let (mut state, mut app) = open_with_plan(Some(plan_reading(Some(draft), None)));
+    let cmds = press_capital_a(&mut state, &mut app);
+    assert_eq!(approvals(&cmds), vec![(1, 3, 2)]);
+    assert!(!wrote_to_a_pane(&cmds));
+    assert_eq!(open_on(&app), Some(1), "the screen stays open");
+}
+
+#[test]
+fn lowercase_a_does_nothing_and_reaches_no_pane() {
+    let draft = plan_version(2, VersionKind::Draft, "the second draft");
+    let (mut state, mut app) = open_with_plan(Some(plan_reading(Some(draft), None)));
+    let cmds = press(&mut state, &mut app, KeyCode::Char('a'), now());
+    assert!(approvals(&cmds).is_empty());
+    assert!(!wrote_to_a_pane(&cmds));
+}
+
+#[test]
+fn a_with_nothing_drafted_says_so_and_asks_nothing() {
+    for plan in [
+        None,
+        Some(plan_reading(
+            None,
+            Some(plan_version(1, VersionKind::OperatorApproved, "in force")),
+        )),
+    ] {
+        let (mut state, mut app) = open_with_plan(plan);
+        let cmds = press_capital_a(&mut state, &mut app);
+        assert!(approvals(&cmds).is_empty());
+        assert!(
+            state
+                .displayed_status()
+                .is_some_and(|status| status.contains("Nothing to approve")),
+            "{:?}",
+            state.displayed_status()
+        );
+    }
+}
+
+#[test]
+fn a_does_not_approve_while_the_screen_is_still_loading() {
+    let (mut state, mut app) = staged();
+    press(&mut state, &mut app, KeyCode::F(5), now());
+    let cmds = press_capital_a(&mut state, &mut app);
+    assert!(approvals(&cmds).is_empty());
+}
+
+#[test]
+fn a_new_draft_changes_the_glance_and_the_open_screen_reads_again() {
+    let draft = plan_version(2, VersionKind::Draft, "the second draft");
+    let (mut state, mut app) = open_with_plan(Some(plan_reading(Some(draft), None)));
+    let t = now();
+    let mut tick_with = |plan: Option<PlanGlance>| {
+        let mut brigade = facts(1, "dir", None);
+        brigade.plan = plan;
+        let cmds = send(
+            &mut state,
+            &mut app,
+            Event::Tick {
+                relay: Vec::new(),
+                brigades: vec![brigade],
+            },
+            t,
+        );
+        read_cmds(&cmds)
+    };
+    assert_eq!(tick_with(Some(glance(2, true))), vec![1], "first sight");
+    assert!(tick_with(Some(glance(2, true))).is_empty(), "nothing moved");
+    assert_eq!(
+        tick_with(Some(glance(3, true))),
+        vec![1],
+        "version 3 arrived"
+    );
+}
+
+#[test]
+fn every_answer_to_an_approval_sets_the_status_and_reads_the_screen_again() {
+    let reports = [
+        (
+            Ok(PlanApprovalReport::Approved {
+                number: 3,
+                version: 2,
+                export: Ok("/data/plans/1-3.md".to_string()),
+            }),
+            "Plan 3 version 2 approved",
+        ),
+        (
+            Ok(PlanApprovalReport::Approved {
+                number: 3,
+                version: 2,
+                export: Err("disk full".to_string()),
+            }),
+            "its export failed: disk full",
+        ),
+        (
+            Ok(PlanApprovalReport::Stale { latest: 4 }),
+            "version 4 since this was read",
+        ),
+        (
+            Ok(PlanApprovalReport::NothingToApprove),
+            "Nothing to approve",
+        ),
+        (Ok(PlanApprovalReport::NoOpenPlan), "no longer open"),
+        (Err("database is locked".to_string()), "database is locked"),
+    ];
+    for (result, wanted) in reports {
+        let draft = plan_version(2, VersionKind::Draft, "x");
+        let (mut state, mut app) = open_with_plan(Some(plan_reading(Some(draft), None)));
+        let cmds = send(
+            &mut state,
+            &mut app,
+            Event::PlanApprovalAnswered {
+                brigade_id: 1,
+                result,
+            },
+            now(),
+        );
+        assert_eq!(read_cmds(&cmds), vec![1], "{wanted}");
+        assert!(
+            state
+                .displayed_status()
+                .is_some_and(|status| status.contains(wanted)),
+            "{wanted}: {:?}",
+            state.displayed_status()
+        );
+    }
+}
+
+#[test]
+fn an_answer_after_the_screen_closed_sets_the_status_and_reads_nothing() {
+    let (mut state, mut app) = staged();
+    let cmds = send(
+        &mut state,
+        &mut app,
+        Event::PlanApprovalAnswered {
+            brigade_id: 1,
+            result: Ok(PlanApprovalReport::NoOpenPlan),
+        },
+        now(),
+    );
+    assert!(read_cmds(&cmds).is_empty());
+    assert!(state.displayed_status().is_some());
+}
+
+#[test]
+fn a_recording_that_predates_plans_still_parses() {
+    let old = r#"{"brigade_id":1,"name":"alpha","director_session":null}"#;
+    let facts: BrigadeNameFacts = serde_json::from_str(old).unwrap();
+    assert_eq!(facts.plan, None);
+    let reading: BrigadeReading =
+        serde_json::from_str(r#"{"decision":null,"progress":null}"#).unwrap();
+    assert_eq!(reading.plan, None);
 }

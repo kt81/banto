@@ -33,6 +33,10 @@ pub const CONSULT_TITLE_COLUMNS: usize = MEMBER_NAME_COLUMNS;
 /// store, so changing the word changes every consultation at once.
 pub const CONSULT_TITLE_LABEL: &str = "Goinkyo: ";
 
+/// The label an ended Planner's session is listed behind. The title is the Plan's,
+/// held to the same width as a consultation's, so the same room is left for it.
+pub const PLANNER_TITLE_LABEL: &str = "Planner: ";
+
 /// Why a title was refused, worded for the Director that chose it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TitleRejection {
@@ -74,6 +78,11 @@ pub fn check_title(input: &str) -> Result<String, TitleRejection> {
 /// A stored consultation title as the list shows it.
 pub fn list_title(title: &str) -> String {
     format!("{CONSULT_TITLE_LABEL}{title}")
+}
+
+/// A stored Plan title as the list shows an ended Planner's session.
+pub fn planner_list_title(title: &str) -> String {
+    format!("{PLANNER_TITLE_LABEL}{title}")
 }
 
 #[cfg(test)]
@@ -120,6 +129,7 @@ mod tests {
         // 36 columns, less the border on each side.
         let inner = usize::from(crate::layout::SIDEBAR_WIDTH) - 2;
         assert!(CONSULT_TITLE_LABEL.width() + CONSULT_TITLE_COLUMNS <= inner);
+        assert!(PLANNER_TITLE_LABEL.width() + CONSULT_TITLE_COLUMNS <= inner);
     }
 
     #[test]

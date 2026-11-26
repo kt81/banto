@@ -80,12 +80,16 @@ overrides). Members get `send_to_peer`, `check_messages` and `brigade_status`. T
 Director also gets:
 
 - `consult_goinkyo` / `dismiss_goinkyo`
+- `open_planner` / `close_planner`: the Director hands you to a Planner when the work
+  spans several errands and is not yet settled (see below)
 - `request_decision`: the Director needs a decision only you can make; banto tags it
   `▸ decision` until you press Enter in its pane, and does not stop it. The question
   it passes along is read on the reading screen (`F5`), not in the list
 - `update_progress`: the Director records the state of the work (a stage line, tasks
-  with their states, work outside the plan), replacing the previous one. You read it
-  on the reading screen (`F5`), so the Director's pane is left for answers and decisions
+  with their states, work outside the plan), replacing the previous one. The stage is
+  a few words naming the phase (80 characters at most), shown with its age on the bottom edge of the
+  Director's tile (`▸ 5m reviewing the plan`). You read the rest on the reading screen
+  (`F5`), so the Director's pane is left for answers and decisions
 - `interrupt_worker`: delivers the Director's reason to a Worker as a message and
   has banto refuse a Claude Worker's next tool calls (up to 3) until it reads it, only
   with relay `auto`. It cannot stop a turn or cut a call that is running; with relay
@@ -101,6 +105,23 @@ consultation in a directory Codex has not trusted waits at Codex's own trust que
 until you answer it in the Goinkyo's pane. `consult_goinkyo` refuses up front when the
 Goinkyo's product cannot run: not enabled in `agents`, no home found, or banto's hook
 not trusted or not launchable.
+
+The Planner is a Claude session the Director opens with `open_planner` when you ask for
+work that spans several errands and whose scope or completion conditions are not settled
+in your words. It
+works the Plan out with you in its own pane, reads the code with `Read`, `Grep` and
+`Glob` only, and writes each draft with `write_plan`. Nothing is settled until you read a
+draft on the reading screen (`F5`, which shows the Plan after Progress) and press `A`
+(Shift) to approve the version on screen. If the Planner has written a newer version since
+you opened the screen, banto refuses and tells you to read it first. Approval sends the
+Director a message from banto, which also says whether the Plan goes to the Goinkyo for
+review, by `goinkyo_consult`; the Director splits the approved Plan into errands.
+Starting no Worker on a draft is an instruction in the `read_plan` tool's description,
+not a check banto makes. The Director ends the Plan with `close_planner`, which refuses `completed`
+unless you approved a version and every task in Progress is done. banto then archives the
+Planner's session and keeps a Markdown export at `<data dir>/plans/<brigade>-<number>.md`.
+A brigade has one Plan at a time. `planner = "off"` makes the Director open a Planner
+only when you ask for one. The Planner always runs on Claude, whatever the Director is.
 
 Each member also gets a role briefing naming its brigade, token and peers (appended
 to the system prompt for Claude Code, delivered by banto's own `SessionStart` hook
@@ -335,7 +356,7 @@ given up to 5 seconds to finish.
 | `B` / `b` | Appoint Director + auto-spawn Workers (on a Director: disband) / spawn one more Worker into the staged brigade |
 | `x` | End what the selected row runs (confirm). On a Director: **close its brigade**: every process of the brigade ends, nothing is deleted, and Enter on the Director's row brings it all back. On a single session with an open pane: end its process. It never dismisses a Worker; use `Ctrl+B x` on that Worker's tile |
 | `F2` / `F3` / `F4` | Move focus between the list and the panes / make the next pane of the staged brigade the current one / ring the brigade bell even while the Director's pane is focused (toggle) |
-| `F5` | Read a brigade's open decision and Progress on a read-only screen, from the list (the selected row's brigade, else the staged one) or from a pane (the staged one). Arrows, `j`/`k`, `PgUp`/`PgDn`, `Home`/`End` scroll; `Esc` closes it; with a decision open, `Enter` closes it and goes to the Director's pane. Opening the screen starts and resumes nothing |
+| `F5` | Read a brigade's open decision, Progress and Plan on a read-only screen (`A` approves the Plan's draft on screen), from the list (the selected row's brigade, else the staged one) or from a pane (the staged one). Arrows, `j`/`k`, `PgUp`/`PgDn`, `Home`/`End` scroll; `Esc` closes it; with a decision open, `Enter` closes it and goes to the Director's pane. Opening the screen starts and resumes nothing |
 | `Ctrl+B` … | tmux-style prefix (configurable), from the list or a pane: |
 | … `o`/`Tab`, arrows | cycle focus through sidebar and panes / directional pane navigation |
 | … `Shift`+`Up`/`Down` | move the focused stack tile one slot up/down |
@@ -403,6 +424,14 @@ goinkyo_consult = "design"
 # A Codex Goinkyo runs read-only (-s read-only -a never), so it cannot build or run tests.
 # Its model and effort are goinkyo_model and goinkyo_effort under [brigade.codex].
 goinkyo_agent = "inherit"
+# When a Director opens a Planner: "auto" (when work spans several errands and its scope
+# or completion is not settled in your words) | "off" (only when you ask). Like goinkyo_consult, it is one paragraph of the
+# Director's briefing and does nothing if director_prompt is empty.
+planner = "auto"
+# The Planner's role text, which replaces Claude's own system prompt along with a paragraph
+# banto always adds; {brigade} is substituted, and "" leaves that paragraph alone. The
+# default is in English and tells the Planner to answer in your language.
+planner_prompt = "..."
 # A Director's request_decision also marks its row and rings. false: the tag only.
 request_attention = true
 
@@ -422,6 +451,10 @@ worker_permission_mode = "auto"  # --permission-mode
 goinkyo_model = "opus"
 goinkyo_effort = "xhigh"
 goinkyo_permission_mode = "auto"
+planner_model = "opus"
+planner_effort = "xhigh"
+planner_permission_mode = "auto"
+planner_tools = "Read,Grep,Glob"   # --tools: the built-in tools it gets, besides banto's own
 
 [brigade.codex]
 worker_model = "terra"           # a slug, or a family word resolved to its newest slug

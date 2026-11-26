@@ -9,17 +9,18 @@
 //! the same template, which is the reason this is one module rather than two
 //! copies.
 
-use banto_core::config::{BrigadeConfig, GoinkyoConsult};
-use banto_core::model::{AgentKind, BrigadeId, BrigadeRole};
+use banto_core::config::{BrigadeConfig, GoinkyoConsult, PlannerSetting};
+use banto_core::model::{AgentKind, BrigadeId, BrigadeRole, PLANNER_TOKEN};
 use banto_io::claude_briefing::{BriefingPattern, PEERS_HOLE};
 use banto_io::codex_briefing::BRIEFING_LAST_SENTENCE;
 use banto_io::store::Store;
 
 /// banto's tools any member may call, by the names Codex dispatches them under.
-const CODEX_MEMBER_TOOLS: [&str; 3] = [
+const CODEX_MEMBER_TOOLS: [&str; 4] = [
     "mcp__banto__check_messages",
     "mcp__banto__send_to_peer",
     "mcp__banto__brigade_status",
+    "mcp__banto__read_plan",
 ];
 
 /// The tools only a Director may call. A Worker is not told them: calling one
@@ -27,13 +28,15 @@ const CODEX_MEMBER_TOOLS: [&str; 3] = [
 /// three above, and the four Director tools added after it never reached it, so a
 /// Codex Director had no name to call them by; a test in `crate::mcp` now checks
 /// every advertised tool against these two lists.
-const CODEX_DIRECTOR_TOOLS: [&str; 6] = [
+const CODEX_DIRECTOR_TOOLS: [&str; 8] = [
     "mcp__banto__request_decision",
     "mcp__banto__name_member",
     "mcp__banto__consult_goinkyo",
     "mcp__banto__dismiss_goinkyo",
     "mcp__banto__interrupt_worker",
     "mcp__banto__update_progress",
+    "mcp__banto__open_planner",
+    "mcp__banto__close_planner",
 ];
 
 /// Facts a Codex member needs that a Claude one does not, appended to the
@@ -122,7 +125,7 @@ macro_rules! des {
 
 macro_rules! after {
     () => {
-        "A shape the operator has approved is settled at this level even if no consultation came first: the time for one was before you asked."
+        "A shape the operator has approved is settled at this level even if no consultation came first: the time for one was before you asked. A Plan is the exception, because the Planner wrote it and nobody has reviewed it: the message that tells you the operator approved one says whether it goes to the Goinkyo before it is built."
     };
 }
 
@@ -220,14 +223,41 @@ pub(crate) fn consult_paragraph(level: GoinkyoConsult) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The Planner paragraph a Director is given after its template and the
+// consultation paragraph. `[brigade] planner` changes only its first sentences;
+// banto enforces neither: `open_planner` works the same at both.
+//
+// Short on purpose. Codex stores a hook's context over about 10,000 bytes as a
+// truncated preview that can never be matched again, and the longest consultation
+// level left about 340 bytes under the budget a test holds. How a Plan is opened,
+// read, written and closed, that the Planner is not to be instructed, that only the
+// version in force is settled, and what to do about a review are in the tool
+// descriptions and the approval message, which cost the briefing nothing.
+// ---------------------------------------------------------------------------
+
+const PLANNER_AUTO: &str = "Planner (auto): open_planner, request verbatim, only if the work spans several errands or commits and what to build, how far or when it is done is unsettled in the operator's words; not for one more of a kind, a repair, a mechanical edit, an investigation or one errand. Their word overrides; on a borderline skip, say why in a line.";
+
+const PLANNER_OFF: &str = "Planner (off): open_planner, request verbatim, only when the operator asks you to; otherwise plan the work yourself.";
+
+/// The paragraph that tells a Director when to open a Planner and how to work
+/// with one.
+pub(crate) fn director_planner_paragraph(setting: PlannerSetting) -> &'static str {
+    match setting {
+        PlannerSetting::Auto => PLANNER_AUTO,
+        PlannerSetting::Off => PLANNER_OFF,
+    }
+}
+
 /// A member's complete role briefing, or `None` when there is nothing to give
 /// it. The one place a briefing is assembled, for both launch paths: the Claude
 /// launch (`crate::embedded::emporium`) and the Codex hook (`crate::hook`) each
 /// ask for it, so they cannot disagree about what a member is told.
 ///
 /// The role's template rendered; for a Director whose template is not empty and
-/// whose `goinkyo_consult` is not empty, the consultation paragraph after it; and
-/// on Codex, last, the addendum. An empty template is the operator declining to
+/// whose `goinkyo_consult` is not empty, the consultation paragraph after it; for
+/// that Director, the Planner paragraph after that; and on Codex, last, the
+/// addendum. An empty template is the operator declining to
 /// give the role any text, and the paragraph does not outlive it: Claude then
 /// gets no flag at all, Codex only the addendum. Workers and the Goinkyo never
 /// get a paragraph.
@@ -251,10 +281,61 @@ pub(crate) fn compose(
         text.push_str("\n\n");
         text.push_str(consult_paragraph(level));
     }
+    if role == BrigadeRole::Director && !text.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(director_planner_paragraph(brigade.planner));
+    }
     match agent {
         AgentKind::Codex => Some(with_codex_addendum(&text, role)),
         AgentKind::ClaudeCode => (!text.is_empty()).then_some(text),
     }
+}
+
+/// What banto adds to the Planner's system prompt after the operator's own role
+/// text (`[brigade] planner_prompt`), always, even when that text is empty: the
+/// facts the Planner cannot work without and the operator has no reason to know.
+/// `request_path` is the request file, written with forward slashes whatever the
+/// platform: the path travels through a model that reads a backslash as an escape.
+fn planner_paragraph(request_path: &str) -> String {
+    format!(
+        "banto runs this pane and adds the following to the text above.\n\n\
+         The operator's request is in the file {path}. Your banto tools are not connected \
+         during your first turn, so read that file with Read before anything else. From your \
+         second turn on, read_plan shows you the Plan as banto holds it, your own drafts \
+         included. If on a later turn banto's tools are still not visible to you, tell the \
+         operator so; do not write the Plan into your answer instead.\n\n\
+         Write the Plan with write_plan, once per version, in the operator's language: each \
+         call is a new version and nothing is in force until the operator approves one. They \
+         approve the version they are reading with the key A on banto's reading screen (F5); \
+         you are not told when, the Director is. Use release_plan only for a Plan the \
+         operator has already approved, and only to split or reorder what they approved. \
+         The scope and the completion conditions are theirs.\n\n\
+         send_to_peer reaches the Director, with `to` set to \"director\", and nobody else. \
+         Use it for what only the Director can answer or must know: a question about the \
+         brigade's work, or a Plan that cannot be made as asked. Do not use it to report \
+         progress to the operator: they are in this pane.",
+        path = request_path.replace('\\', "/")
+    )
+}
+
+/// The Planner's whole system prompt, which replaces Claude's own
+/// (`--system-prompt-file`): the operator's role text rendered, then banto's
+/// paragraph. A Planner is given no `--append-system-prompt` briefing, so
+/// [`compose`] is not used for it.
+pub(crate) fn planner_system_prompt(
+    brigade: &BrigadeConfig,
+    brigade_id: BrigadeId,
+    request_path: &str,
+) -> String {
+    let mut text = brigade
+        .prompt_for(BrigadeRole::Planner)
+        .map(|template| render(template, brigade_id, PLANNER_TOKEN, &[], None))
+        .unwrap_or_default();
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str(&planner_paragraph(request_path));
+    text
 }
 
 /// [`compose`] for a Claude member, as a pattern to compare a recorded briefing
@@ -478,19 +559,22 @@ mod tests {
         );
     }
 
-    const MEMBER_TOOLS: [&str; 3] = [
+    const MEMBER_TOOLS: [&str; 4] = [
         "mcp__banto__check_messages",
         "mcp__banto__send_to_peer",
         "mcp__banto__brigade_status",
+        "mcp__banto__read_plan",
     ];
 
-    const DIRECTOR_TOOLS: [&str; 6] = [
+    const DIRECTOR_TOOLS: [&str; 8] = [
         "mcp__banto__request_decision",
         "mcp__banto__name_member",
         "mcp__banto__consult_goinkyo",
         "mcp__banto__dismiss_goinkyo",
         "mcp__banto__interrupt_worker",
         "mcp__banto__update_progress",
+        "mcp__banto__open_planner",
+        "mcp__banto__close_planner",
     ];
 
     #[test]
@@ -727,8 +811,9 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "You lead 7: worker-1.\n\n{}",
-                consult_paragraph(GoinkyoConsult::Design)
+                "You lead 7: worker-1.\n\n{}\n\n{}",
+                consult_paragraph(GoinkyoConsult::Design),
+                director_planner_paragraph(PlannerSetting::Auto)
             )
         );
     }
@@ -894,7 +979,8 @@ mod tests {
     fn the_shipped_director_briefing_recorded_for_another_roster_is_not_a_difference() {
         let dir = tempfile::tempdir().unwrap();
         let (pattern, recorded) = shipped_director_pattern_and_briefing("");
-        assert!(recorded.ends_with(consult_paragraph(GoinkyoConsult::Design)));
+        assert!(recorded.contains(consult_paragraph(GoinkyoConsult::Design)));
+        assert!(recorded.ends_with(director_planner_paragraph(PlannerSetting::Auto)));
         let path = transcript_with_snapshot(dir.path(), &recorded);
         assert_eq!(
             banto_io::claude_briefing::decide(Some(&path), &pattern),
@@ -984,7 +1070,8 @@ mod tests {
     fn the_shipped_director_prompt_is_followed_by_the_level_paragraph_too() {
         let config = BrigadeConfig::default();
         let out = compose_director(&config, AgentKind::ClaudeCode).unwrap();
-        assert!(out.ends_with(consult_paragraph(GoinkyoConsult::Design)));
+        assert!(out.contains(consult_paragraph(GoinkyoConsult::Design)));
+        assert!(out.ends_with(director_planner_paragraph(PlannerSetting::Auto)));
         assert!(out.starts_with("You are the Director of banto brigade 7."));
     }
 
@@ -1004,13 +1091,125 @@ mod tests {
         let empty = config_with("You lead.", "");
         assert_eq!(
             compose_director(&empty, AgentKind::ClaudeCode).as_deref(),
-            Some("You lead.")
+            Some(
+                format!(
+                    "You lead.\n\n{}",
+                    director_planner_paragraph(PlannerSetting::Auto)
+                )
+                .as_str()
+            )
         );
         let invalid = config_with("You lead.", "sometimes");
         assert_eq!(
             compose_director(&invalid, AgentKind::ClaudeCode).unwrap(),
-            format!("You lead.\n\n{}", consult_paragraph(GoinkyoConsult::Design))
+            format!(
+                "You lead.\n\n{}\n\n{}",
+                consult_paragraph(GoinkyoConsult::Design),
+                director_planner_paragraph(PlannerSetting::Auto)
+            )
         );
+    }
+
+    // ---- the Planner paragraph ----
+
+    #[test]
+    fn the_planner_setting_changes_only_the_planner_paragraph() {
+        let auto = config_with("You lead.", "design");
+        let off = BrigadeConfig {
+            planner: PlannerSetting::Off,
+            ..auto.clone()
+        };
+        let auto_out = compose_director(&auto, AgentKind::ClaudeCode).unwrap();
+        let off_out = compose_director(&off, AgentKind::ClaudeCode).unwrap();
+        assert_ne!(auto_out, off_out);
+        let (auto_head, auto_tail) = auto_out.rsplit_once("\n\n").unwrap();
+        let (off_head, off_tail) = off_out.rsplit_once("\n\n").unwrap();
+        assert_eq!(
+            auto_head, off_head,
+            "everything before the paragraph is the same"
+        );
+        assert_eq!(auto_tail, director_planner_paragraph(PlannerSetting::Auto));
+        assert_eq!(off_tail, director_planner_paragraph(PlannerSetting::Off));
+        assert!(auto_tail.starts_with("Planner (auto)"));
+        assert!(off_tail.starts_with("Planner (off)"));
+    }
+
+    #[test]
+    fn the_planner_paragraph_follows_the_consultation_paragraph_and_both_follow_the_template() {
+        let config = config_with("You lead.", "disputes");
+        let out = compose_director(&config, AgentKind::ClaudeCode).unwrap();
+        let consult = out
+            .find(consult_paragraph(GoinkyoConsult::Disputes))
+            .unwrap();
+        let planner = out
+            .find(director_planner_paragraph(PlannerSetting::Auto))
+            .unwrap();
+        assert!(out.starts_with("You lead.\n\n"));
+        assert!(consult < planner);
+        // With no consultation level the paragraph still follows the template.
+        let none = config_with("You lead.", "");
+        assert_eq!(
+            compose_director(&none, AgentKind::ClaudeCode).unwrap(),
+            format!(
+                "You lead.\n\n{}",
+                director_planner_paragraph(PlannerSetting::Auto)
+            )
+        );
+    }
+
+    #[test]
+    fn each_planner_paragraph_is_one_run_of_single_spaced_text_that_names_the_tool() {
+        for setting in [PlannerSetting::Auto, PlannerSetting::Off] {
+            let text = director_planner_paragraph(setting);
+            assert!(!text.contains('\n') && !text.contains("  "), "{text}");
+            assert!(!text.ends_with(' '), "{text}");
+            assert!(text.contains("open_planner"), "{text}");
+        }
+    }
+
+    #[test]
+    fn auto_opens_a_planner_only_when_both_conditions_hold_and_names_its_exceptions() {
+        let text = director_planner_paragraph(PlannerSetting::Auto);
+        // Both conditions, joined by `and`, never `or`.
+        assert!(
+            text.contains("spans several errands or commits and what to build"),
+            "{text}"
+        );
+        assert!(!text.contains(" or leaves"), "{text}");
+        for exclusion in [
+            "one more of a kind",
+            "a repair",
+            "a mechanical edit",
+            "an investigation",
+            "one errand",
+        ] {
+            assert!(text.contains(exclusion), "{exclusion}: {text}");
+        }
+        assert!(text.contains("Their word overrides"), "{text}");
+        assert!(text.contains("say why in a line"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_director_prompt_gets_no_planner_paragraph_and_neither_do_workers_or_the_goinkyo() {
+        let empty = config_with("", "design");
+        assert_eq!(compose_director(&empty, AgentKind::ClaudeCode), None);
+        let config = BrigadeConfig::default();
+        for role in [BrigadeRole::Worker, BrigadeRole::Goinkyo] {
+            for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+                let out = compose(&config, agent, role, 7, "x", &[], Some("/tmp/r.txt")).unwrap();
+                assert!(!out.contains("open_planner"), "{role:?} {agent:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_approved_plan_is_the_one_shape_the_design_level_still_lets_the_director_review() {
+        let text = consult_paragraph(GoinkyoConsult::Design);
+        assert!(text.contains("A shape the operator has approved is settled at this level"));
+        assert!(text.contains("A Plan is the exception"));
+        // The decisions level already consults a shape the operator approved with
+        // none behind it, so it needs no exception.
+        assert!(!consult_paragraph(GoinkyoConsult::Decisions).contains("A Plan is the exception"));
     }
 
     #[test]
@@ -1104,6 +1303,45 @@ mod tests {
         assert_eq!(
             BRIEFING_LAST_SENTENCE,
             "If this conversation holds more than one banto briefing, the most recent one is current and replaces the earlier ones."
+        );
+    }
+
+    #[test]
+    fn the_planners_prompt_is_the_operators_text_then_banto_paragraph() {
+        let brigade = BrigadeConfig {
+            planner_prompt: "You plan work for brigade {brigade}.".to_string(),
+            ..Default::default()
+        };
+        let text = planner_system_prompt(&brigade, 7, r"C:\data\planner\7-request.md");
+        let (role, banto) = text.split_once("\n\n").expect("two parts");
+        assert_eq!(role, "You plan work for brigade 7.");
+        // Forward slashes whatever the platform: a backslash is an escape to the
+        // model that reads the path.
+        assert!(banto.contains("C:/data/planner/7-request.md"), "{banto}");
+        assert!(!banto.contains('\\'), "{banto}");
+        for tool in ["read_plan", "write_plan", "release_plan", "send_to_peer"] {
+            assert!(banto.contains(tool), "{tool} missing from {banto}");
+        }
+    }
+
+    #[test]
+    fn an_empty_planner_prompt_still_gets_banto_paragraph() {
+        let brigade = BrigadeConfig {
+            planner_prompt: String::new(),
+            ..Default::default()
+        };
+        let text = planner_system_prompt(&brigade, 1, "/data/planner/1-request.md");
+        assert!(text.starts_with("banto runs this pane"), "{text}");
+        assert!(text.contains("/data/planner/1-request.md"));
+    }
+
+    #[test]
+    fn the_planner_is_told_its_banto_tools_are_absent_on_the_first_turn() {
+        let text = planner_paragraph("/r.md");
+        assert!(
+            text.contains("not connected during your first turn")
+                && text.contains("read that file with Read"),
+            "{text}"
         );
     }
 }

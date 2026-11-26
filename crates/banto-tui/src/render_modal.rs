@@ -208,6 +208,9 @@ pub fn render_modal(
         Modal::ConfirmCloseBrigade { name, .. } => {
             render_confirm_close_brigade_modal(frame, name, close, area)
         }
+        Modal::ConfirmClosePlanner { name, .. } => {
+            render_confirm_close_planner_modal(frame, name, area)
+        }
         Modal::ConfirmKill {
             title, dismisses, ..
         } => render_confirm_kill_modal(frame, title, dismisses.as_deref(), area),
@@ -252,6 +255,11 @@ fn render_reading_modal(frame: &mut Frame, state: &ReadingState, full_area: Rect
     let mut hint = String::from(" \u{2191}\u{2193} scroll ");
     if state.decision_open() {
         hint.push_str(" Enter go to the Director ");
+    }
+    // The key is named only while it would do something: a hint for a key that
+    // answers "nothing to approve" teaches the operator to press it for nothing.
+    if state.approvable().is_some() {
+        hint.push_str(" A approve the draft ");
     }
     hint.push_str(" Esc close ");
     let mut block = Block::default()
@@ -534,6 +542,33 @@ fn render_confirm_close_brigade_modal(
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
+/// Render the close-the-Plan dialog. It names what leaves and what is kept, as the
+/// dismissal dialog does for a Worker, because the Planner's own tile is the one
+/// place the operator can end a Plan from.
+fn render_confirm_close_planner_modal(frame: &mut Frame, name: &str, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Close the Plan \u{2014} confirm ")
+        .title_bottom(" Enter close  Esc cancel ");
+    let inner = pad_horizontal(block.inner(area));
+    frame.render_widget(block, area);
+
+    let prompt = truncate_to_width(
+        &format!("Close the open Plan of the brigade \"{name}\"?"),
+        inner.width,
+    );
+    let lines = vec![
+        Line::from(prompt),
+        Line::from(Span::styled(
+            "The Planner ends with it and its session is archived. The Plan is written out \
+             to a file and the Director is told. Nothing can be written to it afterwards.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
 /// Render the emporium's Codex-hook-trust confirm dialog — shown instead of
 /// forming a brigade whose Director or resolved Worker product is Codex, when banto's
 /// `SessionStart` hook doesn't look trusted yet. Static text throughout: the
@@ -776,6 +811,7 @@ mod tests {
 
     use banto_core::app::App;
     use banto_core::model::AgentKind;
+    use banto_core::reading::ReadingTrigger;
 
     use super::*;
 
@@ -943,9 +979,10 @@ mod tests {
         use banto_core::progress::{
             BrigadeReading, DecisionReading, Progress, ProgressReading, ProgressTask, TaskState,
         };
-        let mut state = ReadingState::new(1, "\"Alpha\"".to_string(), (None, None));
+        let mut state = ReadingState::new(1, "\"Alpha\"".to_string(), ReadingTrigger::default());
         state.set_loaded(
             BrigadeReading {
+                plan: None,
                 decision: Some(DecisionReading {
                     seq: 1,
                     question: question.map(str::to_string),
@@ -992,6 +1029,7 @@ mod tests {
         let mut idle = open_reading(None, 1, t);
         idle.set_loaded(
             banto_core::progress::BrigadeReading {
+                plan: None,
                 decision: None,
                 progress: None,
             },
@@ -1000,6 +1038,52 @@ mod tests {
         let (text, _) = reading_text(&idle, 100, 30, t);
         assert!(!text.contains("Enter go to"), "{text}");
         assert!(text.contains("Esc close"), "{text}");
+    }
+
+    #[test]
+    fn the_approval_key_is_named_only_while_there_is_a_draft_to_approve() {
+        use banto_core::plan::{Plan, PlanReading, PlanState, PlanVersion, PlanView, VersionKind};
+        let t = now();
+        let plan_with = |pending: bool| PlanReading {
+            view: PlanView {
+                plan: Plan {
+                    number: 1,
+                    title: "A plan".to_string(),
+                    request: "r".to_string(),
+                    state: PlanState::Drafting,
+                    result: None,
+                    closed_by: None,
+                    opened_at_ms: 0,
+                    closed_at_ms: None,
+                },
+                in_force: None,
+                pending: pending.then(|| PlanVersion {
+                    version: 1,
+                    body: "the draft body".to_string(),
+                    summary: "s".to_string(),
+                    kind: VersionKind::Draft,
+                    created_at_ms: 0,
+                    approved_at_ms: None,
+                }),
+            },
+            read_at_ms: 0,
+        };
+        for (pending, hinted) in [(true, true), (false, false)] {
+            let mut state = open_reading(None, 1, t);
+            state.set_loaded(
+                banto_core::progress::BrigadeReading {
+                    decision: None,
+                    progress: None,
+                    plan: Some(Box::new(plan_with(pending))),
+                },
+                t,
+            );
+            let (text, _) = reading_text(&state, 100, 30, t);
+            assert_eq!(text.contains("A approve the draft"), hinted, "{text}");
+            assert!(text.contains("Esc close"), "{text}");
+        }
+        let (text, _) = reading_text(&open_reading(None, 1, t), 100, 30, t);
+        assert!(!text.contains("A approve"), "{text}");
     }
 
     #[test]

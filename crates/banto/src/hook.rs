@@ -543,7 +543,15 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(claude, format!("I lead {brigade_id}\n\n{paragraph}"));
+        assert_eq!(
+            claude,
+            format!(
+                "I lead {brigade_id}\n\n{paragraph}\n\n{}",
+                crate::briefing::director_planner_paragraph(
+                    banto_core::config::PlannerSetting::Auto
+                )
+            )
+        );
 
         // A Worker in the same cell is never given it.
         let worker = HookIdentity {

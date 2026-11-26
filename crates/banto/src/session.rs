@@ -274,10 +274,11 @@ fn activity_from_observations(
     }
 }
 
-/// Names the sessions of ended consultations: each one the store holds a title
-/// for is listed as "Goinkyo: <title>" ([`consultation::list_title`]) instead of
-/// whatever the provider derived — banto's own first prompt, or Claude's
-/// generated title, which read alike for every consultation.
+/// Names the sessions of ended consultations and Plans: each one the store holds
+/// a title for is listed as "Goinkyo: <title>" ([`consultation::list_title`]) or
+/// "Planner: <title>" ([`consultation::planner_list_title`]) instead of whatever
+/// the provider derived: banto's own first prompt, or Claude's generated title,
+/// which read alike for every consultation.
 ///
 /// Precedence is the operator's `/rename` first
 /// (`SessionMeta::title_is_custom`, left alone), then banto's title, then what
@@ -290,18 +291,19 @@ fn activity_from_observations(
 /// restored session keeps its name. A store read failure is tolerated, like
 /// [`mark_archived`]'s: the sessions keep the titles the provider gave them.
 pub(crate) fn apply_consultation_titles(metas: &mut [SessionMeta], store: &Store) {
-    let titles: HashMap<String, String> = store
-        .consultation_titles()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(id, title)| (id.0, title))
-        .collect();
+    let mut titles: HashMap<String, String> = HashMap::new();
+    for (id, title) in store.consultation_titles().unwrap_or_default() {
+        titles.insert(id.0, consultation::list_title(&title));
+    }
+    for (id, title) in store.planner_titles().unwrap_or_default() {
+        titles.insert(id.0, consultation::planner_list_title(&title));
+    }
     if titles.is_empty() {
         return;
     }
     for meta in metas.iter_mut().filter(|meta| !meta.title_is_custom) {
         if let Some(title) = titles.get(&meta.id.0) {
-            meta.title = Some(consultation::list_title(title));
+            meta.title = Some(title.clone());
         }
     }
 }

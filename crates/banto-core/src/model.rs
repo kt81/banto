@@ -448,6 +448,19 @@ pub const DIRECTOR_TOKEN: &str = "director";
 /// is left as its own literal rather than reusing this constant.
 pub const GOINKYO_TOKEN: &str = "goinkyo";
 
+/// The Planner's own [`MemberToken`]: fixed, like the Goinkyo's, because a
+/// brigade has at most one Planner at a time and it lives exactly as long as
+/// the Plan it opened with. As with the Goinkyo's, it coincides with the role's
+/// own [`BrigadeRole::as_token`] form by choice and nothing enforces it.
+pub const PLANNER_TOKEN: &str = "planner";
+
+/// The sender word of a message banto itself wrote, such as "the operator
+/// approved Plan 1 version 2". It sits in the `from_session` column where a
+/// member's token would, which is why no member may be named it
+/// ([`crate::member_name::looks_like_token`]) and why no reader may look it up
+/// among the roster: nothing that carries it came from an agent.
+pub const BANTO_SENDER: &str = "banto";
+
 /// A member's role within a brigade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BrigadeRole {
@@ -462,6 +475,11 @@ pub enum BrigadeRole {
     /// never opened by the operator directly), addressable only by name,
     /// never a broadcast recipient.
     Goinkyo,
+    /// Works a Plan out with the operator, who talks to it directly. Opened by
+    /// the Director's `open_planner` (Claude only), addressable only by name and
+    /// only by the Director, never a broadcast recipient. Its member row
+    /// disappears only in the transaction that closes its Plan.
+    Planner,
 }
 
 impl BrigadeRole {
@@ -471,11 +489,12 @@ impl BrigadeRole {
             BrigadeRole::Director => "director",
             BrigadeRole::Worker => "worker",
             BrigadeRole::Goinkyo => "goinkyo",
+            BrigadeRole::Planner => "planner",
         }
     }
 
     /// Parse a persisted `role` token. `None` for anything other than
-    /// `"director"`/`"worker"`/`"goinkyo"` — every writer of this column
+    /// `"director"`/`"worker"`/`"goinkyo"`/`"planner"` — every writer of this column
     /// goes through [`Self::as_token`], which can only ever produce one of
     /// those, so an unrecognized value means the row did not come from
     /// banto's own write path.
@@ -484,6 +503,7 @@ impl BrigadeRole {
             "director" => Some(BrigadeRole::Director),
             "worker" => Some(BrigadeRole::Worker),
             "goinkyo" => Some(BrigadeRole::Goinkyo),
+            "planner" => Some(BrigadeRole::Planner),
             _ => None,
         }
     }
@@ -504,9 +524,14 @@ impl BrigadeRole {
     /// role existed to disagree about.
     pub fn addressability(self) -> &'static [(BrigadeRole, bool)] {
         match self {
-            BrigadeRole::Director => &[(BrigadeRole::Worker, true), (BrigadeRole::Goinkyo, false)],
+            BrigadeRole::Director => &[
+                (BrigadeRole::Worker, true),
+                (BrigadeRole::Goinkyo, false),
+                (BrigadeRole::Planner, false),
+            ],
             BrigadeRole::Worker => &[(BrigadeRole::Director, true)],
             BrigadeRole::Goinkyo => &[(BrigadeRole::Director, true)],
+            BrigadeRole::Planner => &[(BrigadeRole::Director, true)],
         }
     }
 

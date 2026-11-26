@@ -409,6 +409,47 @@ pub(super) const MIGRATIONS: &[&str] = &[
         seq INTEGER NOT NULL,
         updated_at_ms INTEGER NOT NULL
     );",
+    // v25: Plans, the Planner's output. `plans` holds one row per Plan a brigade
+    // ever opened, closed ones included, because a Plan's number is its position in
+    // the brigade's history and the export's file name. `plans_one_open` is the rule
+    // that a brigade has at most one open Plan, kept by the database so that two
+    // writers (the emporium and a Director's `_mcp`) cannot both open one; a row
+    // whose `state` is any word but `closed` counts as open, so a hand edit cannot
+    // hide a Plan from the rule. `plan_versions` holds every text written for a Plan:
+    // the operator approves exactly one of them, and the others stay as the record
+    // of what the Planner proposed. Neither table has a foreign key, like the rest
+    // of this schema; `Store::delete_brigade` and `Store::delete_empty_brigades`
+    // delete the rows beside the brigade's others.
+    //
+    // `consultations.role` says whose session ended: `Store::consultation_titles`
+    // lists the Goinkyo's only, and `Store::planner_titles` the Planner's, because
+    // the list labels the two differently. Every row from before this version is a
+    // Goinkyo's, which is the column's default.
+    "ALTER TABLE consultations ADD COLUMN role TEXT NOT NULL DEFAULT 'goinkyo';
+    CREATE TABLE plans (
+        brigade_id INTEGER NOT NULL,
+        number INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        request TEXT NOT NULL,
+        state TEXT NOT NULL,
+        result TEXT,
+        closed_by TEXT,
+        opened_at_ms INTEGER NOT NULL,
+        closed_at_ms INTEGER,
+        PRIMARY KEY (brigade_id, number)
+    );
+    CREATE UNIQUE INDEX plans_one_open ON plans (brigade_id) WHERE state <> 'closed';
+    CREATE TABLE plan_versions (
+        brigade_id INTEGER NOT NULL,
+        plan_number INTEGER NOT NULL,
+        version INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        approved_at_ms INTEGER,
+        PRIMARY KEY (brigade_id, plan_number, version)
+    );",
 ];
 
 /// The schema version this build migrates to and knows how to read.
@@ -594,6 +635,79 @@ mod tests {
                 .is_err(),
             "the copy is from before the table existed"
         );
+    }
+
+    #[test]
+    fn v24_to_v25_upgrade_adds_plans_and_labels_old_consultations_as_the_goinkyos() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // A database as v24 code left it: a brigade with a Director and one
+        // consultation already filed, made before a consultation had a role.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[..24] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 3000);
+                 INSERT INTO brigade_members (brigade_id, member_token, role, session_id)
+                 VALUES (1, 'director', 'director', 'dir-1');
+                 INSERT INTO consultations (session_id, title, ended_at_ms)
+                 VALUES ('old-consult', 'Old question', 4000);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 24).unwrap();
+        }
+
+        let mut store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+
+        assert_eq!(
+            store.consultation_titles().unwrap(),
+            [(
+                SessionId("old-consult".to_string()),
+                "Old question".to_string()
+            )],
+            "an old consultation is still the Goinkyo's"
+        );
+        assert!(store.planner_titles().unwrap().is_empty());
+        assert_eq!(store.open_plan_view(1).unwrap(), None);
+        assert_eq!(store.brigade_members(1).unwrap().len(), 1);
+
+        // The new surface works on the upgraded file, and the one-open-Plan rule
+        // is the database's own: a second open row is refused by the index.
+        assert_eq!(
+            store
+                .open_planner(
+                    1,
+                    "director",
+                    "Layout",
+                    "request",
+                    banto_core::model::AgentKind::ClaudeCode
+                )
+                .unwrap(),
+            crate::store::OpenedPlanner::Opened { number: 1 }
+        );
+        let second = store.conn.execute(
+            "INSERT INTO plans (brigade_id, number, title, request, state, opened_at_ms)
+             VALUES (1, 2, 't', 'r', 'weird-state', 1)",
+            [],
+        );
+        assert!(second.is_err(), "any state but closed counts as open");
+
+        // The copy kept before the upgrade is a v24 database without either.
+        let before = rusqlite::Connection::open(dir.path().join("banto.db.before-v25")).unwrap();
+        let version: i64 = before
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 24);
+        assert!(before.prepare("SELECT role FROM consultations").is_err());
+        assert!(before.prepare("SELECT number FROM plans").is_err());
     }
 
     /// Proves the bundled rusqlite build ships the FTS5 module.

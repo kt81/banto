@@ -37,12 +37,15 @@ tmux はターミナルのウィンドウマネージャです。banto は Claud
 banto は MCP 上でメンバー間のメッセージを中継します。各メンバーの起動時に `banto _mcp` へつなぎ、Claude Code には `--mcp-config`、Codex には `-c mcp_servers.banto.*` の上書きで渡します。メンバーは `send_to_peer`、`check_messages`、`brigade_status` を使えます。Director にはさらに次のツールがあります。
 
 - `consult_goinkyo` / `dismiss_goinkyo`
+- `open_planner` / `close_planner`: 作業が複数の用事にまたがり、まだ固まっていないとき、Director があなたを Planner に引き合わせます（下記）
 - `request_decision`: あなたにしか下せない判断を Director が待つときのものです。banto はその Director に `▸ decision` タグを付け、そのペインで Enter を押すまで残します。Director は止めません。Director が添えた質問は、一覧ではなく読み取り画面（`F5`）で読めます
-- `update_progress`: Director が作業の状態（ステージの 1 行、状態付きのタスク、計画外の作業）を記録します。前のものは置き換わります。読み取り画面（`F5`）で読めるので、Director のペインは回答と判断のために空けておけます
+- `update_progress`: Director が作業の状態（ステージの 1 行、状態付きのタスク、計画外の作業）を記録します。前のものは置き換わります。ステージはフェーズを表す数語（80 文字まで）で、経過時間とともに Director のタイルの下辺に出ます（`▸ 5m reviewing the plan`）。残りは読み取り画面（`F5`）で読めるので、Director のペインは回答と判断のために空けておけます
 - `interrupt_worker`: Director が書いた理由をメッセージとして Worker に渡し、Claude の Worker には、リレーが `auto` のときだけ、それを読むまで次のツール呼び出しを banto が断ります（最大 3 回）。ターンを止めることも、実行中の呼び出しを切ることもできません。リレーが `manual` の場合と Codex の Worker には、通常のメッセージとして届くだけで、何も断られません
 - `name_member`: Worker の常設の役割に表示名を付けます（宛先は引き続きトークンです）
 
 Goinkyo は、Director が `consult_goinkyo` で相談する助言役のセッションです。既定では Director と同じプロダクトで動くため、Codex の Director の Goinkyo は Codex になります（`goinkyo_agent`）。`goinkyo_agent = "claude"` にすると Claude のままです。Codex の Goinkyo は読み取り専用で、承認の確認なしに動くので、ビルドもテストもできません。Codex がまだ信頼していないディレクトリでの最初の相談は、Codex 自身の信頼の質問で止まり、Goinkyo のペインで答えるまで待ちます。Goinkyo のプロダクトが動かせないとき（`agents` で有効になっていない、ホームが見つからない、banto のフックが未信頼または起動できない）、`consult_goinkyo` は最初に拒否します。
+
+Planner は、複数の用事にまたがり、かつ範囲や完了条件があなたの言葉で決まっていない作業を頼まれたときに、Director が `open_planner` で開く Claude のセッションです。Planner は専用のペインであなたと Plan を詰め、コードは `Read`、`Grep`、`Glob` だけで読み、下書きを `write_plan` で書きます。読み取り画面（`F5`。Progress の後に Plan が出ます）で下書きを読み、`A`（Shift）を押して画面に出ている版を承認するまで、何も確定しません。画面を開いた後に Planner がもっと新しい版を書いていたときは、banto は承認を断り、先にその版を読むよう伝えます。承認すると banto から Director にメッセージが届きます。メッセージには、`goinkyo_consult` に従って Plan を Goinkyo のレビューに回すかどうかも書かれています。Director は承認された Plan を用事に分けます。下書きの段階で Worker を始めないのは、`read_plan` ツールの説明にある指示で、banto が確かめるわけではありません。Director は `close_planner` で Plan を終えます。`completed` は、あなたが承認した版があり、Progress のタスクがすべて終わっているときだけ受け付けます。終えると banto は Planner のセッションをアーカイブし、Markdown の書き出しを `<data dir>/plans/<brigade>-<number>.md` に残します。1 つの Brigade が持てる Plan は同時に 1 つです。`planner = "off"` にすると、Director はあなたが頼んだときだけ Planner を開きます。Planner は Director のプロダクトに関係なく、常に Claude で動きます。
 
 各メンバーには、所属する Brigade、トークン、同僚を示す役割ブリーフィングも渡します。Claude Code ではシステムプロンプトへ追記し、Codex では banto 自身の `SessionStart` フックで届けます。中継されたメッセージには、別の AI から来たものだと明示する枠を付けるので、操作者の入力と取り違えられることはありません。banto の**自動リレー**は、未読メッセージがあるアイドルのメンバーを起こします。Claude Code では起動用フックを使い、Codex では短い定型の Nudge（催促）を `codex queue` で積みます。そのため Director→Worker→Director の往復に人手の橋渡しは要りません。`relay = "auto"` のとき、この起こし方はメンバーの文脈全体に対するターンを始めるので、メッセージに依頼の中身がなくても、アイドルのメンバーは 1 ターン分の費用を使うことがあります。このリポジトリの大部分は、このループで作られました。
 
@@ -172,7 +175,7 @@ banto を終了し、同じインストール行を実行して、banto をま�
 | `B` / `b` | Director を任命し、Worker を自動起動する（Director の上では: 解散（disband））/ stage 済みの Brigade に Worker をもうひとつ起こす |
 | `x` | 選択した行が動かしているものを終了する（確認あり）。Director では**その Brigade を畳む**（Close Brigade）。Brigade のすべてのプロセスが終わり、何も削除されないので、Director の行で Enter を押せばすべてが戻る。ペインが開いている単独のセッションでは、そのプロセスを終了する。Worker を Brigade から外すことは決してない。それには、その Worker のタイルで `Ctrl+B x` を使う |
 | `F2` / `F3` / `F4` | フォーカスを一覧とペインの間で移動する / stage 済みの Brigade の次のペインを現在のペインにする / Director のペインにフォーカスがあってもベルを鳴らす（切り替え） |
-| `F5` | Brigade の未回答の判断と Progress を、読み取り専用の画面で読む。一覧からは選択行の Brigade（なければ stage 済みのもの）、ペインからは stage 済みのものを読む。矢印、`j`/`k`、`PgUp`/`PgDn`、`Home`/`End` でスクロールし、`Esc` で閉じる。判断が開いているときは `Enter` で閉じて Director のペインへ移る。画面を開くだけでは何も起動も再開もしない |
+| `F5` | Brigade の未回答の判断、Progress、Plan を、読み取り専用の画面で読む（`A` で画面に出ている Plan の下書きを承認する）。一覧からは選択行の Brigade（なければ stage 済みのもの）、ペインからは stage 済みのものを読む。矢印、`j`/`k`、`PgUp`/`PgDn`、`Home`/`End` でスクロールし、`Esc` で閉じる。判断が開いているときは `Enter` で閉じて Director のペインへ移る。画面を開くだけでは何も起動も再開もしない |
 | `Ctrl+B` … | tmux 風のプレフィックス（設定可能）。一覧からでもペインからでも使える: |
 | … `o`/`Tab`、矢印 | サイドバーとペインの間でフォーカスを順に移す / 方向を指定してペインを移動する |
 | … `Shift`+`Up`/`Down` | フォーカス中のスタックのタイルを 1 つ上/下へ動かす |
@@ -229,6 +232,14 @@ goinkyo_consult = "design"
 # Codex の Goinkyo は読み取り専用（-s read-only -a never）で動くため、ビルドもテストもできません。
 # モデルと effort は [brigade.codex] の goinkyo_model と goinkyo_effort です。
 goinkyo_agent = "inherit"
+# Director が Planner を開くとき: "auto"（作業が複数の用事にまたがり、かつ範囲や
+# 完了条件があなたの言葉で決まっていないとき）| "off"（頼まれたときだけ）。goinkyo_consult と同じく Director の
+# ブリーフィングの 1 段落で、director_prompt が空なら何も起きません。
+planner = "auto"
+# Planner の役割の文面。banto が必ず足す段落と共に Claude 自身のシステムプロンプトに
+# 取って代わります。{brigade} は置き換えられ、"" ならその段落だけが残ります。
+# 既定は英語で、あなたの言語で答えるよう Planner に伝えます。
+planner_prompt = "..."
 # Director の request_decision は、行に印を付けてベルも鳴らします。false なら印だけです。
 request_attention = true
 
@@ -249,6 +260,10 @@ worker_permission_mode = "auto"  # --permission-mode
 goinkyo_model = "opus"
 goinkyo_effort = "xhigh"
 goinkyo_permission_mode = "auto"
+planner_model = "opus"
+planner_effort = "xhigh"
+planner_permission_mode = "auto"
+planner_tools = "Read,Grep,Glob"   # --tools: banto 自身のツールのほかに渡す組み込みツール
 
 [brigade.codex]
 worker_model = "terra"           # slug、または最新の slug に解決されるファミリー名

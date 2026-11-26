@@ -40,6 +40,7 @@ pub mod layout;
 pub mod member_name;
 pub mod model;
 pub mod pane_log;
+pub mod plan;
 pub mod program_state;
 pub mod progress;
 pub mod reading;

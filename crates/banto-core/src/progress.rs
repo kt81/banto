@@ -23,8 +23,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::display_text::{display_lines, display_name};
 
-/// The longest `stage`, in characters.
-pub const STAGE_MAX_CHARS: usize = 200;
+/// The longest `stage`, in characters, for a write. It is one line on the Director's
+/// tile, which is as wide as a terminal pane; a stored one over the limit (written
+/// under an older, longer limit) is still read and drawn, cut by width.
+pub const STAGE_MAX_CHARS: usize = 80;
 /// The longest task `id`, in characters. An id is a handle (`T1`), not a title.
 pub const TASK_ID_MAX_CHARS: usize = 16;
 /// The longest task `note`, in characters.
@@ -113,12 +115,18 @@ pub struct ProgressRecord {
 }
 
 /// The part of a stored Progress the tick reads for every brigade: the write
-/// count, which says whether the body changed, and the stage line, which can be
-/// shown without the body being read (nothing draws it yet).
+/// count, which says whether the body changed, and the stage line with its write
+/// time, which the Director's tile draws without the body being read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgressGlance {
     pub seq: i64,
     pub stage: String,
+    /// banto's clock at the write, in unix milliseconds: the age the tile shows is
+    /// worked out against the drawing frame's own "now", so the core reads no clock.
+    /// Zero in a stream recorded before it was carried, which reads as written long
+    /// ago.
+    #[serde(default)]
+    pub updated_at_ms: i64,
 }
 
 /// What the reading screen shows about a brigade, read from the store when the
@@ -131,6 +139,11 @@ pub struct BrigadeReading {
     pub decision: Option<DecisionReading>,
     /// The Director's Progress, if it has written one.
     pub progress: Option<ProgressReading>,
+    /// The brigade's open Plan, if it has one. Boxed because it carries two whole
+    /// versions, and this struct travels inside `Event` and `Modal`, whose other
+    /// variants are small.
+    #[serde(default)]
+    pub plan: Option<Box<crate::plan::PlanReading>>,
 }
 
 /// The open request as the store holds it.
@@ -420,6 +433,26 @@ mod tests {
             serde_json::from_str::<TaskState>("\"dropped\"").unwrap(),
             TaskState::Dropped
         );
+    }
+
+    #[test]
+    fn a_recorded_glance_without_the_write_time_still_parses() {
+        let old: ProgressGlance = serde_json::from_str(r#"{"seq":3,"stage":"s"}"#).unwrap();
+        assert_eq!(
+            old,
+            ProgressGlance {
+                seq: 3,
+                stage: "s".to_string(),
+                updated_at_ms: 0,
+            }
+        );
+        let new = ProgressGlance {
+            seq: 4,
+            stage: "実装".to_string(),
+            updated_at_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&new).unwrap();
+        assert_eq!(serde_json::from_str::<ProgressGlance>(&json).unwrap(), new);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! banto's own data directory and everything banto keeps in it: the database,
-//! the per-member MCP configs and the Goinkyo's consultation requests under
-//! `mcp/`, and under `logs/` the opt-in message logs and the pane lifecycle log
+//! the per-member MCP configs, the Goinkyo's consultation requests and the
+//! Planner's request and prompt files under `mcp/`, the exports of Plans under
+//! `plans/`, and under `logs/` the opt-in message logs and the pane lifecycle log
 //! `panes.log`. It is `<data_local>/banto`
 //! unless the operator named another (`--data-dir`, `BANTO_DATA_DIR`, `data_dir`
 //! in `config.toml`); `banto::startup` decides, and refuses one inside an agent's
@@ -19,8 +20,10 @@
 //!   deletion ([`is_garbage`] is the pure form of this pair).
 //!
 //! Only names banto writes are ever candidates (see [`parse_name`]), only in
-//! `mcp/` and `mcp/goinkyo/`, and only if those two are real directories. The
-//! logs, the database and anything else are never touched.
+//! `mcp/`, `mcp/goinkyo/` and `mcp/planner/`, and only if those are real
+//! directories. The logs, the database, the Plan exports and anything else are
+//! never touched: an export is the one record of a Plan that outlives its
+//! brigade.
 //!
 //! What this does **not** protect against, stated so nobody has to find it out:
 //!
@@ -40,7 +43,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use banto_core::model::{BrigadeId, DIRECTOR_TOKEN, GOINKYO_TOKEN};
+use banto_core::model::{BrigadeId, DIRECTOR_TOKEN, GOINKYO_TOKEN, PLANNER_TOKEN};
 
 use crate::store::MAX_WORKER_NUMBER;
 
@@ -114,6 +117,50 @@ impl DataDir {
         Self::request_path_in(&self.goinkyo_dir(), brigade)
     }
 
+    /// `<root>/mcp/planner`: the Planner's request files and its rendered system
+    /// prompts, one of each per brigade (a brigade has at most one Planner).
+    pub fn planner_dir(&self) -> PathBuf {
+        self.mcp_dir().join("planner")
+    }
+
+    /// `<root>/mcp/planner/<brigade>.txt`: what the operator asked for, in the
+    /// operator's words, which the Planner reads on its first turn.
+    pub fn planner_request_path(&self, brigade: BrigadeId) -> Option<PathBuf> {
+        Self::request_path_in(&self.planner_dir(), brigade)
+    }
+
+    /// `<root>/mcp/planner/<brigade>.prompt.md`: the Planner's system prompt as
+    /// last rendered, rewritten at every launch and handed to Claude as a file
+    /// (`--system-prompt-file`) rather than as an argument, which on Windows has a
+    /// length limit a role text can approach.
+    pub fn planner_prompt_path(&self, brigade: BrigadeId) -> Option<PathBuf> {
+        Self::prompt_path_in(&self.planner_dir(), brigade)
+    }
+
+    /// `<dir>/<brigade>.prompt.md` for a Planner directory `dir`: the one place
+    /// that name is written.
+    pub fn prompt_path_in(dir: &Path, brigade: BrigadeId) -> Option<PathBuf> {
+        Some(dir.join(prompt_name(brigade)?))
+    }
+
+    /// `<root>/plans`: one Markdown export per Plan, written when the operator
+    /// approves a version and again when the Plan closes. Never swept and never
+    /// deleted with a brigade.
+    pub fn plans_dir(&self) -> PathBuf {
+        self.0.join("plans")
+    }
+
+    /// `<root>/plans/<brigade>-<number>.md`.
+    pub fn plan_export_path(&self, brigade: BrigadeId, number: i64) -> Option<PathBuf> {
+        Self::plan_export_path_in(&self.plans_dir(), brigade, number)
+    }
+
+    /// The same for a caller that holds only the directory (the MCP server).
+    pub fn plan_export_path_in(dir: &Path, brigade: BrigadeId, number: i64) -> Option<PathBuf> {
+        (is_issued_brigade(brigade) && number >= 1)
+            .then(|| dir.join(format!("{brigade}-{number}.md")))
+    }
+
     /// `<dir>/<brigade>.txt` for a consultation-request directory `dir` — the one
     /// place that file name is written, for a caller that holds only the
     /// directory (the MCP server). `None` for a brigade id banto does not issue.
@@ -150,10 +197,35 @@ fn issued_worker_number(token: &str) -> Option<i64> {
     (number <= MAX_WORKER_NUMBER).then_some(number)
 }
 
-/// A member token banto issues: the Director's, the Goinkyo's, or a numbered
-/// Worker's. Any other token (a hand-edited store can hold anything) gets no file.
+/// Writes a Plan's export to `<dir>/<brigade>-<number>.md`, creating `dir`, and
+/// returns the path. Overwritten each time: the file is the latest state of the
+/// Plan, not a history. An error is the caller's to report and never to act on:
+/// the database is the source of truth.
+pub fn write_plan_export(
+    dir: &Path,
+    brigade: BrigadeId,
+    number: i64,
+    text: &str,
+) -> std::io::Result<PathBuf> {
+    let path = DataDir::plan_export_path_in(dir, brigade, number).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("brigade {brigade}, plan {number} is not a name banto issues"),
+        )
+    })?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+/// A member token banto issues: the Director's, the Goinkyo's, the Planner's, or a
+/// numbered Worker's. Any other token (a hand-edited store can hold anything) gets
+/// no file.
 fn is_issued_token(token: &str) -> bool {
-    token == DIRECTOR_TOKEN || token == GOINKYO_TOKEN || issued_worker_number(token).is_some()
+    token == DIRECTOR_TOKEN
+        || token == GOINKYO_TOKEN
+        || token == PLANNER_TOKEN
+        || issued_worker_number(token).is_some()
 }
 
 fn config_name(brigade: BrigadeId, token: &str) -> Option<String> {
@@ -172,6 +244,10 @@ fn request_name(brigade: BrigadeId) -> Option<String> {
     is_issued_brigade(brigade).then(|| format!("{brigade}.txt"))
 }
 
+fn prompt_name(brigade: BrigadeId) -> Option<String> {
+    is_issued_brigade(brigade).then(|| format!("{brigade}.prompt.md"))
+}
+
 /// A file banto writes under `mcp/`, as its name says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnedFile {
@@ -181,6 +257,10 @@ pub enum OwnedFile {
     MemberSettings { brigade: BrigadeId, token: String },
     /// `mcp/goinkyo/<brigade>.txt`.
     GoinkyoRequest { brigade: BrigadeId },
+    /// `mcp/planner/<brigade>.txt`.
+    PlannerRequest { brigade: BrigadeId },
+    /// `mcp/planner/<brigade>.prompt.md`.
+    PlannerPrompt { brigade: BrigadeId },
 }
 
 /// Which directory a name was found in.
@@ -188,6 +268,7 @@ pub enum OwnedFile {
 pub enum Where {
     Mcp,
     Goinkyo,
+    Planner,
 }
 
 /// Whether `name`, found in `place`, is exactly a name banto writes there. A name
@@ -214,12 +295,23 @@ pub fn parse_name(place: Where, name: &str) -> Option<OwnedFile> {
         Where::Goinkyo => OwnedFile::GoinkyoRequest {
             brigade: name.strip_suffix(".txt")?.parse().ok()?,
         },
+        Where::Planner => match name.strip_suffix(".prompt.md") {
+            Some(brigade) => OwnedFile::PlannerPrompt {
+                brigade: brigade.parse().ok()?,
+            },
+            None => OwnedFile::PlannerRequest {
+                brigade: name.strip_suffix(".txt")?.parse().ok()?,
+            },
+        },
     };
     // The writer decides: `+7`, `007` and `Worker-1` parse above and are refused here.
     let written = match &parsed {
         OwnedFile::MemberConfig { brigade, token } => config_name(*brigade, token)?,
         OwnedFile::MemberSettings { brigade, token } => settings_name(*brigade, token)?,
-        OwnedFile::GoinkyoRequest { brigade } => request_name(*brigade)?,
+        OwnedFile::GoinkyoRequest { brigade } | OwnedFile::PlannerRequest { brigade } => {
+            request_name(*brigade)?
+        }
+        OwnedFile::PlannerPrompt { brigade } => prompt_name(*brigade)?,
     };
     (written == name).then_some(parsed)
 }
@@ -243,12 +335,16 @@ impl Facts {
     }
 
     /// Whether the store has a member that needs `file`: the member itself for its
-    /// config or settings, the brigade's Goinkyo for a consultation request.
+    /// config or settings, the brigade's Goinkyo for a consultation request, the
+    /// brigade's Planner for its request and its prompt.
     fn owns(&self, file: &OwnedFile) -> bool {
         let (brigade, token) = match file {
             OwnedFile::MemberConfig { brigade, token }
             | OwnedFile::MemberSettings { brigade, token } => (*brigade, token.as_str()),
             OwnedFile::GoinkyoRequest { brigade } => (*brigade, GOINKYO_TOKEN),
+            OwnedFile::PlannerRequest { brigade } | OwnedFile::PlannerPrompt { brigade } => {
+                (*brigade, PLANNER_TOKEN)
+            }
         };
         self.members.contains(&(brigade, token.to_string()))
     }
@@ -332,8 +428,8 @@ fn age_of(path: &Path, now: SystemTime) -> Option<Duration> {
 ///
 /// The order is the protection:
 ///
-/// 1. list the names (and require `mcp/` and `mcp/goinkyo/` to be real
-///    directories);
+/// 1. list the names (and require `mcp/`, `mcp/goinkyo/` and `mcp/planner/` to be
+///    real directories);
 /// 2. only then ask the store (`read_facts`): banto records a member in the store
 ///    before it writes that member's config, so a config already in the listing
 ///    has its member visible to a read that comes after it;
@@ -351,6 +447,7 @@ pub fn sweep(
 ) -> SweepReport {
     let mut listed = list(&data_dir.mcp_dir(), Where::Mcp);
     listed.extend(list(&data_dir.goinkyo_dir(), Where::Goinkyo));
+    listed.extend(list(&data_dir.planner_dir(), Where::Planner));
     let mut report = SweepReport::default();
     if listed.is_empty() {
         return report;
@@ -937,6 +1034,113 @@ mod tests {
         assert_eq!(report, SweepReport::default());
         assert!(fs::symlink_metadata(&link).is_ok());
         assert!(precious.exists());
+    }
+
+    // --- the Planner's files ---------------------------------------------------
+
+    #[test]
+    fn the_planners_paths_hang_off_the_directory_and_exports_live_outside_the_swept_one() {
+        let dir = DataDir::new(PathBuf::from("/data/banto"));
+        assert_eq!(
+            dir.planner_request_path(7),
+            Some(PathBuf::from("/data/banto/mcp/planner/7.txt"))
+        );
+        assert_eq!(
+            dir.planner_prompt_path(7),
+            Some(PathBuf::from("/data/banto/mcp/planner/7.prompt.md"))
+        );
+        assert_eq!(
+            dir.plan_export_path(7, 2),
+            Some(PathBuf::from("/data/banto/plans/7-2.md"))
+        );
+        assert_eq!(dir.plan_export_path(0, 1), None);
+        assert_eq!(dir.plan_export_path(7, 0), None);
+        assert_eq!(dir.planner_request_path(-1), None);
+    }
+
+    #[test]
+    fn the_planners_two_files_round_trip_and_near_misses_are_not_banto_names() {
+        let dir = DataDir::new(PathBuf::from("/d"));
+        let request = dir.planner_request_path(12).unwrap();
+        assert_eq!(
+            parse_name(
+                Where::Planner,
+                request.file_name().unwrap().to_str().unwrap()
+            ),
+            Some(OwnedFile::PlannerRequest { brigade: 12 })
+        );
+        let prompt = dir.planner_prompt_path(12).unwrap();
+        assert_eq!(
+            parse_name(
+                Where::Planner,
+                prompt.file_name().unwrap().to_str().unwrap()
+            ),
+            Some(OwnedFile::PlannerPrompt { brigade: 12 })
+        );
+        for name in [
+            "07.txt",
+            "7.TXT",
+            "7.prompt.MD",
+            "7.prompt.md.old",
+            "07.prompt.md",
+            ".prompt.md",
+            "x.prompt.md",
+            "0.txt",
+        ] {
+            assert_eq!(parse_name(Where::Planner, name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_planners_files_are_owned_by_exactly_its_brigades_planner_row() {
+        for file in [
+            OwnedFile::PlannerRequest { brigade: 7 },
+            OwnedFile::PlannerPrompt { brigade: 7 },
+        ] {
+            assert!(!is_garbage(&file, OLD, &facts(&[(7, "planner")])));
+            assert!(is_garbage(&file, OLD, &facts(&[(7, "goinkyo")])));
+            assert!(is_garbage(&file, OLD, &facts(&[(8, "planner")])));
+            assert!(!is_garbage(&file, Some(Duration::ZERO), &facts(&[])));
+        }
+    }
+
+    #[test]
+    fn a_sweep_removes_a_gone_planners_files_and_never_touches_the_exports() {
+        let (_tmp, dir) = world();
+        touch(&dir.planner_request_path(7).unwrap(), A_DAY);
+        touch(&dir.planner_prompt_path(7).unwrap(), A_DAY);
+        touch(&dir.planner_request_path(3).unwrap(), A_DAY);
+        touch(&dir.planner_prompt_path(3).unwrap(), A_DAY);
+        touch(&dir.plan_export_path(3, 1).unwrap(), A_DAY);
+        touch(&dir.planner_dir().join("notes.md"), A_DAY);
+
+        let report = sweep(&dir, SystemTime::now(), || Some(facts(&[(7, "planner")])));
+
+        assert_eq!(report.deleted.len(), 2, "{report:?}");
+        assert_eq!(
+            names(&dir.planner_dir()),
+            ["7.prompt.md", "7.txt", "notes.md"]
+        );
+        assert_eq!(
+            names(&dir.plans_dir()),
+            ["3-1.md"],
+            "an export outlives its brigade by design"
+        );
+    }
+
+    #[test]
+    fn an_export_is_written_whole_and_overwritten_by_the_next() {
+        let (_tmp, dir) = world();
+        let first = write_plan_export(&dir.plans_dir(), 7, 1, "one\n").unwrap();
+        assert_eq!(first, dir.plan_export_path(7, 1).unwrap());
+        assert_eq!(fs::read_to_string(&first).unwrap(), "one\n");
+        write_plan_export(&dir.plans_dir(), 7, 1, "two\n").unwrap();
+        assert_eq!(fs::read_to_string(&first).unwrap(), "two\n");
+        assert_eq!(names(&dir.plans_dir()), ["7-1.md"]);
+        // A name banto does not issue is an error and writes nothing.
+        assert!(write_plan_export(&dir.plans_dir(), 0, 1, "x").is_err());
+        assert!(write_plan_export(&dir.plans_dir(), 7, 0, "x").is_err());
+        assert_eq!(names(&dir.plans_dir()), ["7-1.md"]);
     }
 
     /// A junction is not a symbolic link to Windows' API (it needs no privilege),

@@ -34,6 +34,7 @@ use banto_core::model::{
 
 use super::archive::archive_on;
 use super::consultations::record_on;
+use super::plans::{PlanClosed, PlanClosing, close_open_plan_on};
 use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
 
 /// What `brigades.request_text` holds while a Director's request is open. A
@@ -122,12 +123,13 @@ pub enum InterruptState {
     Decided(InterruptOutcome),
 }
 
-/// Archives the session of every Goinkyo row about to be deleted from
+/// Archives the session of every Goinkyo and Planner row about to be deleted from
 /// `brigade_id` — only the one named by `token` when given, every one when not —
 /// inside the transaction that deletes it. A dismissed consultation's session
 /// would otherwise return to the list as an ordinary row titled with banto's own
 /// first prompt, and the operator's standing instruction (2026-11-20) is that
-/// banto buries those itself; `D` restores any one of them.
+/// banto buries those itself; `D` restores any one of them. A Planner's session is
+/// the same kind of thing and is buried the same way.
 ///
 /// The role and the id are read from the row, here, in the transaction: the
 /// caller's `token` is not a reason to archive (a Worker's dismissal comes
@@ -146,30 +148,115 @@ pub enum InterruptState {
 /// before titles is archived and records nothing. The two writes are one
 /// transaction with the delete, so no reader sees a session archived and not yet
 /// titled, or the reverse.
-fn archive_goinkyo_sessions(
+pub(super) fn archive_ended_sessions(
     tx: &rusqlite::Transaction<'_>,
     brigade_id: BrigadeId,
     token: Option<&str>,
 ) -> Result<(), StoreError> {
     let mut stmt = tx.prepare(
-        "SELECT session_id, consult_title FROM brigade_members
-         WHERE brigade_id = ?1 AND role = ?2 AND session_id IS NOT NULL
-           AND (?3 IS NULL OR member_token = ?3)",
+        "SELECT session_id, consult_title, role FROM brigade_members
+         WHERE brigade_id = ?1 AND role IN (?2, ?3) AND session_id IS NOT NULL
+           AND (?4 IS NULL OR member_token = ?4)",
     )?;
     let rows = stmt
         .query_map(
-            params![brigade_id, BrigadeRole::Goinkyo.as_token(), token],
-            |row| Ok((SessionId(row.get(0)?), row.get::<_, Option<String>>(1)?)),
+            params![
+                brigade_id,
+                BrigadeRole::Goinkyo.as_token(),
+                BrigadeRole::Planner.as_token(),
+                token
+            ],
+            |row| {
+                Ok((
+                    SessionId(row.get(0)?),
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )?
         .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
-    for (id, title) in &rows {
+    for (id, title, role) in &rows {
         archive_on(tx, id)?;
-        if let Some(title) = title {
-            record_on(tx, id, title)?;
+        if let (Some(title), Some(role)) = (title, BrigadeRole::from_token(role)) {
+            record_on(tx, id, role, title)?;
         }
     }
     Ok(())
+}
+
+/// The token of the brigade's Director, `None` when it has none.
+pub(super) fn director_token_on(
+    conn: &rusqlite::Connection,
+    brigade_id: BrigadeId,
+) -> Result<Option<String>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT member_token FROM brigade_members WHERE brigade_id = ?1 AND role = ?2",
+            params![brigade_id, BrigadeRole::Director.as_token()],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Appends a message to the brigade's queue on whatever connection or transaction
+/// the caller holds. `from_token` is a member token, or `banto_core::model::BANTO_SENDER` for the
+/// messages banto itself writes.
+pub(super) fn enqueue_message_on(
+    conn: &rusqlite::Connection,
+    brigade_id: BrigadeId,
+    from_token: &str,
+    to_role: BrigadeRole,
+    to_member: Option<&str>,
+    body: &str,
+) -> Result<i64, StoreError> {
+    conn.execute(
+        "INSERT INTO brigade_messages (brigade_id, from_session, to_role, to_member, body, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            brigade_id,
+            from_token,
+            to_role.as_token(),
+            to_member,
+            body,
+            system_time_to_unix_ms(SystemTime::now())
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// A member's row, its read cursor, the mail addressed to it, and the solo it may
+/// hold, removed in the caller's transaction. Returns whether a row was there.
+///
+/// Not an operation anything calls on a role's say-so: [`Store::dismiss_worker`]
+/// uses it after refusing a Planner, and the Plan's close uses it for the Planner
+/// only after closing the Plan.
+pub(super) fn remove_member_on(
+    tx: &rusqlite::Transaction<'_>,
+    brigade_id: BrigadeId,
+    token: &str,
+) -> Result<bool, StoreError> {
+    let removed = tx.execute(
+        "DELETE FROM brigade_members WHERE brigade_id = ?1 AND member_token = ?2",
+        params![brigade_id, token],
+    )? > 0;
+    tx.execute(
+        "DELETE FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?2",
+        params![brigade_id, token],
+    )?;
+    tx.execute(
+        "DELETE FROM brigade_messages WHERE brigade_id = ?1 AND to_member = ?2",
+        params![brigade_id, token],
+    )?;
+    // The member's own arrangement (rank, weight, collapsed) went with its row. The
+    // soloed member is a brigade-level column naming a token, so it needs clearing
+    // by hand: the Goinkyo's token is reused by the next consultation, and the
+    // Planner's by the next Plan, and neither may inherit a solo.
+    tx.execute(
+        "UPDATE brigades SET solo_member = NULL WHERE id = ?1 AND solo_member = ?2",
+        params![brigade_id, token],
+    )?;
+    Ok(removed)
 }
 
 impl Store {
@@ -226,19 +313,36 @@ impl Store {
     /// is a separate concern, left for later: this only clears a brigade that
     /// is gone entirely.) A consultation still open in it is over with the
     /// brigade, so its Goinkyo's session is archived in the same transaction
-    /// ([`archive_goinkyo_sessions`]).
-    pub fn delete_brigade(&mut self, id: BrigadeId) -> Result<(), StoreError> {
+    /// ([`archive_ended_sessions`]).
+    ///
+    /// A Plan still open is closed first, in that same transaction, as `abandoned`
+    /// by the operator, and its Planner's session is archived and titled with it:
+    /// the Planner's row goes only with its Plan. The closed Plan is returned so
+    /// that the caller can write its export, which outlives the brigade; the rows
+    /// themselves are deleted with the rest.
+    pub fn delete_brigade(
+        &mut self,
+        id: BrigadeId,
+    ) -> Result<Option<super::plans::ClosedPlan>, StoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        archive_goinkyo_sessions(&tx, id, None)?;
+        let closed = match close_open_plan_on(&tx, id, &PlanClosing::Disband)? {
+            PlanClosed::Closed(closed) => Some(*closed),
+            // `Disband` has no caller to refuse and no result to check, so the
+            // other two answers are "there was no Plan".
+            PlanClosed::NoOpenPlan | PlanClosed::NotDirector | PlanClosed::Refused(_) => None,
+        };
+        archive_ended_sessions(&tx, id, None)?;
         tx.execute("DELETE FROM brigade_members WHERE brigade_id = ?1", [id])?;
         tx.execute("DELETE FROM brigade_messages WHERE brigade_id = ?1", [id])?;
         tx.execute("DELETE FROM brigade_cursors WHERE brigade_id = ?1", [id])?;
         tx.execute("DELETE FROM brigade_progress WHERE brigade_id = ?1", [id])?;
+        tx.execute("DELETE FROM plans WHERE brigade_id = ?1", [id])?;
+        tx.execute("DELETE FROM plan_versions WHERE brigade_id = ?1", [id])?;
         tx.execute("DELETE FROM brigades WHERE id = ?1", [id])?;
         tx.commit()?;
-        Ok(())
+        Ok(closed)
     }
 
     /// Records that a Director is waiting on the operator's decision.
@@ -560,7 +664,8 @@ impl Store {
 
     /// Removes a member from a brigade together with its cursor, and nothing
     /// else: no mail, no solo, and — unlike [`Self::dismiss_worker`] — no archive
-    /// of a Goinkyo's session. Removing a non-member is a no-op. Nothing in the
+    /// of a Goinkyo's session. Removing a non-member is a no-op, and so is removing
+    /// a Planner, which goes only with its Plan ([`Self::close_plan`]). Nothing in the
     /// product calls this; it is the bare row removal the store tests build their
     /// rosters with, and a caller that ends a member for the operator wants
     /// `dismiss_worker`.
@@ -571,11 +676,14 @@ impl Store {
     ) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "DELETE FROM brigade_members WHERE brigade_id = ?1 AND member_token = ?2",
-            params![brigade_id, token],
+            "DELETE FROM brigade_members
+             WHERE brigade_id = ?1 AND member_token = ?2 AND role <> ?3",
+            params![brigade_id, token, BrigadeRole::Planner.as_token()],
         )?;
         tx.execute(
-            "DELETE FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?2",
+            "DELETE FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?2
+             AND NOT EXISTS (SELECT 1 FROM brigade_members
+                             WHERE brigade_id = ?1 AND member_token = ?2)",
             params![brigade_id, token],
         )?;
         tx.commit()?;
@@ -606,7 +714,13 @@ impl Store {
     /// role the row itself holds and never by `token` (the exited-Worker path
     /// comes through here too): once the row is gone its session would come back
     /// to the list as an ordinary row, and the operator has said those are to be
-    /// buried ([`archive_goinkyo_sessions`]).
+    /// buried ([`archive_ended_sessions`]).
+    ///
+    /// A *Planner* is never removed here, by whatever token the caller names: its
+    /// row lives exactly as long as its Plan is open and is removed only in the
+    /// transaction that closes the Plan ([`Self::close_plan`]). Returns `false`
+    /// for it, and writes nothing, so a caller that dismissed it learns the row
+    /// is still there only by reading the roster.
     pub fn dismiss_worker(
         &mut self,
         brigade_id: BrigadeId,
@@ -615,27 +729,17 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        archive_goinkyo_sessions(&tx, brigade_id, Some(token))?;
-        let removed = tx.execute(
-            "DELETE FROM brigade_members WHERE brigade_id = ?1 AND member_token = ?2",
-            params![brigade_id, token],
-        )? > 0;
-        tx.execute(
-            "DELETE FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?2",
-            params![brigade_id, token],
+        let is_planner: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM brigade_members
+             WHERE brigade_id = ?1 AND member_token = ?2 AND role = ?3)",
+            params![brigade_id, token, BrigadeRole::Planner.as_token()],
+            |row| row.get(0),
         )?;
-        tx.execute(
-            "DELETE FROM brigade_messages WHERE brigade_id = ?1 AND to_member = ?2",
-            params![brigade_id, token],
-        )?;
-        // The member's own arrangement (rank, weight, collapsed) went with its
-        // row. The soloed member is a brigade-level column naming a token, so
-        // it needs clearing by hand: the Goinkyo's token is reused by the next
-        // consultation, which must not inherit a dismissed one's solo.
-        tx.execute(
-            "UPDATE brigades SET solo_member = NULL WHERE id = ?1 AND solo_member = ?2",
-            params![brigade_id, token],
-        )?;
+        if is_planner {
+            return Ok(false);
+        }
+        archive_ended_sessions(&tx, brigade_id, Some(token))?;
+        let removed = remove_member_on(&tx, brigade_id, token)?;
         tx.commit()?;
         Ok(removed)
     }
@@ -869,7 +973,7 @@ impl Store {
     pub fn brigade_hidden_session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id FROM brigade_members
-             WHERE role IN ('worker', 'goinkyo') AND session_id IS NOT NULL",
+             WHERE role IN ('worker', 'goinkyo', 'planner') AND session_id IS NOT NULL",
         )?;
         let rows = stmt.query_map([], |row| Ok(SessionId(row.get(0)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -900,19 +1004,7 @@ impl Store {
         to_member: Option<&str>,
         body: &str,
     ) -> Result<i64, StoreError> {
-        self.conn.execute(
-            "INSERT INTO brigade_messages (brigade_id, from_session, to_role, to_member, body, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                brigade_id,
-                from_token,
-                to_role.as_token(),
-                to_member,
-                body,
-                system_time_to_unix_ms(SystemTime::now())
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        enqueue_message_on(&self.conn, brigade_id, from_token, to_role, to_member, body)
     }
 
     /// Pull the messages in `brigade_id` addressed to `recipient_role` (and,
@@ -996,6 +1088,8 @@ impl Store {
             tx.execute("DELETE FROM brigade_messages WHERE brigade_id = ?1", [id])?;
             tx.execute("DELETE FROM brigade_cursors WHERE brigade_id = ?1", [id])?;
             tx.execute("DELETE FROM brigade_progress WHERE brigade_id = ?1", [id])?;
+            tx.execute("DELETE FROM plans WHERE brigade_id = ?1", [id])?;
+            tx.execute("DELETE FROM plan_versions WHERE brigade_id = ?1", [id])?;
             tx.execute("DELETE FROM brigades WHERE id = ?1", [id])?;
         }
         tx.commit()?;
@@ -2825,7 +2919,9 @@ mod tests {
             EndedBy::Dismissal => {
                 store.dismiss_worker(brigade, "goinkyo").unwrap();
             }
-            EndedBy::Disband => store.delete_brigade(brigade).unwrap(),
+            EndedBy::Disband => {
+                store.delete_brigade(brigade).unwrap();
+            }
         }
     }
 
@@ -2905,7 +3001,9 @@ mod tests {
                 EndedBy::Dismissal => {
                     store.dismiss_worker(br, "worker-1").unwrap();
                 }
-                EndedBy::Disband => store.delete_brigade(br).unwrap(),
+                EndedBy::Disband => {
+                    store.delete_brigade(br).unwrap();
+                }
             }
 
             assert!(store.archived_ids().unwrap().is_empty(), "{how:?}");
@@ -3070,7 +3168,9 @@ mod tests {
                 EndedBy::Dismissal => {
                     store.dismiss_worker(br, "worker-1").unwrap();
                 }
-                EndedBy::Disband => store.delete_brigade(br).unwrap(),
+                EndedBy::Disband => {
+                    store.delete_brigade(br).unwrap();
+                }
             }
 
             assert!(store.consultation_titles().unwrap().is_empty(), "{how:?}");
