@@ -156,10 +156,11 @@ pub(crate) enum AgentLaunch {
         /// Claude's, its tool list, and the two flags that keep it to banto's MCP
         /// server and out of the browser. `None` for every other member.
         planner: Option<PlannerLaunch>,
-        /// `--settings <file>`: the one file banto passes a Claude Worker whose
-        /// relay is on, holding the hook that gates its tool calls while an
-        /// interrupt is unread. Pushed right before `--mcp-config`, so that both
-        /// follow every other flag; `None` for every other member.
+        /// `--settings <file>`: passed to every Claude brigade member (Director,
+        /// Worker, Goinkyo, Planner) when the relay is `auto`, `None` otherwise.
+        /// It always holds the wake hooks; a Worker's also holds the hook that
+        /// gates its tool calls while an interrupt is unread. Pushed right before
+        /// `--mcp-config`, so that both follow every other flag.
         settings: Option<PathBuf>,
         mcp_config: Option<PathBuf>,
         /// The positional prompt of `claude [flags] -- "<prompt>"`: the first
@@ -436,8 +437,9 @@ const NOTIFICATION_EVENT_OVERRIDE: &str =
 ///   notification died inside the multiplexer before it ever reached the
 ///   real terminal a human was looking at. That parser is psmux's own, not
 ///   part of this repository, so no path here would stay accurate — this is
-///   the mechanism, not a citation. Not re-measured against banto's own pane
-///   parser.
+///   the mechanism, not a citation. banto's own pane parser drops OSC 9 as
+///   well (`PaneModes::unhandled_osc` reads only banto's OSC 7501), so `bel`
+///   stays the only transport that reaches banto's attention.
 ///
 /// See [`NOTIFICATION_OVERRIDES`] for the build/date this was checked
 /// against.

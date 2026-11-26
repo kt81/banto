@@ -2517,6 +2517,20 @@ on that Director's pane, the focus a BEL latch is cleared by: staging the brigad
 puts him there, so staging clears a quiet fire's or a request's mark in the update
 that stages it (the request's tag stays, "Decision (2026-11-15)").
 
+**A child's own notifications are dropped.** The escapes an agent writes to ask its
+terminal for a desktop notification (OSC 9 text, OSC 777 `notify`, OSC 99, OSC
+1337) never leave the pane: the parser hands them to its unhandled-OSC hook, which
+reads only banto's own OSC 7501, so nothing reaches the host terminal or the bell
+logic, and a BEL that ends one of them is not counted as a BEL. OSC 9;4 progress is
+parsed into the screen and read by nothing. OSC 52 is the only escape that passes
+from a child to the host. Claude Code in a pane inherits `TERM` and `TERM_PROGRAM`
+and so does send OSC 777 (a dialog left alone for 6 seconds, and "waiting for your
+input" once a finished turn has been idle for 60 seconds). It stays dropped for two
+reasons: the marks and the bells above already cover waiting and a permission
+dialog, and the idle notice would be false in a brigade, where members are idle
+while the Director works. Relaying or converting it would ring once per idle member
+per turn, and the bell is meant to be rarer than every turn.
+
 **One event, one ring.** The bell is rung for events, not for row marks, and does
 not depend on what the list shows (a search that hides the Director's row does not
 silence it). A member's wait rings once, when it is first announced: through its
