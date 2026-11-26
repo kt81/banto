@@ -365,6 +365,8 @@ given up to 5 seconds to finish.
 | … `x` | dismiss the focused Worker/Goinkyo from its brigade (confirm; it leaves for good, its session is kept); on a Director or a single session, the same as `x` on the list |
 | … `Esc` / `b` / `Ctrl+B` | cancel the prefix / send a literal prefix chord to the child |
 
+In a pane, `Ctrl+J` is the newline that works in every terminal. `Shift+Enter` works where the terminal reports the Shift, and not where it sends a bare CR for it.
+
 While the prefix is armed, the status bar shows the full binding table. With the
 mouse, drag a boundary between panes or tiles to resize, drag a stack tile by its
 title to move it, and use `[S]` (solo) or `[_]`/`[+]` (collapse/open) in a tile's

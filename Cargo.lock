@@ -373,7 +373,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 [[package]]
 name = "crossterm"
 version = "0.29.0"
-source = "git+https://github.com/kt81/crossterm?branch=banto%2F0.29-emoji-panel-fix#32953a56654a88b4bcf0344667b5993c10b879f7"
+source = "git+https://github.com/kt81/crossterm?branch=banto%2F0.29-patches#e9c76ec9ee2007a8f1c9fb01da130ef0ba212823"
 dependencies = [
  "bitflags 2.13.1",
  "crossterm_winapi",

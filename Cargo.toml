@@ -18,14 +18,19 @@ strip = true
 [profile.dev.package."*"]
 opt-level = 2
 
-# crossterm 0.29.0's Windows input parser feeds surrogate KEY-UP halves into
-# its pairing logic, so anything injected via KEYEVENTF_UNICODE (the Windows
-# emoji panel, notably) pairs as (high, high)/(low, low) and vanishes —
-# diagnosed with a raw ReadConsoleInputW probe, 2026-07-25. Upstream releases
-# are infrequent, so banto rides a pinned one-commit fork of the 0.29 tag
-# (fix also PR'd upstream; drop this patch when a release carries it).
+# banto rides a fork of crossterm's 0.29 tag that carries two upstream PRs,
+# neither merged as of 2026-11-26, because releases are infrequent:
+# - #1073, Windows: 0.29.0's input parser feeds surrogate KEY-UP halves into
+#   its pairing logic, so anything injected via KEYEVENTF_UNICODE (the Windows
+#   emoji panel, notably) pairs as (high, high)/(low, low) and vanishes —
+#   diagnosed with a raw ReadConsoleInputW probe, 2026-07-25.
+# - #1182, Unix: the parser drops `CSI 27;mod;code~` silently. Ghostty 1.4.0
+#   on macOS sends Shift+Enter as `ESC[27;2;13~` unasked (raw byte dump,
+#   2026-11-26), so Shift+Enter did nothing in a pane. The PR hands the
+#   sequence to the CSI-u parser.
+# Drop this patch once a crossterm release carries both.
 [patch.crates-io]
-crossterm = { git = "https://github.com/kt81/crossterm", branch = "banto/0.29-emoji-panel-fix" }
+crossterm = { git = "https://github.com/kt81/crossterm", branch = "banto/0.29-patches" }
 # vt100 measures cell width one character at a time, so a base char followed
 # by U+FE0F settles as one narrow cell while every terminal — and the child
 # driving this grid — counts the pair as two columns. The grid then sits a
