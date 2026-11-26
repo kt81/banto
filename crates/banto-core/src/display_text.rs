@@ -149,6 +149,61 @@ pub fn display_name(text: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// `text` as several lines: the line structure kept, each line reduced by
+/// [`display_safe`]. For the text an agent wrote that banto draws over more than
+/// one line (a decision's question on the reading screen); [`display_name`] is
+/// still the rule for everything that sits inside one.
+///
+/// Every line break (`\n`, `\r\n`, a lone `\r`, and the vertical tab, form
+/// feed, next-line and Unicode line and paragraph separators, which a terminal
+/// or a viewer may treat as one) becomes `\n` *before* the characters are
+/// dropped, for the reason [`display_name`] gives: dropping a break first would
+/// glue two lines into one word. Each line then loses its trailing whitespace,
+/// a run of blank lines is cut to one, and blank lines at the start and the end
+/// are removed. Nothing else is folded: leading indentation and the words on a
+/// line stay as written.
+pub fn display_lines(text: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut pending_cr = false;
+    let mut current = String::new();
+    let flush = |current: &mut String, lines: &mut Vec<String>| {
+        let line = display_safe(current);
+        lines.push(line.trim_end().to_string());
+        current.clear();
+    };
+    for c in text.chars() {
+        match c {
+            // `\r\n` is one break: the `\n` after a `\r` is already counted.
+            '\n' if pending_cr => pending_cr = false,
+            '\n' | '\u{0B}' | '\u{0C}' | '\u{85}' | '\u{2028}' | '\u{2029}' => {
+                pending_cr = false;
+                flush(&mut current, &mut lines);
+            }
+            '\r' => {
+                pending_cr = true;
+                flush(&mut current, &mut lines);
+            }
+            c => {
+                pending_cr = false;
+                current.push(c);
+            }
+        }
+    }
+    flush(&mut current, &mut lines);
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.is_empty() && out.last().is_none_or(String::is_empty) {
+            // Leading blanks, and the second of two blanks in a row.
+            continue;
+        }
+        out.push(line);
+    }
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
 /// `text` cut to at most `columns` display columns, ending in `…` when
 /// anything was cut. By display width, not characters: a wide (Japanese)
 /// character takes two columns. By grapheme cluster, not characters: a base
@@ -381,5 +436,33 @@ mod tests {
         let text = format!("{0}a{0}b", "\u{0301}".repeat(MAX_ZERO_WIDTH_RUN));
         assert_eq!(shorten_to_columns(&text, 10), text);
         assert_eq!(cap_zero_width_runs(&text), text);
+    }
+
+    #[test]
+    fn lines_keep_their_breaks_and_every_kind_of_break_is_one() {
+        assert_eq!(display_lines("a\nb"), "a\nb");
+        assert_eq!(display_lines("a\r\nb"), "a\nb");
+        assert_eq!(display_lines("a\rb"), "a\nb");
+        assert_eq!(
+            display_lines("a\u{85}b\u{2028}c\u{2029}d\u{0b}e\u{0c}f"),
+            "a\nb\nc\nd\ne\nf"
+        );
+        // A `\r\n` is one break, not two: the blank line below is the operator's own.
+        assert_eq!(display_lines("a\r\n\r\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn lines_drop_what_steers_a_terminal_but_keep_indentation_and_words() {
+        assert_eq!(
+            display_lines("  - 選択肢A\u{1b}[31m\n\tindented \u{202e}tail  "),
+            "  - 選択肢A[31m\n indented tail"
+        );
+    }
+
+    #[test]
+    fn lines_cut_blank_runs_and_the_blanks_at_both_ends() {
+        assert_eq!(display_lines("\n\n a\n\n\n\n b \n \n"), " a\n\n b");
+        assert_eq!(display_lines(""), "");
+        assert_eq!(display_lines(" \n\t\n\u{200b}"), "");
     }
 }

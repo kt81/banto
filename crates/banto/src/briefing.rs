@@ -27,12 +27,13 @@ const CODEX_MEMBER_TOOLS: [&str; 3] = [
 /// three above, and the four Director tools added after it never reached it, so a
 /// Codex Director had no name to call them by; a test in `crate::mcp` now checks
 /// every advertised tool against these two lists.
-const CODEX_DIRECTOR_TOOLS: [&str; 5] = [
+const CODEX_DIRECTOR_TOOLS: [&str; 6] = [
     "mcp__banto__request_decision",
     "mcp__banto__name_member",
     "mcp__banto__consult_goinkyo",
     "mcp__banto__dismiss_goinkyo",
     "mcp__banto__interrupt_worker",
+    "mcp__banto__update_progress",
 ];
 
 /// Facts a Codex member needs that a Claude one does not, appended to the
@@ -139,7 +140,7 @@ macro_rules! only {
 
 macro_rules! tail {
     () => {
-        "Being sure of your answer exempts nothing: that is the case this exists for. A consultation is a separate session that reads the code for itself; it takes minutes and costs more than a Worker's errand. The operator chose this level knowing that, so do not economise below it, and do not consult beyond it unless the operator asks. Tell the operator in one line when you consult, and in one line why when you recommend or go ahead without consulting on something that fits a case above."
+        "Being sure of your answer exempts nothing: that is the case this exists for. A consultation is a separate session that reads the code for itself; it takes minutes and costs more than a Worker's errand. The operator chose this level knowing that, so do not economise below it, and do not consult beyond it unless the operator asks. Record in Progress, in one line, that you consulted, and in one line why when you recommend or go ahead without consulting on something that fits a case above."
     };
 }
 
@@ -151,7 +152,7 @@ macro_rules! asked {
 
 macro_rules! dissent {
     () => {
-        "When you go against what the Goinkyo advised, tell the operator so, and why, in one line."
+        "When you go against what the Goinkyo advised, record that in Progress, and why, in one line."
     };
 }
 
@@ -483,12 +484,13 @@ mod tests {
         "mcp__banto__brigade_status",
     ];
 
-    const DIRECTOR_TOOLS: [&str; 5] = [
+    const DIRECTOR_TOOLS: [&str; 6] = [
         "mcp__banto__request_decision",
         "mcp__banto__name_member",
         "mcp__banto__consult_goinkyo",
         "mcp__banto__dismiss_goinkyo",
         "mcp__banto__interrupt_worker",
+        "mcp__banto__update_progress",
     ];
 
     #[test]
@@ -675,7 +677,7 @@ mod tests {
         for text in [off, disputes, design, decisions] {
             assert!(text.contains("A consultation the operator asks for is filed with kind"));
             assert!(text.ends_with(
-                "When you go against what the Goinkyo advised, tell the operator so, and why, in one line."
+                "When you go against what the Goinkyo advised, record that in Progress, and why, in one line."
             ));
         }
 

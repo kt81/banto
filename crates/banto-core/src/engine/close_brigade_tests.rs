@@ -585,6 +585,7 @@ fn the_exits_of_a_closed_brigade_are_one_status_line_and_remove_and_reopen_nobod
             request: None,
             interrupts: None,
             roster: Vec::new(),
+            progress: None,
         },
     );
     let name = state.brigade_name(&app, 1);

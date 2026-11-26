@@ -5,6 +5,8 @@
 //! screen), so they're `pub` here too rather than only exposed via
 //! `render_modal`.
 
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -17,6 +19,7 @@ use banto_core::app::{
     WorkerPickerField, WorkerPickerFor,
 };
 use banto_core::engine::CloseReading;
+use banto_core::reading::{ReadingState, Tone, reading_area, reading_lines, reading_text_size};
 
 use crate::text::truncate_to_width;
 
@@ -80,7 +83,12 @@ pub fn modal_area(area: Rect) -> Rect {
 /// glyph cell too, which makes it match the previous frame's already-blank
 /// state and stops the diff from skipping the border's own cell.
 pub fn modal_clear_area(full_area: Rect) -> Rect {
-    let modal = modal_area(full_area);
+    widened_clear_area(modal_area(full_area), full_area)
+}
+
+/// `modal` widened by one column on each side and clamped to `full_area`: the
+/// reason is [`modal_clear_area`]'s, and holds for any box drawn over the list.
+fn widened_clear_area(modal: Rect, full_area: Rect) -> Rect {
     let x = modal.x.saturating_sub(1).max(full_area.x);
     let right = (modal.x + modal.width + 1).min(full_area.x + full_area.width);
     Rect::new(x, modal.y, right.saturating_sub(x), modal.height)
@@ -167,12 +175,25 @@ pub fn windowed_view(s: &str, cursor: usize, max_width: u16) -> (String, u16) {
 /// [`Modal::ConfirmCloseBrigade`] reads it. It is passed in rather than kept in
 /// the modal because the dialog stays open while panes end and start, and what
 /// it says must be what Enter would end at the moment it is read.
+///
+/// `now` is the moment the reading screen's ages are told as of
+/// ([`Modal::Reading`]); no other modal reads it.
 pub fn render_modal(
     frame: &mut Frame,
     modal: &Modal,
     full_area: Rect,
     close: Option<&CloseReading>,
+    now: Instant,
 ) {
+    // Its own box, larger than a dialog's: its text scrolls.
+    if let Modal::Reading(state) = modal {
+        frame.render_widget(
+            Clear,
+            widened_clear_area(reading_area(full_area), full_area),
+        );
+        render_reading_modal(frame, state, full_area, now);
+        return;
+    }
     let area = modal_area(full_area);
     frame.render_widget(Clear, modal_clear_area(full_area));
     match modal {
@@ -195,7 +216,72 @@ pub fn render_modal(
         Modal::ConfirmDirectorReopen { name, .. } => {
             render_confirm_director_reopen_modal(frame, name, area)
         }
+        // Drawn above, in its own box.
+        Modal::Reading(_) => {}
     }
+}
+
+/// How a [`Tone`] is drawn. Not the waiting magenta, which means "wants the
+/// operator" everywhere else, and a task state is not that.
+fn tone_style(tone: Tone) -> Style {
+    use banto_core::progress::TaskState;
+    match tone {
+        Tone::Plain => Style::default(),
+        Tone::Heading => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        Tone::Dim => Style::default().fg(Color::DarkGray),
+        Tone::Warn => Style::default().fg(Color::Red),
+        Tone::Task(TaskState::Todo) => Style::default().fg(Color::Gray),
+        Tone::Task(TaskState::Doing) => Style::default().fg(Color::Yellow),
+        Tone::Task(TaskState::Blocked) => Style::default().fg(Color::Red),
+        Tone::Task(TaskState::Done) => Style::default().fg(Color::Green),
+        Tone::Task(TaskState::Dropped) => Style::default().fg(Color::DarkGray),
+    }
+}
+
+/// The F5 reading screen: the brigade's open decision and its Progress, read-only,
+/// scrolled by the state's own offset (kept inside the text here too, since the
+/// terminal may have shrunk since the key that set it).
+fn render_reading_modal(frame: &mut Frame, state: &ReadingState, full_area: Rect, now: Instant) {
+    let area = reading_area(full_area);
+    let (width, height) = reading_text_size(full_area);
+    let lines = reading_lines(state, now, width);
+    let scroll = state.scroll().min(lines.len().saturating_sub(height));
+
+    let mut hint = String::from(" \u{2191}\u{2193} scroll ");
+    if state.decision_open() {
+        hint.push_str(" Enter go to the Director ");
+    }
+    hint.push_str(" Esc close ");
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" {} \u{2014} reading ", state.name()))
+        .title_bottom(hint);
+    if lines.len() > height {
+        let last = (scroll + height).min(lines.len());
+        block = block.title_top(
+            Line::from(format!(" {}-{} of {} ", scroll + 1, last, lines.len())).right_aligned(),
+        );
+    }
+    let inner = pad_horizontal(block.inner(area));
+    frame.render_widget(block, area);
+
+    let visible: Vec<Line> = lines
+        .iter()
+        .skip(scroll)
+        .take(height)
+        .map(|line| {
+            Line::from(
+                line.spans
+                    .iter()
+                    .map(|(text, tone)| Span::styled(text.clone(), tone_style(*tone)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(visible), inner);
 }
 
 /// Render the `n` new-session dialog: a one-line cwd input (with a blinking
@@ -681,6 +767,13 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    /// The one clock read the tests need: time is an argument everywhere else
+    /// (`docs/DISCIPLINE.md` section 3), and these only need some instant to pass in.
+    #[allow(clippy::disallowed_methods)]
+    fn now() -> Instant {
+        Instant::now()
+    }
+
     use banto_core::app::App;
     use banto_core::model::AgentKind;
 
@@ -831,6 +924,109 @@ mod tests {
         );
     }
 
+    fn reading_text(
+        state: &ReadingState,
+        width: u16,
+        height: u16,
+        now: Instant,
+    ) -> (String, ratatui::buffer::Buffer) {
+        let modal = Modal::Reading(state.clone());
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_modal(frame, &modal, frame.area(), None, now))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (buffer_text(&buffer), buffer)
+    }
+
+    fn open_reading(question: Option<&str>, tasks: usize, read_at: Instant) -> ReadingState {
+        use banto_core::progress::{
+            BrigadeReading, DecisionReading, Progress, ProgressReading, ProgressTask, TaskState,
+        };
+        let mut state = ReadingState::new(1, "\"Alpha\"".to_string(), (None, None));
+        state.set_loaded(
+            BrigadeReading {
+                decision: Some(DecisionReading {
+                    seq: 1,
+                    question: question.map(str::to_string),
+                    age_ms: Some(0),
+                }),
+                progress: Some(ProgressReading {
+                    progress: Progress {
+                        stage: "migrating".to_string(),
+                        tasks: (0..tasks)
+                            .map(|i| ProgressTask {
+                                id: format!("t{i}"),
+                                state: TaskState::Doing,
+                                note: format!("note {i}"),
+                            })
+                            .collect(),
+                        off_plan: Vec::new(),
+                    },
+                    seq: 1,
+                    age_ms: 0,
+                }),
+            },
+            read_at,
+        );
+        state
+    }
+
+    #[test]
+    fn the_reading_screen_shows_the_question_the_progress_and_its_keys() {
+        let t = now();
+        let state = open_reading(Some("Ship the migration today?"), 2, t);
+        let (text, _) = reading_text(&state, 100, 30, t);
+        for expected in [
+            "\"Alpha\"",
+            "Ship the migration today?",
+            "migrating",
+            "t0",
+            "note 1",
+            "Enter go to the Director",
+            "Esc close",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}:\n{text}");
+        }
+        // No decision open: Enter is not offered, because it does nothing.
+        let mut idle = open_reading(None, 1, t);
+        idle.set_loaded(
+            banto_core::progress::BrigadeReading {
+                decision: None,
+                progress: None,
+            },
+            t,
+        );
+        let (text, _) = reading_text(&idle, 100, 30, t);
+        assert!(!text.contains("Enter go to"), "{text}");
+        assert!(text.contains("Esc close"), "{text}");
+    }
+
+    #[test]
+    fn a_long_reading_scrolls_and_says_which_lines_it_shows() {
+        let t = now();
+        let mut state = open_reading(Some("q?"), 40, t);
+        let (top, _) = reading_text(&state, 100, 16, t);
+        assert!(top.contains("t0") && !top.contains("t39"), "{top}");
+        assert!(top.contains(" 1-"), "{top}");
+        // A scroll past the end is drawn at the end, not blank.
+        state.set_scroll(10_000);
+        let (end, _) = reading_text(&state, 100, 16, t);
+        assert!(end.contains("t39") && !end.contains("t0 "), "{end}");
+    }
+
+    #[test]
+    fn the_reading_screen_keeps_its_margin_and_survives_a_tiny_terminal() {
+        let t = now();
+        let state = open_reading(Some("q?"), 1, t);
+        let (_, buffer) = reading_text(&state, 100, 30, t);
+        // The corner is outside its box.
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), " ");
+        for (w, h) in [(1, 1), (5, 3), (12, 4)] {
+            reading_text(&state, w, h, t);
+        }
+    }
+
     fn close_dialog_text(reading: Option<&CloseReading>) -> String {
         let modal = Modal::ConfirmCloseBrigade {
             brigade_id: 1,
@@ -838,7 +1034,7 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
         terminal
-            .draw(|frame| render_modal(frame, &modal, frame.area(), reading))
+            .draw(|frame| render_modal(frame, &modal, frame.area(), reading, now()))
             .unwrap();
         buffer_text(terminal.backend().buffer())
     }
@@ -909,7 +1105,7 @@ mod tests {
                 // leave a dangling half-glyph once the border overwrote
                 // only the continuation cell.
                 frame.render_widget(Span::raw("あ"), Rect::new(1, 5, 2, 1));
-                render_modal(frame, &modal, area, None);
+                render_modal(frame, &modal, area, None, now());
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -936,7 +1132,7 @@ mod tests {
                 // `modal_area_shrinks_margin_in_a_narrow_pane_...`:
                 // width 36 starting at x=2 ends at column 37).
                 frame.render_widget(Span::raw("あ"), Rect::new(38, 5, 2, 1));
-                render_modal(frame, &modal, area, None);
+                render_modal(frame, &modal, area, None, now());
             })
             .unwrap();
         let buf = terminal.backend().buffer();

@@ -383,6 +383,32 @@ pub(super) const MIGRATIONS: &[&str] = &[
     "ALTER TABLE brigade_members ADD COLUMN wake_issued INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE brigade_members ADD COLUMN wake_received INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE brigade_members ADD COLUMN wake_waiter INTEGER NOT NULL DEFAULT 0;",
+    // v24: what the operator reads about a brigade on the reading screen.
+    // `brigades.request_question` is the question a Director attached to its open
+    // decision request. It sits beside `request_text` and has that column's
+    // lifetime (set by the request, cleared by the answer, deleted with the
+    // brigade); NULL is "no question", which is every request made before this
+    // version and every one made without. `request_text` itself still holds only
+    // the constant that says a request is open, so a question never decides
+    // whether one is.
+    //
+    // `brigade_progress` is a Director's Progress, one row per brigade, replaced
+    // whole on every write (`Store::set_progress`). `tasks` and `off_plan` are JSON
+    // arrays: they are only ever written and read whole, never queried by element,
+    // and a table per list would buy nothing but a second thing to keep in step.
+    // `seq` counts the writes, so the tick can tell that it changed without reading
+    // the body; `updated_at_ms` is banto's clock at the write. No foreign key: this
+    // schema has none anywhere, and `Store::delete_brigade` deletes the row beside
+    // the others.
+    "ALTER TABLE brigades ADD COLUMN request_question TEXT;
+    CREATE TABLE brigade_progress (
+        brigade_id INTEGER PRIMARY KEY,
+        stage TEXT NOT NULL,
+        tasks TEXT NOT NULL,
+        off_plan TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    );",
 ];
 
 /// The schema version this build migrates to and knows how to read.
@@ -491,6 +517,82 @@ mod tests {
         assert_eq!(
             store.poll_wake(1, "worker-1", generation).unwrap(),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn v23_to_v24_upgrade_adds_the_question_column_and_progress_table_and_keeps_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // A database as v23 code left it: a brigade whose Director has an open
+        // request, made before a request could carry a question.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[..23] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO brigades (id, name, created_at_ms, request_text, request_seq, request_at_ms)
+                 VALUES (1, 'cell', 3000, 'open', 4, 3500);
+                 INSERT INTO brigade_members (brigade_id, member_token, role, session_id)
+                 VALUES (1, 'director', 'director', 'dir-1');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 23).unwrap();
+        }
+
+        let mut store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+
+        assert_eq!(
+            store.brigade_request(1).unwrap(),
+            Some(4),
+            "the open request survives"
+        );
+        let detail = store.brigade_request_detail(1).unwrap().unwrap();
+        assert_eq!(
+            (detail.seq, detail.question, detail.requested_at_ms),
+            (4, None, Some(3500)),
+            "an old request has no question"
+        );
+        assert_eq!(store.brigade_progress(1).unwrap(), None);
+        assert_eq!(store.brigade_progress_glance(1).unwrap(), None);
+        // The new surface works on the upgraded file.
+        assert_eq!(
+            store.set_request(1, "director", Some("Ship it?")).unwrap(),
+            Some(5)
+        );
+        let progress = banto_core::progress::Progress {
+            stage: "s".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            store.set_progress(1, "director", &progress).unwrap(),
+            Some(1)
+        );
+
+        // The copy kept before the upgrade is a v23 database without either.
+        let before = rusqlite::Connection::open(dir.path().join("banto.db.before-v24")).unwrap();
+        let version: i64 = before
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 23);
+        assert!(
+            before
+                .prepare("SELECT request_question FROM brigades")
+                .is_err(),
+            "the copy is from before the column existed"
+        );
+        assert!(
+            before
+                .prepare("SELECT stage FROM brigade_progress")
+                .is_err(),
+            "the copy is from before the table existed"
         );
     }
 

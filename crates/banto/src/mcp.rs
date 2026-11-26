@@ -21,10 +21,13 @@
 //! - `consult_goinkyo(..)` / `dismiss_goinkyo()` (Director only) summon and end
 //!   the Goinkyo;
 //! - `name_member(member, name)` (Director only) labels a Worker;
-//! - `request_decision()` (Director only) records that the brigade is waiting on
-//!   the operator's decision, shown as a short fixed tag until they answer in the
-//!   Director's pane. It takes no text: the question is in the Director's own
-//!   output. It never blocks;
+//! - `request_decision(question?)` (Director only) records that the brigade is
+//!   waiting on the operator's decision. The list and the title show a short
+//!   fixed tag until they answer in the Director's pane; the optional `question`
+//!   is drawn only on the reading screen. It never blocks;
+//! - `update_progress(stage, tasks?, off_plan?)` (Director only) replaces the
+//!   brigade's Progress whole: the state of the work, which the operator reads
+//!   on the reading screen instead of in the Director's pane;
 //! - `interrupt_worker(member, text)` (Director only) delivers `text` to a Worker
 //!   as an ordinary message and has banto refuse the Worker's next tool calls
 //!   until it reads it. The tool only records the request, in the same
@@ -70,6 +73,7 @@ use banto_core::model::{
     AgentKind, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, GOINKYO_TOKEN,
     InterruptOutcome, MemberToken, SessionId,
 };
+use banto_core::progress::{Progress, RawTask, check_progress, check_question};
 use banto_io::brigade_log::{BrigadeLog, Entry, EntryKind, Party, Recipient};
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_activity::is_thread_idle;
@@ -589,17 +593,85 @@ fn tools_list_result() -> Value {
                 "name": "request_decision",
                 "description": "Director only. Tell banto that you are waiting on a \
                                 decision only the operator can make, and that work stops \
-                                until it is made. banto shows the operator THAT you are \
-                                waiting, not the question: write the question in your own \
-                                pane first, then call this. It takes no arguments and does \
-                                not block you: carry on with whatever can proceed. The tag \
-                                stays until the operator answers in your pane. Use it only \
-                                when the decision is the operator's alone AND work stops on \
-                                it; not for status, for questions you or a Worker can \
-                                settle, or for finished work (banto itself tells the \
+                                until it is made. Write the decision in your pane FIRST \
+                                (what is being decided, the options, your recommendation), \
+                                then call this with the same text as `question` (line breaks \
+                                are kept). Your pane is where the operator answers: the list \
+                                and the title show only a fixed `decision` tag, and the \
+                                question is read on banto's reading screen. \
+                                It does not block you: carry on with whatever can proceed. \
+                                The tag stays until the operator answers in your pane. Use \
+                                it only when the decision is the operator's alone AND work \
+                                stops on it; not for status, for questions you or a Worker \
+                                can settle, or for finished work (banto itself tells the \
                                 operator when the whole brigade has gone quiet). A second \
-                                call while one is open counts as a new request.",
-                "inputSchema": { "type": "object", "properties": {} },
+                                call while one is open counts as a new request and replaces \
+                                its question.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The decision, for the operator. At most 4000 \
+                                            characters; a longer one is refused, not cut."
+                        }
+                    },
+                },
+            },
+            {
+                "name": "update_progress",
+                "description": "Director only. Record the state of the brigade's work. The \
+                                operator reads it on banto's reading screen, so the state \
+                                of the work does not have to be written in your pane. Each call replaces the whole \
+                                Progress (it shows the latest state, not a history): send \
+                                everything that still matters, and leave out what no longer \
+                                does. Call it when state changes (a task's state, an \
+                                off-plan item appearing or clearing, a decision requested or \
+                                answered), not on every report. Write for the operator, in \
+                                their language. One line per item; a limit exceeded is \
+                                refused, not cut: stage 200 characters, task id 16, task \
+                                note 200, off_plan item 200, at most 40 tasks and 20 \
+                                off_plan items. Task ids must be unique.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "stage": {
+                            "type": "string",
+                            "description": "One line: what phase the work is in."
+                        },
+                        "tasks": {
+                            "type": "array",
+                            "description": "The tasks, in the order to show them. Omit for none.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {
+                                        "type": "string",
+                                        "description": "A short handle, e.g. \"T1\"."
+                                    },
+                                    "state": {
+                                        "type": "string",
+                                        "enum": ["todo", "doing", "blocked", "done", "dropped"]
+                                    },
+                                    "note": {
+                                        "type": "string",
+                                        "description": "One line. Optional."
+                                    }
+                                },
+                                "required": ["id", "state"],
+                                "additionalProperties": false,
+                            }
+                        },
+                        "off_plan": {
+                            "type": "array",
+                            "description": "Work being done that is outside what was agreed, \
+                                            one line each. Omit for none.",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["stage"],
+                    "additionalProperties": false,
+                },
             },
             {
                 "name": "name_member",
@@ -699,7 +771,8 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
         "consult_goinkyo" => tool_consult_goinkyo(ctx, msg),
         "dismiss_goinkyo" => tool_dismiss_goinkyo(ctx),
         "name_member" => tool_name_member(ctx, msg),
-        "request_decision" => tool_request_decision(ctx),
+        "request_decision" => tool_request_decision(ctx, msg),
+        "update_progress" => tool_update_progress(ctx, msg),
         "interrupt_worker" => interrupt_worker(ctx, msg, INTERRUPT_WAIT),
         GATE_TOOL => tool_interrupt_gate(ctx, msg),
         other => tool_error(&format!("unknown tool: {other}")),
@@ -1235,7 +1308,7 @@ fn tool_check_messages(ctx: &mut ServerContext) -> Value {
             // the delivery: erroring the whole call out now would drop
             // messages the caller can never pull again.
             let members = ctx.store.brigade_members(brigade).unwrap_or_default();
-            tool_text(format_inbox(&messages, &members), false)
+            tool_text(format_inbox(&messages, &members, role), false)
         }
         Err(err) => tool_error(&format!("failed to read messages: {err}")),
     }
@@ -1748,6 +1821,14 @@ fn role_label(role: BrigadeRole) -> &'static str {
     }
 }
 
+/// What a Director is told after the framing sentence of its inbox. Conditional
+/// ("if banto started this turn") because the Director may pull its mail in the
+/// middle of a turn the operator started, and then the operator is waiting.
+const DIRECTOR_QUIET_NOTE: &str = "If banto started this turn (its nudge) and not the operator, \
+     nobody is waiting for an answer from you: write nothing for the operator unless it changes \
+     what they must decide, record a change in the state of the work with update_progress, and \
+     end the turn. A decision only they can make goes through request_decision.";
+
 /// Render pulled messages with the firewall framing that keeps the recipient
 /// from mistaking a relayed AI message for a direct operator instruction.
 /// Attribution is the sender's member token (`"director"`, `"worker-1"`,
@@ -1769,7 +1850,17 @@ fn role_label(role: BrigadeRole) -> &'static str {
 /// Goinkyo now, mixing them for the same generic reading, for a second, new
 /// reason. Either way, an unresolved sender token counts toward neither a
 /// match nor a mismatch.
-fn format_inbox(messages: &[BrigadeMessage], members: &[BrigadeMember]) -> String {
+///
+/// A Director's preface adds [`DIRECTOR_QUIET_NOTE`]. This is the text a Director
+/// woken by the relay reads first, so it is where the rule that such a turn is
+/// not the operator speaking has to be said: the briefing that states it was
+/// read long before. `RELAY_NUDGE_LINE` cannot carry it, since Workers read
+/// that line too.
+fn format_inbox(
+    messages: &[BrigadeMessage],
+    members: &[BrigadeMember],
+    recipient: BrigadeRole,
+) -> String {
     let mut resolved_sender_roles = messages.iter().filter_map(|message| {
         members
             .iter()
@@ -1788,6 +1879,10 @@ fn format_inbox(messages: &[BrigadeMessage], members: &[BrigadeMember]) -> Strin
          operator. Act at your discretion.\n",
         messages.len()
     );
+    if recipient == BrigadeRole::Director {
+        out.push_str(DIRECTOR_QUIET_NOTE);
+        out.push('\n');
+    }
     for message in messages {
         let addressing = if message.to_member.is_some() {
             "to you"
@@ -2364,14 +2459,19 @@ fn write_gate_outcome(ctx: &mut ServerContext, ids: &[i64], outcome: InterruptOu
 }
 
 /// `request_decision`: record that this Director is waiting on the operator's
-/// decision. It takes no text, and none is read: whatever a caller sends (an agent
-/// briefed by an older prompt may still send `text`) is ignored, so no agent-written
-/// word is stored, carried or drawn; the question is in the Director's own pane.
+/// decision, with the question it attached when it attached one. The question is
+/// agent-written text, so it is reduced by `check_question` (line breaks kept,
+/// control and invisible characters dropped) and an over-long one is refused rather
+/// than cut: the Director then sends a shorter one, where a cut sentence would reach
+/// the operator unmarked. It is drawn only on the reading screen; whether a request
+/// is open is the constant the store keeps beside it, so no question can change what
+/// the tick reads. The old `text` argument is still not read: an agent briefed by an
+/// earlier prompt may send it, and it is ignored, not stored.
 /// Director only, by the store's live membership like `name_member`; a caller that
 /// is in no brigade (or whose brigade is gone) gets the usual refusal. The answer
 /// says only that the request is recorded: whether anything rings is the operator's
 /// setting, read by banto's own process, and must not be promised from here.
-fn tool_request_decision(ctx: &mut ServerContext) -> Value {
+fn tool_request_decision(ctx: &mut ServerContext, msg: &Value) -> Value {
     let (brigade, token, role) = match live_membership(ctx) {
         Ok(Some(membership)) => membership,
         Ok(None) => return not_in_brigade(),
@@ -2380,21 +2480,125 @@ fn tool_request_decision(ctx: &mut ServerContext) -> Value {
     if role != BrigadeRole::Director {
         return tool_error("request_decision may only be called by a Director.");
     }
+    let question = match msg.pointer("/params/arguments/question") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => match check_question(text) {
+            Ok(question) => question,
+            Err(refusal) => return tool_error(&refusal.to_string()),
+        },
+        Some(_) => return tool_error("`question` must be a string."),
+    };
     // The write checks again, in its own transaction, that this member is still the
     // brigade's Director: a membership that changed since the check above (the
     // brigade disbanded, the member removed) is the usual refusal, not a write.
-    match ctx.store.set_request(brigade, &token) {
+    match ctx.store.set_request(brigade, &token, question.as_deref()) {
         Ok(Some(_)) => tool_text(
-            "Recorded. banto now shows the operator that you are waiting for a decision, \
-             not the question: the question you wrote before this call is what they will \
-             read, so do not write it again. You are not blocked: carry on with whatever \
-             can proceed."
-                .to_string(),
+            if question.is_some() {
+                "Recorded. banto shows the operator that you are waiting for a decision, and \
+                 your question on its reading screen. The question you wrote in your pane is \
+                 where they answer, so do not write it again. You are not blocked: carry on \
+                 with whatever can proceed."
+            } else {
+                "Recorded, with no `question`: banto shows the operator that you are waiting \
+                 for a decision and, on its reading screen, that the question is in your pane. \
+                 The question you wrote in your pane is what they read and answer, so do not \
+                 write it again. Pass it as `question` too next time. You are not blocked: \
+                 carry on with whatever can proceed."
+            }
+            .to_string(),
             false,
         ),
         Ok(None) => not_in_brigade(),
         Err(err) => tool_error(&format!("failed to record the request: {err}")),
     }
+}
+
+/// `update_progress`: replace this Director's brigade's Progress with what it sent.
+/// Every field is checked by `check_progress`, which is the one place that knows
+/// the limits; this function only turns JSON into its input and says plainly which
+/// argument was of the wrong shape, since a Director that is told "invalid" cannot
+/// tell what to fix. Director only, resolved from the store as `request_decision` is,
+/// and re-checked in the write's own transaction. Nothing is written when any part
+/// is refused: a Progress is replaced whole or not at all.
+///
+/// The answer tells the Director it may stop: the point of Progress is that the
+/// state of the work is read here instead of in the pane, and a Director that
+/// narrates the write after making it has gained the operator nothing.
+fn tool_update_progress(ctx: &mut ServerContext, msg: &Value) -> Value {
+    let (brigade, token, role) = match live_membership(ctx) {
+        Ok(Some(membership)) => membership,
+        Ok(None) => return not_in_brigade(),
+        Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
+    };
+    if role != BrigadeRole::Director {
+        return tool_error("update_progress may only be called by a Director.");
+    }
+    let progress = match parse_progress_args(msg) {
+        Ok(progress) => progress,
+        Err(message) => return tool_error(&message),
+    };
+    match ctx.store.set_progress(brigade, &token, &progress) {
+        Ok(Some(_)) => tool_text(
+            "Recorded. The operator reads it on banto's reading screen. You may end your \
+             turn here with no text for the operator."
+                .to_string(),
+            false,
+        ),
+        Ok(None) => not_in_brigade(),
+        Err(err) => tool_error(&format!("failed to record the progress: {err}")),
+    }
+}
+
+/// The arguments of `update_progress` as a checked `Progress`, or the message that
+/// names what was wrong.
+fn parse_progress_args(msg: &Value) -> Result<Progress, String> {
+    let stage = match msg.pointer("/params/arguments/stage") {
+        Some(Value::String(stage)) => stage.as_str(),
+        None | Some(Value::Null) => return Err("`stage` is required.".to_string()),
+        Some(_) => return Err("`stage` must be a string.".to_string()),
+    };
+    let mut tasks: Vec<RawTask> = Vec::new();
+    match msg.pointer("/params/arguments/tasks") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(items)) => {
+            for (index, item) in items.iter().enumerate() {
+                let n = index + 1;
+                let Value::Object(fields) = item else {
+                    return Err(format!(
+                        "task {n} must be an object with `id`, `state` and optionally `note`."
+                    ));
+                };
+                let text = |key: &str, required: bool| -> Result<String, String> {
+                    match fields.get(key) {
+                        Some(Value::String(text)) => Ok(text.clone()),
+                        None | Some(Value::Null) if !required => Ok(String::new()),
+                        None | Some(Value::Null) => Err(format!("task {n} is missing `{key}`.")),
+                        Some(_) => Err(format!("task {n}'s `{key}` must be a string.")),
+                    }
+                };
+                tasks.push(RawTask {
+                    id: text("id", true)?,
+                    state: text("state", true)?,
+                    note: text("note", false)?,
+                });
+            }
+        }
+        Some(_) => return Err("`tasks` must be an array.".to_string()),
+    }
+    let mut off_plan: Vec<String> = Vec::new();
+    match msg.pointer("/params/arguments/off_plan") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(items)) => {
+            for (index, item) in items.iter().enumerate() {
+                match item {
+                    Value::String(text) => off_plan.push(text.clone()),
+                    _ => return Err(format!("`off_plan` item {} must be a string.", index + 1)),
+                }
+            }
+        }
+        Some(_) => return Err("`off_plan` must be an array of strings.".to_string()),
+    }
+    check_progress(stage, &tasks, &off_plan).map_err(|refusal| refusal.to_string())
 }
 
 fn tool_text(text: String, is_error: bool) -> Value {
@@ -2904,7 +3108,7 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_is_advertised_without_parameters_and_no_tool_is_named_for_asking() {
+    fn request_decision_is_advertised_with_an_optional_question_and_no_tool_is_named_for_asking() {
         let mut ctx = ctx("s", None, None, None);
         let response = call(
             &mut ctx,
@@ -2927,21 +3131,33 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "request_decision")
             .unwrap();
-        // No parameters, nothing required, and nothing that forbids an extra one.
+        // One optional string, and nothing that forbids the `text` an older briefing
+        // still sends.
         let schema = &tool["inputSchema"];
-        assert!(
-            schema["properties"]
-                .as_object()
-                .is_some_and(|p| p.is_empty()),
+        assert_eq!(
+            schema["properties"]["question"]["type"], "string",
+            "{schema}"
+        );
+        assert_eq!(
+            schema["properties"].as_object().unwrap().len(),
+            1,
             "{schema}"
         );
         assert!(schema.get("required").is_none(), "{schema}");
         assert!(schema.get("additionalProperties").is_none(), "{schema}");
-        // It says plainly what is shown: that the Director waits, not the question.
+        // It says what is shown where: a fixed tag in the list, the question on the
+        // reading screen, and that the pane is still where the operator answers.
         let description = tool["description"].as_str().unwrap();
-        assert!(description.contains("THAT you are"), "{description}");
-        assert!(description.contains("not the question"), "{description}");
-        assert!(description.contains("write the question in your own pane first"));
+        assert!(description.contains("`question`"), "{description}");
+        assert!(
+            description.contains("Write the decision in your pane FIRST"),
+            "{description}"
+        );
+        assert!(description.contains("reading screen"), "{description}");
+        assert!(
+            description.contains("fixed `decision` tag"),
+            "{description}"
+        );
         // What lasts is the tag, until the answer; the mark, which ends sooner, is
         // not promised to the Director.
         assert!(
@@ -2952,6 +3168,35 @@ mod tests {
             !description.to_lowercase().contains("mark"),
             "{description}"
         );
+    }
+
+    #[test]
+    fn update_progress_is_advertised_as_director_only_with_a_closed_schema() {
+        let tools = tools_list_result();
+        let tool = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "update_progress")
+            .unwrap();
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.starts_with("Director only."), "{description}");
+        assert!(description.contains("replaces the whole"), "{description}");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["required"], json!(["stage"]), "{schema}");
+        assert_eq!(schema["additionalProperties"], json!(false), "{schema}");
+        let states = &schema["properties"]["tasks"]["items"]["properties"]["state"]["enum"];
+        assert_eq!(
+            states,
+            &json!(["todo", "doing", "blocked", "done", "dropped"]),
+            "the words the tool takes are the words the core knows"
+        );
+        for word in states.as_array().unwrap() {
+            assert!(
+                banto_core::progress::TaskState::from_token(word.as_str().unwrap()).is_some(),
+                "{word}"
+            );
+        }
     }
 
     #[test]
@@ -3030,7 +3275,8 @@ mod tests {
         // bell or about anyone having been told, and it says what is shown.
         let text = result_text(&response).to_lowercase();
         assert!(text.contains("recorded"), "{text:?}");
-        assert!(text.contains("not the question"), "{text:?}");
+        assert!(text.contains("no `question`"), "{text:?}");
+        assert!(text.contains("pass it as `question`"), "{text:?}");
         for word in ["bell", "notif", "alert", "ring", "sent"] {
             assert!(!text.contains(word), "{word}: {text:?}");
         }
@@ -3060,6 +3306,97 @@ mod tests {
             assert!(!is_error(&response), "{text}: {}", result_text(&response));
             assert_eq!(stored_request(&ctx), Some(1), "{text}");
         }
+    }
+
+    fn request_call_with_question(question: &Value) -> String {
+        json!({
+            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+            "params": { "name": "request_decision", "arguments": { "question": question } }
+        })
+        .to_string()
+    }
+
+    fn stored_question(ctx: &ServerContext) -> Option<String> {
+        ctx.store
+            .brigade_request_detail(1)
+            .unwrap()
+            .and_then(|detail| detail.question)
+    }
+
+    #[test]
+    fn a_question_is_stored_sanitised_with_its_line_breaks() {
+        let mut ctx = request_ctx();
+        let response = call(
+            &mut ctx,
+            &request_call_with_question(&json!("Ship it?\r\n- yes\n- no\u{1b}[2J \u{202e}")),
+        );
+        assert!(!is_error(&response), "{}", result_text(&response));
+        assert_eq!(stored_request(&ctx), Some(1));
+        assert_eq!(
+            stored_question(&ctx).as_deref(),
+            Some("Ship it?\n- yes\n- no[2J")
+        );
+        // The answer to a call that carried one says where they read it, and does not
+        // tell the Director to write it (it already did, and 2026-11-16 showed what a
+        // result that says so does).
+        let text = result_text(&response);
+        assert!(text.contains("reading screen"), "{text:?}");
+        assert!(
+            !text.to_lowercase().contains("write the question"),
+            "{text:?}"
+        );
+        assert!(text.contains("do not write it again"), "{text:?}");
+        // A later request without one does not show the first one's.
+        call(&mut ctx, &request_call());
+        assert_eq!(stored_request(&ctx), Some(2));
+        assert_eq!(stored_question(&ctx), None);
+    }
+
+    #[test]
+    fn a_question_with_nothing_visible_is_no_question() {
+        for question in [json!(""), json!("  \n\u{200b}\t"), Value::Null] {
+            let mut ctx = request_ctx();
+            let response = call(&mut ctx, &request_call_with_question(&question));
+            assert!(
+                !is_error(&response),
+                "{question}: {}",
+                result_text(&response)
+            );
+            assert_eq!(stored_request(&ctx), Some(1), "{question}");
+            assert_eq!(stored_question(&ctx), None, "{question}");
+        }
+    }
+
+    #[test]
+    fn a_question_that_is_too_long_or_not_a_string_is_refused_and_no_request_is_made() {
+        let mut ctx = request_ctx();
+        let long = "q".repeat(banto_core::progress::QUESTION_MAX_CHARS + 1);
+        let response = call(&mut ctx, &request_call_with_question(&json!(long)));
+        assert!(is_error(&response));
+        let text = result_text(&response);
+        assert!(text.contains("4000"), "the limit is named: {text:?}");
+        assert_eq!(
+            stored_request(&ctx),
+            None,
+            "a refused call is not a request"
+        );
+        let response = call(&mut ctx, &request_call_with_question(&json!(3)));
+        assert!(is_error(&response));
+        assert!(result_text(&response).contains("must be a string"));
+        assert_eq!(stored_request(&ctx), None);
+        // At the limit it is accepted.
+        let at_limit = "q".repeat(banto_core::progress::QUESTION_MAX_CHARS);
+        let response = call(&mut ctx, &request_call_with_question(&json!(at_limit)));
+        assert!(!is_error(&response), "{}", result_text(&response));
+        assert_eq!(stored_request(&ctx), Some(1));
+    }
+
+    #[test]
+    fn a_stray_text_argument_is_not_a_question() {
+        let mut ctx = request_ctx();
+        call(&mut ctx, &request_call_with_text(&json!("Which shape?")));
+        assert_eq!(stored_request(&ctx), Some(1));
+        assert_eq!(stored_question(&ctx), None);
     }
 
     #[test]
@@ -3101,6 +3438,171 @@ mod tests {
         let response = call(&mut ctx, &request_call());
         assert!(result_text(&response).contains("not"));
         assert_eq!(stored_request(&ctx), None);
+    }
+
+    // --- update_progress ---------------------------------------------------------
+
+    fn progress_call(arguments: Value) -> String {
+        json!({
+            "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+            "params": { "name": "update_progress", "arguments": arguments }
+        })
+        .to_string()
+    }
+
+    fn stored_progress(ctx: &ServerContext) -> Option<banto_core::progress::ProgressRecord> {
+        ctx.store.brigade_progress(1).unwrap()
+    }
+
+    #[test]
+    fn a_director_records_progress_and_is_told_it_may_end_its_turn() {
+        let mut ctx = request_ctx();
+        let response = call(
+            &mut ctx,
+            &progress_call(json!({
+                "stage": "実装中: 保存層",
+                "tasks": [
+                    { "id": "T1", "state": "doing", "note": "マイグレーション" },
+                    { "id": "T2", "state": "todo" }
+                ],
+                "off_plan": ["README の表も直している"]
+            })),
+        );
+        assert!(!is_error(&response), "{}", result_text(&response));
+        let text = result_text(&response);
+        assert!(text.contains("Recorded"), "{text:?}");
+        assert!(text.contains("end your turn here with no text"), "{text:?}");
+        let record = stored_progress(&ctx).unwrap();
+        assert_eq!(record.progress.stage, "実装中: 保存層");
+        assert_eq!(record.progress.tasks.len(), 2);
+        assert_eq!(record.progress.tasks[1].note, "");
+        assert_eq!(record.progress.off_plan, ["README の表も直している"]);
+        assert_eq!(record.seq, 1);
+        // Replaced whole: tasks and off_plan omitted mean none, not "keep".
+        call(&mut ctx, &progress_call(json!({ "stage": "done" })));
+        let record = stored_progress(&ctx).unwrap();
+        assert_eq!(record.progress.stage, "done");
+        assert!(record.progress.tasks.is_empty() && record.progress.off_plan.is_empty());
+        assert_eq!(record.seq, 2);
+    }
+
+    #[test]
+    fn a_worker_and_a_goinkyo_cannot_update_progress() {
+        let director = request_ctx();
+        let mut worker = worker_ctx_of(director, "worker-1");
+        let response = call(&mut worker, &progress_call(json!({ "stage": "s" })));
+        assert!(is_error(&response));
+        assert!(result_text(&response).contains("only be called by a Director"));
+        assert_eq!(stored_progress(&worker), None);
+        let mut goinkyo = ServerContext {
+            identity: Identity {
+                session: Some("goinkyo-session".to_string()),
+                brigade: Some(1),
+                member: Some("goinkyo".to_string()),
+                role: Some(BrigadeRole::Goinkyo),
+            },
+            ..worker
+        };
+        let response = call(&mut goinkyo, &progress_call(json!({ "stage": "s" })));
+        assert!(is_error(&response));
+        assert_eq!(stored_progress(&goinkyo), None);
+    }
+
+    #[test]
+    fn progress_from_outside_a_brigade_or_a_disbanded_one_is_the_usual_refusal() {
+        let mut outside = ctx("spike-session", None, None, None);
+        let response = call(&mut outside, &progress_call(json!({ "stage": "s" })));
+        assert_eq!(
+            result_text(&response),
+            result_text(&call(&mut outside, &status_call()))
+        );
+        let mut ctx = request_ctx();
+        ctx.store.delete_brigade(1).unwrap();
+        let response = call(&mut ctx, &progress_call(json!({ "stage": "s" })));
+        assert!(result_text(&response).contains("not"));
+        assert_eq!(stored_progress(&ctx), None);
+    }
+
+    #[test]
+    fn a_refused_write_names_what_was_wrong_and_leaves_the_last_progress_alone() {
+        let mut ctx = request_ctx();
+        call(&mut ctx, &progress_call(json!({ "stage": "first" })));
+        let long = "x".repeat(banto_core::progress::STAGE_MAX_CHARS + 1);
+        let many: Vec<Value> = (0..=banto_core::progress::TASKS_MAX)
+            .map(|n| json!({ "id": format!("T{n}"), "state": "todo" }))
+            .collect();
+        let cases: Vec<(Value, &str)> = vec![
+            (json!({}), "`stage` is required"),
+            (json!({ "stage": 3 }), "`stage` must be a string"),
+            (json!({ "stage": " \u{200b}" }), "nothing visible"),
+            (json!({ "stage": long }), "the limit is 200"),
+            (
+                json!({ "stage": "s", "tasks": "T1" }),
+                "`tasks` must be an array",
+            ),
+            (
+                json!({ "stage": "s", "tasks": [3] }),
+                "task 1 must be an object",
+            ),
+            (
+                json!({ "stage": "s", "tasks": [{ "state": "todo" }] }),
+                "task 1 is missing `id`",
+            ),
+            (
+                json!({ "stage": "s", "tasks": [{ "id": "T1", "state": "wip" }] }),
+                "todo, doing, blocked, done, dropped",
+            ),
+            (
+                json!({ "stage": "s", "tasks": [{ "id": "T1", "state": "todo", "note": 4 }] }),
+                "task 1's `note` must be a string",
+            ),
+            (
+                json!({ "stage": "s", "tasks": [
+                    { "id": "T1", "state": "todo" }, { "id": "T1", "state": "done" }
+                ] }),
+                "used twice",
+            ),
+            (json!({ "stage": "s", "tasks": many }), "the limit is 40"),
+            (
+                json!({ "stage": "s", "off_plan": "x" }),
+                "`off_plan` must be an array",
+            ),
+            (
+                json!({ "stage": "s", "off_plan": [1] }),
+                "`off_plan` item 1 must be a string",
+            ),
+            (
+                json!({ "stage": "s", "off_plan": ["a", " "] }),
+                "`off_plan` item 2",
+            ),
+        ];
+        for (arguments, expect) in cases {
+            let response = call(&mut ctx, &progress_call(arguments.clone()));
+            assert!(is_error(&response), "{arguments}");
+            let text = result_text(&response);
+            assert!(text.contains(expect), "{expect:?} not in {text:?}");
+        }
+        let record = stored_progress(&ctx).unwrap();
+        assert_eq!(record.progress.stage, "first");
+        assert_eq!(record.seq, 1, "no refused call was a write");
+    }
+
+    #[test]
+    fn progress_text_is_reduced_to_one_visible_line_each() {
+        let mut ctx = request_ctx();
+        call(
+            &mut ctx,
+            &progress_call(json!({
+                "stage": "phase\ntwo\u{1b}[31m",
+                "tasks": [{ "id": "T\u{202e}1", "state": "doing", "note": "a\r\nb" }],
+                "off_plan": ["x\ty"]
+            })),
+        );
+        let record = stored_progress(&ctx).unwrap();
+        assert_eq!(record.progress.stage, "phase two[31m");
+        assert_eq!(record.progress.tasks[0].id, "T1");
+        assert_eq!(record.progress.tasks[0].note, "a b");
+        assert_eq!(record.progress.off_plan, ["x y"]);
     }
 
     #[test]
@@ -5311,6 +5813,48 @@ mod tests {
             text.contains("from your brigade peer(s)"),
             "a mixed-role batch reads generically: {text:?}"
         );
+    }
+
+    #[test]
+    fn only_a_directors_inbox_carries_the_note_that_a_banto_started_turn_is_not_the_operator() {
+        let pulled = |recipient_token: &str, role: BrigadeRole, sender: &str, sender_role| {
+            let mut ctx = ctx("r", Some(1), Some(recipient_token), Some(role));
+            ctx.store
+                .add_brigade_member(1, sender, sender_role, None)
+                .unwrap();
+            ctx.store
+                .enqueue_brigade_message(1, sender, role, None, "hello")
+                .unwrap();
+            let response = call(
+                &mut ctx,
+                r#"{"jsonrpc":"2.0","id":50,"method":"tools/call",
+                    "params":{"name":"check_messages","arguments":{}}}"#,
+            );
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let director = pulled(
+            "director",
+            BrigadeRole::Director,
+            "worker-1",
+            BrigadeRole::Worker,
+        );
+        assert!(director.contains(DIRECTOR_QUIET_NOTE), "{director}");
+        assert!(director.contains("update_progress"), "{director}");
+        // Between the framing sentence and the first message, not after it.
+        let note_at = director.find(DIRECTOR_QUIET_NOTE).unwrap();
+        assert!(note_at < director.find("[from worker-1").unwrap());
+
+        let worker = pulled(
+            "worker-1",
+            BrigadeRole::Worker,
+            "director",
+            BrigadeRole::Director,
+        );
+        assert!(!worker.contains("update_progress"), "{worker}");
+        assert!(!worker.contains("nobody is waiting"), "{worker}");
     }
 
     #[test]

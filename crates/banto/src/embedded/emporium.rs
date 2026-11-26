@@ -1988,6 +1988,38 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
         // Conditional on the sequence, so an answer to an older request never
         // wipes a newer one; a failed write is silent, and the core has already
         // forgotten the request and will not take it back.
+        // The reading screen's body: the open request with its question and the
+        // Director's Progress. Ages are told here, by this process's clock, so
+        // that the core reads none. A failed read is the screen's to say, not a
+        // silence: it is open because the operator asked.
+        StoreIntent::ReadBrigadeReading { brigade_id } => {
+            let store = store.borrow();
+            let now_ms = unix_ms(SystemTime::now());
+            let result = (|| {
+                let decision = store.brigade_request_detail(brigade_id)?.map(|detail| {
+                    banto_core::progress::DecisionReading {
+                        seq: detail.seq,
+                        question: detail.question,
+                        age_ms: detail.requested_at_ms.map(|at| (now_ms - at).max(0)),
+                    }
+                });
+                let progress = store.brigade_progress(brigade_id)?.map(|record| {
+                    banto_core::progress::ProgressReading {
+                        age_ms: (now_ms - record.updated_at_ms).max(0),
+                        seq: record.seq,
+                        progress: record.progress,
+                    }
+                });
+                Ok::<_, banto_io::store::StoreError>(banto_core::progress::BrigadeReading {
+                    decision,
+                    progress,
+                })
+            })();
+            vec![Event::BrigadeReadingRead {
+                brigade_id,
+                result: result.map_err(|err| err.to_string()),
+            }]
+        }
         StoreIntent::ClearRequest { brigade_id, seq } => {
             let _ = store.borrow_mut().clear_request(brigade_id, seq);
             Vec::new()
@@ -2691,6 +2723,15 @@ fn gather_relay_observations_from(
             request,
             interrupts: interrupt_facts(&store.borrow(), brigade.id, unix_ms(SystemTime::now())),
             roster: members.iter().map(|member| member.token.clone()).collect(),
+            // An unreadable Progress reads as none for this tick: an open reading
+            // screen (whose counter pair then differs)
+            // reads its body again and says why it cannot. Not a `continue` like
+            // the request above, which would also hide this brigade's roster and
+            // interrupts from the core for a Progress row's sake.
+            progress: store
+                .borrow()
+                .brigade_progress_glance(brigade.id)
+                .unwrap_or(None),
         });
         for member in members {
             let Some(session_id) = member.session_id.as_ref() else {
@@ -4315,7 +4356,13 @@ fn draw(
             }
             _ => None,
         };
-        banto_tui::render_modal::render_modal(frame, modal, full_area, close.as_ref());
+        banto_tui::render_modal::render_modal(
+            frame,
+            modal,
+            full_area,
+            close.as_ref(),
+            Instant::now(),
+        );
     }
 
     frame_cursor
@@ -7227,6 +7274,7 @@ mod tests {
                     request: None,
                     interrupts: None,
                     roster: Vec::new(),
+                    progress: None,
                 }],
             },
             now,
@@ -8717,6 +8765,7 @@ mod tests {
                 request: None,
                 interrupts: Some(Vec::new()),
                 roster: vec!["director".to_string(), "worker-1".to_string()],
+                progress: None,
             })
         );
         assert_eq!(
@@ -8729,6 +8778,7 @@ mod tests {
                 request: None,
                 interrupts: Some(Vec::new()),
                 roster: vec!["director".to_string()],
+                progress: None,
             })
         );
         assert_eq!(by_id(3).map(|f| f.director_session), Some(None));
@@ -8739,8 +8789,8 @@ mod tests {
     fn a_tick_carries_each_brigades_open_request_from_the_store_and_nothing_a_director_wrote() {
         let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
         let other = store.borrow_mut().create_brigade("other").unwrap();
-        store.borrow_mut().set_request(1, "director").unwrap();
-        store.borrow_mut().set_request(1, "director").unwrap();
+        store.borrow_mut().set_request(1, "director", None).unwrap();
+        store.borrow_mut().set_request(1, "director", None).unwrap();
         let claude_home = tempfile::tempdir().unwrap();
         let home = ClaudeHome::new(claude_home.path().to_path_buf());
         let mut gathered = GlanceGate::default();
@@ -8766,8 +8816,8 @@ mod tests {
     #[test]
     fn answering_clears_the_store_only_while_it_is_still_that_request() {
         let (store, _, _) = staged_worker("w1", Some(AgentKind::ClaudeCode));
-        store.borrow_mut().set_request(1, "director").unwrap();
-        store.borrow_mut().set_request(1, "director").unwrap();
+        store.borrow_mut().set_request(1, "director", None).unwrap();
+        store.borrow_mut().set_request(1, "director", None).unwrap();
         let clear =
             |seq| execute_store_intent(StoreIntent::ClearRequest { brigade_id: 1, seq }, &store);
         assert!(clear(1).is_empty(), "no event comes back");
@@ -8803,6 +8853,7 @@ mod tests {
                     request: open.then_some(banto_core::engine::RequestFact { seq: 1 }),
                     interrupts: None,
                     roster: Vec::new(),
+                    progress: None,
                 }],
             },
             now,

@@ -37,7 +37,8 @@ tmux はターミナルのウィンドウマネージャです。banto は Claud
 banto は MCP 上でメンバー間のメッセージを中継します。各メンバーの起動時に `banto _mcp` へつなぎ、Claude Code には `--mcp-config`、Codex には `-c mcp_servers.banto.*` の上書きで渡します。メンバーは `send_to_peer`、`check_messages`、`brigade_status` を使えます。Director にはさらに次のツールがあります。
 
 - `consult_goinkyo` / `dismiss_goinkyo`
-- `request_decision`: あなたにしか下せない判断を Director が待つときのものです。banto はその Director に `▸ decision` タグを付け、そのペインで Enter を押すまで残します。Director は止めません
+- `request_decision`: あなたにしか下せない判断を Director が待つときのものです。banto はその Director に `▸ decision` タグを付け、そのペインで Enter を押すまで残します。Director は止めません。Director が添えた質問は、一覧ではなく読み取り画面（`F5`）で読めます
+- `update_progress`: Director が作業の状態（ステージの 1 行、状態付きのタスク、計画外の作業）を記録します。前のものは置き換わります。読み取り画面（`F5`）で読めるので、Director のペインは回答と判断のために空けておけます
 - `interrupt_worker`: Director が書いた理由をメッセージとして Worker に渡し、Claude の Worker には、リレーが `auto` のときだけ、それを読むまで次のツール呼び出しを banto が断ります（最大 3 回）。ターンを止めることも、実行中の呼び出しを切ることもできません。リレーが `manual` の場合と Codex の Worker には、通常のメッセージとして届くだけで、何も断られません
 - `name_member`: Worker の常設の役割に表示名を付けます（宛先は引き続きトークンです）
 
@@ -171,6 +172,7 @@ banto を終了し、同じインストール行を実行して、banto をま�
 | `B` / `b` | Director を任命し、Worker を自動起動する（Director の上では: 解散（disband））/ stage 済みの Brigade に Worker をもうひとつ起こす |
 | `x` | 選択した行が動かしているものを終了する（確認あり）。Director では**その Brigade を畳む**（Close Brigade）。Brigade のすべてのプロセスが終わり、何も削除されないので、Director の行で Enter を押せばすべてが戻る。ペインが開いている単独のセッションでは、そのプロセスを終了する。Worker を Brigade から外すことは決してない。それには、その Worker のタイルで `Ctrl+B x` を使う |
 | `F2` / `F3` / `F4` | フォーカスを一覧とペインの間で移動する / stage 済みの Brigade の次のペインを現在のペインにする / Director のペインにフォーカスがあってもベルを鳴らす（切り替え） |
+| `F5` | Brigade の未回答の判断と Progress を、読み取り専用の画面で読む。一覧からは選択行の Brigade（なければ stage 済みのもの）、ペインからは stage 済みのものを読む。矢印、`j`/`k`、`PgUp`/`PgDn`、`Home`/`End` でスクロールし、`Esc` で閉じる。判断が開いているときは `Enter` で閉じて Director のペインへ移る。画面を開くだけでは何も起動も再開もしない |
 | `Ctrl+B` … | tmux 風のプレフィックス（設定可能）。一覧からでもペインからでも使える: |
 | … `o`/`Tab`、矢印 | サイドバーとペインの間でフォーカスを順に移す / 方向を指定してペインを移動する |
 | … `Shift`+`Up`/`Down` | フォーカス中のスタックのタイルを 1 つ上/下へ動かす |

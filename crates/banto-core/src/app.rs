@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::model::{Activity, AgentKind, SessionRow};
+use crate::reading::ReadingState;
 
 /// A group id, mirroring `banto_io::store::GroupId` (`i64`) without
 /// coupling `App` to the store crate's types.
@@ -147,6 +148,12 @@ pub enum Modal {
         /// plain kill prompt (see above).
         dismisses: Option<String>,
     },
+    /// The F5 reading screen: what a brigade's Director asked the operator and
+    /// how far its work is, read-only. Not a dialog the operator answers: it takes
+    /// no text and confirms nothing but a jump to the Director's pane, and it is
+    /// kept in this family so that, like the others, it is the only thing taking
+    /// keys while it is open.
+    Reading(ReadingState),
     /// The emporium's Worker picker for `[brigade] worker_agent = "select"`:
     /// choose which product the *Workers* about to be created (not the
     /// Director — that's already whatever session was promoted) will run
@@ -1230,6 +1237,7 @@ impl App {
             | Some(Modal::ConfirmKill { .. })
             | Some(Modal::ConfirmCodexTrust)
             | Some(Modal::ConfirmDirectorReopen { .. })
+            | Some(Modal::Reading(_))
             | None => {}
         }
     }
@@ -1778,6 +1786,26 @@ impl App {
     /// [`Modal::ConfirmCloseBrigade`].
     pub fn open_confirm_close_brigade_modal(&mut self, brigade_id: i64, name: String) {
         self.modal = Some(Modal::ConfirmCloseBrigade { brigade_id, name });
+    }
+
+    /// Open the reading screen — see [`Modal::Reading`].
+    pub fn open_reading_modal(&mut self, state: ReadingState) {
+        self.modal = Some(Modal::Reading(state));
+    }
+
+    /// The open reading screen, if that is the modal that is open.
+    pub fn reading(&self) -> Option<&ReadingState> {
+        match &self.modal {
+            Some(Modal::Reading(state)) => Some(state),
+            _ => None,
+        }
+    }
+
+    pub fn reading_mut(&mut self) -> Option<&mut ReadingState> {
+        match &mut self.modal {
+            Some(Modal::Reading(state)) => Some(state),
+            _ => None,
+        }
     }
 
     /// Open the emporium's Codex-hook-trust confirm dialog — see

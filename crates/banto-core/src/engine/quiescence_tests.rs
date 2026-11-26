@@ -53,6 +53,7 @@ fn listed(state: &EmporiumState) -> Vec<BrigadeNameFacts> {
             request: stored_request(brigade_id),
             interrupts: None,
             roster: Vec::new(),
+            progress: None,
         })
         .collect()
 }
@@ -3437,6 +3438,7 @@ fn a_brigade_nothing_hosts_yet_shows_its_stored_request_on_its_directors_row_wit
         request: stored_request(9),
         interrupts: None,
         roster: Vec::new(),
+        progress: None,
     };
     let cmds = send(
         &mut state,
@@ -10996,9 +10998,10 @@ fn an_input_only_question_goes_when_the_stamp_is_three_seconds_old_not_when_its_
 
 #[test]
 fn keys_that_reach_a_child_as_nothing_still_stamp_the_operators_input() {
-    // `F1` and `F5`..`F12` encode to no bytes: the child is told nothing, yet
+    // `F1` and `F6`..`F12` encode to no bytes: the child is told nothing, yet
     // the stamp the quit question reads is set (see `took_input_recently`).
-    for code in [KeyCode::F(1), KeyCode::F(5), KeyCode::F(12)] {
+    // `F5` is banto's own key (the reading screen) and never reaches a pane.
+    for code in [KeyCode::F(1), KeyCode::F(6), KeyCode::F(12)] {
         let (mut state, mut app, a, _b, at) = typing_fixture();
         let cmds = press(&mut state, &mut app, code, at);
         assert!(!typed_into(&cmds, &a), "{code:?}: wrote {cmds:?}");

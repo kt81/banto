@@ -38,9 +38,20 @@ use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
 
 /// What `brigades.request_text` holds while a Director's request is open. A
 /// constant: the request is the fact that the brigade is waiting on the operator's
-/// decision, never anything an agent wrote (the question is in the Director's own
-/// pane).
+/// decision, and nothing an agent wrote decides whether one is open. The question a
+/// Director may attach lives in its own column (`request_question`), so that a
+/// hand-edited or oversized question can never change what the tick reads.
 pub const REQUEST_OPEN: &str = "open";
+
+/// A brigade's open decision request as the reading screen reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestDetail {
+    pub seq: i64,
+    /// What the Director attached, `None` when it attached no question.
+    pub question: Option<String>,
+    /// When the request was made, `None` for a row whose time is not a number.
+    pub requested_at_ms: Option<i64>,
+}
 
 /// An `interrupt_worker` request the UI has not decided or its Worker has not read,
 /// as the UI reads it each tick.
@@ -224,26 +235,31 @@ impl Store {
         tx.execute("DELETE FROM brigade_members WHERE brigade_id = ?1", [id])?;
         tx.execute("DELETE FROM brigade_messages WHERE brigade_id = ?1", [id])?;
         tx.execute("DELETE FROM brigade_cursors WHERE brigade_id = ?1", [id])?;
+        tx.execute("DELETE FROM brigade_progress WHERE brigade_id = ?1", [id])?;
         tx.execute("DELETE FROM brigades WHERE id = ?1", [id])?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Records that a Director is waiting on the operator's decision. Only that
-    /// fact is stored, never anything the Director wrote: `request_text` holds the
-    /// constant [`REQUEST_OPEN`] while a request is open and is NULL when none is,
-    /// `request_seq` counts requests (so a second call is a new request even though
-    /// nothing in the row differs) and `request_at_ms` stamps the time. One
-    /// `BEGIN IMMEDIATE` transaction, so two writers get two numbers. Returns the
-    /// new sequence, `None` when there is no such brigade or `director_token` is
-    /// not, in that same transaction, the brigade's Director: the caller checked
-    /// its role a moment before, and a membership that has changed since (the
-    /// brigade disbanded, the member removed) is not written as. Lives on the
-    /// brigade's own row, so disbanding takes it with it.
+    /// Records that a Director is waiting on the operator's decision.
+    /// `request_text` holds the constant [`REQUEST_OPEN`] while a request is open
+    /// and is NULL when none is, `request_seq` counts requests (so a second call is
+    /// a new request even though nothing in the row differs) and `request_at_ms`
+    /// stamps the time. `question` is the text the Director attached, already
+    /// reduced by `banto_core::progress::check_question`, or `None`: it replaces
+    /// whatever an earlier request held, so a second request with no question does
+    /// not show the first one's. One `BEGIN IMMEDIATE` transaction, so two writers
+    /// get two numbers. Returns the new sequence, `None` when there is no such
+    /// brigade or `director_token` is not, in that same transaction, the
+    /// brigade's Director: the caller checked its role a moment before, and a
+    /// membership that has changed since (the brigade disbanded, the member
+    /// removed) is not written as. Lives on the brigade's own row, so disbanding
+    /// takes it with it.
     pub fn set_request(
         &mut self,
         brigade_id: BrigadeId,
         director_token: &str,
+        question: Option<&str>,
     ) -> Result<Option<i64>, StoreError> {
         let tx = self
             .conn
@@ -260,12 +276,14 @@ impl Store {
         // CAST: whatever a hand-edited column holds reads as an integer.
         let changed = tx.execute(
             "UPDATE brigades SET request_text = ?2, \
-             request_seq = CAST(request_seq AS INTEGER) + 1, request_at_ms = ?3 \
+             request_seq = CAST(request_seq AS INTEGER) + 1, request_at_ms = ?3, \
+             request_question = ?4 \
              WHERE id = ?1",
             params![
                 brigade_id,
                 REQUEST_OPEN,
-                system_time_to_unix_ms(SystemTime::now())
+                system_time_to_unix_ms(SystemTime::now()),
+                question
             ],
         )?;
         if changed == 0 {
@@ -286,7 +304,7 @@ impl Store {
     /// when a request was cleared.
     pub fn clear_request(&mut self, brigade_id: BrigadeId, seq: i64) -> Result<bool, StoreError> {
         let changed = self.conn.execute(
-            "UPDATE brigades SET request_text = NULL \
+            "UPDATE brigades SET request_text = NULL, request_question = NULL \
              WHERE id = ?1 AND CAST(request_seq AS INTEGER) = ?2 AND request_text IS NOT NULL",
             params![brigade_id, seq],
         )?;
@@ -309,6 +327,37 @@ impl Store {
             )
             .optional()?;
         Ok(row.and_then(|(open, seq)| open.then_some(seq)))
+    }
+
+    /// What the brigade's open request holds for the reading screen: its sequence,
+    /// the question the Director attached (`None` when it attached none), and when
+    /// it was made. `None` when no request is open, or there is no such brigade.
+    ///
+    /// Read only while the screen is open, never by the tick, so unlike
+    /// [`Self::brigade_request`] it reads the text: bytes that are not text in the
+    /// column fail this read (the screen then says it could not read), not the
+    /// tick's.
+    pub fn brigade_request_detail(
+        &self,
+        brigade_id: BrigadeId,
+    ) -> Result<Option<RequestDetail>, StoreError> {
+        let row: Option<(bool, i64, Option<String>, Option<i64>)> = self
+            .conn
+            .query_row(
+                "SELECT request_text IS NOT NULL, CAST(request_seq AS INTEGER), \
+                 request_question, CAST(request_at_ms AS INTEGER) \
+                 FROM brigades WHERE id = ?1",
+                [brigade_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(open, seq, question, at_ms)| {
+            open.then_some(RequestDetail {
+                seq,
+                question,
+                requested_at_ms: at_ms,
+            })
+        }))
     }
 
     /// Returns all brigades, oldest first (creation order).
@@ -946,6 +995,7 @@ impl Store {
         for id in &empty_ids {
             tx.execute("DELETE FROM brigade_messages WHERE brigade_id = ?1", [id])?;
             tx.execute("DELETE FROM brigade_cursors WHERE brigade_id = ?1", [id])?;
+            tx.execute("DELETE FROM brigade_progress WHERE brigade_id = ?1", [id])?;
             tx.execute("DELETE FROM brigades WHERE id = ?1", [id])?;
         }
         tx.commit()?;
@@ -2266,12 +2316,12 @@ mod tests {
         let br = briefed(&mut store);
         assert_eq!(store.brigade_request(br).unwrap(), None);
         assert_eq!(held(&store, br), None);
-        assert_eq!(store.set_request(br, "director").unwrap(), Some(1));
+        assert_eq!(store.set_request(br, "director", None).unwrap(), Some(1));
         assert_eq!(store.brigade_request(br).unwrap(), Some(1));
-        // Never anything a caller wrote: the one value there is.
+        // Whatever a question says, the column the tick reads holds the one value.
         assert_eq!(held(&store, br).as_deref(), Some(REQUEST_OPEN));
         // A second call is a new request: the sequence is what says so.
-        assert_eq!(store.set_request(br, "director").unwrap(), Some(2));
+        assert_eq!(store.set_request(br, "director", None).unwrap(), Some(2));
         assert_eq!(store.brigade_request(br).unwrap(), Some(2));
         assert_eq!(held(&store, br).as_deref(), Some(REQUEST_OPEN));
         let at: Option<i64> = store
@@ -2284,7 +2334,54 @@ mod tests {
             .unwrap();
         assert!(at.is_some_and(|ms| ms > 0), "the time is recorded: {at:?}");
         // No brigade, no request.
-        assert_eq!(store.set_request(br + 100, "director").unwrap(), None);
+        assert_eq!(store.set_request(br + 100, "director", None).unwrap(), None);
+    }
+
+    #[test]
+    fn a_question_lives_and_dies_with_its_request_and_never_leaks_into_the_next() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = briefed(&mut store);
+        assert_eq!(store.brigade_request_detail(br).unwrap(), None);
+        let asked = "Ship it?\n- yes\n- no";
+        assert_eq!(
+            store.set_request(br, "director", Some(asked)).unwrap(),
+            Some(1)
+        );
+        let detail = store.brigade_request_detail(br).unwrap().unwrap();
+        assert_eq!(detail.seq, 1);
+        assert_eq!(detail.question.as_deref(), Some(asked));
+        assert!(detail.requested_at_ms.is_some_and(|ms| ms > 0));
+        // The tick's column is the constant whatever the question says.
+        assert_eq!(held(&store, br).as_deref(), Some(REQUEST_OPEN));
+        // A second request with no question does not show the first one's.
+        assert_eq!(store.set_request(br, "director", None).unwrap(), Some(2));
+        assert_eq!(
+            store.brigade_request_detail(br).unwrap().unwrap().question,
+            None
+        );
+        // An answer clears it with the request; a stale answer does not.
+        store.set_request(br, "director", Some("again")).unwrap();
+        assert!(!store.clear_request(br, 2).unwrap());
+        assert_eq!(
+            store
+                .brigade_request_detail(br)
+                .unwrap()
+                .unwrap()
+                .question
+                .as_deref(),
+            Some("again")
+        );
+        assert!(store.clear_request(br, 3).unwrap());
+        assert_eq!(store.brigade_request_detail(br).unwrap(), None);
+        let left: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT request_question FROM brigades WHERE id = ?1",
+                [br],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, None);
     }
 
     #[test]
@@ -2297,10 +2394,10 @@ mod tests {
             .unwrap();
         // The tool checked the role a moment ago; the write checks it again, in its
         // own transaction, so a membership that has changed since is not written as.
-        assert_eq!(store.set_request(br, &worker).unwrap(), None);
-        assert_eq!(store.set_request(br, "goinkyo").unwrap(), None);
+        assert_eq!(store.set_request(br, &worker, None).unwrap(), None);
+        assert_eq!(store.set_request(br, "goinkyo", None).unwrap(), None);
         assert_eq!(store.brigade_request(br).unwrap(), None);
-        assert_eq!(store.set_request(br, "director").unwrap(), Some(1));
+        assert_eq!(store.set_request(br, "director", None).unwrap(), Some(1));
         // The Director leaves the brigade between the check and the write.
         store
             .conn
@@ -2309,7 +2406,7 @@ mod tests {
                 [br],
             )
             .unwrap();
-        assert_eq!(store.set_request(br, "director").unwrap(), None);
+        assert_eq!(store.set_request(br, "director", None).unwrap(), None);
         assert_eq!(
             store.brigade_request(br).unwrap(),
             Some(1),
@@ -2321,8 +2418,8 @@ mod tests {
     fn a_request_is_cleared_only_by_the_sequence_that_was_answered() {
         let mut store = Store::open_in_memory().unwrap();
         let br = briefed(&mut store);
-        store.set_request(br, "director").unwrap();
-        store.set_request(br, "director").unwrap();
+        store.set_request(br, "director", None).unwrap();
+        store.set_request(br, "director", None).unwrap();
         // The answer was to the first: a newer request is never wiped by it.
         assert!(!store.clear_request(br, 1).unwrap());
         assert_eq!(store.brigade_request(br).unwrap(), Some(2));
@@ -2330,19 +2427,19 @@ mod tests {
         assert_eq!(store.brigade_request(br).unwrap(), None);
         // Clearing twice is harmless, and the next request still has a new number.
         assert!(!store.clear_request(br, 2).unwrap());
-        assert_eq!(store.set_request(br, "director").unwrap(), Some(3));
+        assert_eq!(store.set_request(br, "director", None).unwrap(), Some(3));
     }
 
     #[test]
     fn a_disbanded_brigade_takes_its_request_with_it() {
         let mut store = Store::open_in_memory().unwrap();
         let br = briefed(&mut store);
-        store.set_request(br, "director").unwrap();
+        store.set_request(br, "director", None).unwrap();
         store.delete_brigade(br).unwrap();
         assert_eq!(store.brigade_request(br).unwrap(), None);
         // A new brigade has its own, from the start.
         let other = briefed(&mut store);
-        assert_eq!(store.set_request(other, "director").unwrap(), Some(1));
+        assert_eq!(store.set_request(other, "director", None).unwrap(), Some(1));
     }
 
     #[test]
@@ -2358,7 +2455,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.brigade_request(br).unwrap(), Some(7));
-        assert_eq!(store.set_request(br, "director").unwrap(), Some(8));
+        assert_eq!(store.set_request(br, "director", None).unwrap(), Some(8));
         // Bytes that are not valid text in the column: the value is never read, so
         // it cannot fail the read (which would drop the brigade from every tick).
         store

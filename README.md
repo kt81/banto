@@ -81,7 +81,11 @@ Director also gets:
 
 - `consult_goinkyo` / `dismiss_goinkyo`
 - `request_decision`: the Director needs a decision only you can make; banto tags it
-  `▸ decision` until you press Enter in its pane, and does not stop it
+  `▸ decision` until you press Enter in its pane, and does not stop it. The question
+  it passes along is read on the reading screen (`F5`), not in the list
+- `update_progress`: the Director records the state of the work (a stage line, tasks
+  with their states, work outside the plan), replacing the previous one. You read it
+  on the reading screen (`F5`), so the Director's pane is left for answers and decisions
 - `interrupt_worker`: delivers the Director's reason to a Worker as a message and
   has banto refuse a Claude Worker's next tool calls (up to 3) until it reads it, only
   with relay `auto`. It cannot stop a turn or cut a call that is running; with relay
@@ -331,6 +335,7 @@ given up to 5 seconds to finish.
 | `B` / `b` | Appoint Director + auto-spawn Workers (on a Director: disband) / spawn one more Worker into the staged brigade |
 | `x` | End what the selected row runs (confirm). On a Director: **close its brigade**: every process of the brigade ends, nothing is deleted, and Enter on the Director's row brings it all back. On a single session with an open pane: end its process. It never dismisses a Worker; use `Ctrl+B x` on that Worker's tile |
 | `F2` / `F3` / `F4` | Move focus between the list and the panes / make the next pane of the staged brigade the current one / ring the brigade bell even while the Director's pane is focused (toggle) |
+| `F5` | Read a brigade's open decision and Progress on a read-only screen, from the list (the selected row's brigade, else the staged one) or from a pane (the staged one). Arrows, `j`/`k`, `PgUp`/`PgDn`, `Home`/`End` scroll; `Esc` closes it; with a decision open, `Enter` closes it and goes to the Director's pane. Opening the screen starts and resumes nothing |
 | `Ctrl+B` … | tmux-style prefix (configurable), from the list or a pane: |
 | … `o`/`Tab`, arrows | cycle focus through sidebar and panes / directional pane navigation |
 | … `Shift`+`Up`/`Down` | move the focused stack tile one slot up/down |

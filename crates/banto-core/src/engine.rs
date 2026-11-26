@@ -45,6 +45,8 @@ use crate::model::{
 };
 use crate::pane_log::PaneFacts;
 use crate::program_state::ReportedState;
+use crate::progress::{BrigadeReading, ProgressGlance};
+use crate::reading::{ReadingState, reading_max_scroll, reading_text_size};
 
 pub use crate::layout::{
     Areas, Axis, Boundary, BrigadeLayout, ButtonKind, COLLAPSED_TILE_HEIGHT,
@@ -601,6 +603,14 @@ pub struct BrigadeNameFacts {
     /// stream recorded before it existed, which reads as "nobody is on the roster".
     #[serde(default)]
     pub roster: Vec<MemberToken>,
+    /// The write count and stage line of the brigade's Director's Progress, as the
+    /// store held them when the tick read it (`None`: none written, or a stream
+    /// recorded before Progress existed). The count says whether the reading
+    /// screen's body is stale; nothing draws the stage line yet (the list row
+    /// was too narrow for it, "Decision (2026-11-26)"). The rest of the Progress
+    /// is read only while the screen is open.
+    #[serde(default)]
+    pub progress: Option<ProgressGlance>,
 }
 
 /// One `interrupt_worker` request the UI has not decided or its Worker has not
@@ -645,9 +655,9 @@ fn yes() -> bool {
 
 /// A Director's open request for a decision as the store holds it: the sequence
 /// number its `set_request` gave it. Nothing a Director wrote travels here (the
-/// request is the fact that the brigade waits on the operator, and the question is
-/// in the Director's own pane), so a recording of a tick holds nothing a Director
-/// wrote through this path.
+/// request is the fact that the brigade waits on the operator; the question is read
+/// from the store only while the reading screen is open), so a recording of a tick
+/// holds nothing a Director wrote through this path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestFact {
     pub seq: i64,
@@ -3753,6 +3763,13 @@ pub enum StoreIntent {
         brigade_id: BrigadeId,
         seq: i64,
     },
+    /// Read what the reading screen shows for `brigade_id`: the open request with
+    /// its question and the Director's Progress, answered by
+    /// [`Event::BrigadeReadingRead`]. Issued when the screen opens and whenever the
+    /// tick sees one of its two counters change while it is open.
+    ReadBrigadeReading {
+        brigade_id: BrigadeId,
+    },
     /// Persist the agent the Worker picker was last confirmed with
     /// (`Store::set_last_worker_agent`).
     SaveLastWorkerAgent {
@@ -4330,6 +4347,12 @@ pub enum Event {
         group_id: GroupId,
         name: String,
         result: Result<(), String>,
+    },
+    /// Answers `Cmd::Store(StoreIntent::ReadBrigadeReading)`. An answer for a brigade
+    /// whose screen is no longer open is dropped.
+    BrigadeReadingRead {
+        brigade_id: BrigadeId,
+        result: Result<BrigadeReading, String>,
     },
     MembershipResolved {
         session_id: String,
@@ -4926,6 +4949,9 @@ pub fn update(
             held_by_row,
         } => update_pane_session_moved(state, (old_id, new_id), held_by_row, now),
         Event::Tick { relay, brigades } => update_tick(state, app, brigade, relay, brigades, now),
+        Event::BrigadeReadingRead { brigade_id, result } => {
+            update_reading_read(state, app, brigade_id, result, now)
+        }
         Event::QuiescenceSampled { samples } => {
             // Only stored: the brigade-quiet decision is made by the tick that
             // follows it, once the relay has decided what to type this second.
@@ -5014,6 +5040,7 @@ pub fn update(
         cmds.extend(sync_brigade_marks(state, app, now));
         sync_request_rows(state, app);
     }
+    cmds.extend(refresh_reading(state, app));
     cmds.extend(refresh_waiting_display(state, app, now));
     cmds.extend(emit_focus_transitions(state));
     cmds
@@ -5579,6 +5606,194 @@ fn sync_request_rows(state: &EmporiumState, app: &mut App) {
         })
         .collect();
     app.set_request_rows(rows);
+}
+
+/// The two counters whose change makes the reading screen's body stale, as the
+/// last tick read them: the open request's sequence number (the question is
+/// stored with it, so it cannot change under the same number) and the Progress
+/// write count.
+fn reading_trigger(state: &EmporiumState, brigade_id: BrigadeId) -> (Option<i64>, Option<i64>) {
+    (
+        state.requests.get(&brigade_id).copied(),
+        state
+            .brigade_names
+            .get(&brigade_id)
+            .and_then(|facts| facts.progress.as_ref())
+            .map(|glance| glance.seq),
+    )
+}
+
+/// The brigade F5 reads: with a pane focused, the staged one; from the list, the
+/// one the selected row belongs to (a Director's row by the session id the
+/// roster names, or a hosted member's pane), and only when the row belongs to
+/// none, the staged one. Reading a brigade stages nobody.
+fn reading_target(state: &EmporiumState, app: &App) -> Option<BrigadeId> {
+    let staged = match &state.stage {
+        Stage::Brigade { id, .. } => Some(*id),
+        _ => None,
+    };
+    if state.focus == Focus::Pane {
+        return staged;
+    }
+    let of_row = app.selected_row().and_then(|row| {
+        state
+            .brigade_names
+            .iter()
+            .find(|(_, facts)| facts.director_session.as_deref() == Some(row.id.as_str()))
+            .map(|(id, _)| *id)
+            .or_else(|| {
+                state
+                    .member_brigades
+                    .get(&SessionKey::from_id(&row.id))
+                    .copied()
+            })
+    });
+    of_row.or(staged)
+}
+
+/// F5: open the reading screen on the brigade [`reading_target`] names and ask
+/// the store for its body, or say there is nothing to read.
+fn open_reading(state: &mut EmporiumState, app: &mut App, now: Instant) -> Vec<Cmd> {
+    let Some(brigade_id) = reading_target(state, app) else {
+        state.set_status(
+            "no brigade to read: select a Director or stage a brigade first",
+            now,
+        );
+        return Vec::new();
+    };
+    let name = state.brigade_name(app, brigade_id);
+    app.open_reading_modal(ReadingState::new(
+        brigade_id,
+        name,
+        reading_trigger(state, brigade_id),
+    ));
+    vec![Cmd::Store(StoreIntent::ReadBrigadeReading { brigade_id })]
+}
+
+/// The tick (or an answered request) may have moved a counter the open screen's
+/// body was read for: read it again, so what is on screen is what the store
+/// holds. Nothing while no screen is open, so the store is read for it only
+/// while someone is looking.
+fn refresh_reading(state: &EmporiumState, app: &mut App) -> Vec<Cmd> {
+    let Some(reading) = app.reading_mut() else {
+        return Vec::new();
+    };
+    let brigade_id = reading.brigade_id();
+    let now_trigger = reading_trigger(state, brigade_id);
+    if reading.asked() == now_trigger {
+        return Vec::new();
+    }
+    reading.set_asked(now_trigger);
+    vec![Cmd::Store(StoreIntent::ReadBrigadeReading { brigade_id })]
+}
+
+fn update_reading_read(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade_id: BrigadeId,
+    result: Result<BrigadeReading, String>,
+    now: Instant,
+) -> Vec<Cmd> {
+    let answered = state.request_answered.get(&brigade_id).copied();
+    let size = state.size;
+    let Some(reading) = app.reading_mut() else {
+        return Vec::new();
+    };
+    if reading.brigade_id() != brigade_id {
+        return Vec::new();
+    }
+    match result {
+        Ok(mut body) => {
+            // The operator's Enter has already answered it here; the store's clear
+            // is on its way and the read may have come first.
+            if body
+                .decision
+                .as_ref()
+                .is_some_and(|d| answered.is_some_and(|answered| d.seq <= answered))
+            {
+                body.decision = None;
+            }
+            reading.set_loaded(body, now);
+        }
+        Err(reason) => reading.set_unreadable(reason),
+    }
+    // The text may have got shorter than the position the operator had scrolled to.
+    let max = reading_max_scroll(reading, now, size);
+    if reading.scroll() > max {
+        reading.set_scroll(max);
+    }
+    Vec::new()
+}
+
+/// A key on the reading screen: scroll, Esc to close, Enter to go to the
+/// Director's pane while a decision is open. Nothing else does anything, and
+/// nothing reaches a pane.
+fn update_reading_key(
+    state: &mut EmporiumState,
+    app: &mut App,
+    code: KeyCode,
+    mods: Modifiers,
+    now: Instant,
+) -> Vec<Cmd> {
+    if code == KeyCode::Esc {
+        app.close_modal();
+        return Vec::new();
+    }
+    if mods.ctrl || mods.alt {
+        return Vec::new();
+    }
+    let size = state.size;
+    let (_, page) = reading_text_size(Rect::new(0, 0, size.0, size.1));
+    let page = page.saturating_sub(1).max(1);
+    let Some(reading) = app.reading_mut() else {
+        return Vec::new();
+    };
+    let max = reading_max_scroll(reading, now, size);
+    let at = reading.scroll().min(max);
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => reading.set_scroll(at.saturating_sub(1)),
+        KeyCode::Down | KeyCode::Char('j') => reading.set_scroll((at + 1).min(max)),
+        KeyCode::PageUp => reading.set_scroll(at.saturating_sub(page)),
+        KeyCode::PageDown => reading.set_scroll((at + page).min(max)),
+        KeyCode::Home => reading.set_scroll(0),
+        KeyCode::End => reading.set_scroll(max),
+        KeyCode::Enter => {
+            if !reading.decision_open() {
+                return Vec::new();
+            }
+            let brigade_id = reading.brigade_id();
+            app.close_modal();
+            return go_to_director(state, app, brigade_id, now);
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// Go to `brigade_id`'s Director's pane the way Enter on its row does: the same
+/// membership round trip, so a brigade nothing hosts yet is staged and its
+/// Director resumed, and a staged one just comes forward.
+fn go_to_director(
+    state: &mut EmporiumState,
+    app: &App,
+    brigade_id: BrigadeId,
+    now: Instant,
+) -> Vec<Cmd> {
+    let session = director_pane_of(state, brigade_id)
+        .map(|key| key.as_str().to_string())
+        .or_else(|| {
+            state
+                .brigade_names
+                .get(&brigade_id)
+                .and_then(|facts| facts.director_session.clone())
+        })
+        .filter(|session| app.row_for_id(session).is_some());
+    let Some(session_id) = session else {
+        state.set_status("the Director's session is not in the list yet", now);
+        return Vec::new();
+    };
+    state.pending_membership = Some((PendingMembership::Activate, session_id.clone()));
+    vec![Cmd::Store(StoreIntent::ResolveMembership { session_id })]
 }
 
 /// Mark the Directors' rows of the brigades that want the operator, and ring for
@@ -6173,6 +6388,11 @@ fn update_key(
         );
         return Vec::new();
     }
+    // The same standing as F4: one keystroke from either focus, never forwarded
+    // to a pane's child, taken after a modal, the search box and an armed prefix.
+    if code == KeyCode::F(5) {
+        return open_reading(state, app, now);
+    }
     if code == KeyCode::F(3) {
         let collapsed = state.pane_collapsed();
         if let Stage::Brigade { panes, focused, .. } = &mut state.stage
@@ -6490,6 +6710,11 @@ fn update_modal_key(
     mods: Modifiers,
     now: Instant,
 ) -> Vec<Cmd> {
+    // Before the Ctrl chords below, which would swap this screen for a dialog
+    // about a group the operator is not looking at.
+    if matches!(app.modal(), Some(Modal::Reading(_))) {
+        return update_reading_key(state, app, code, mods, now);
+    }
     if mods.ctrl {
         match code {
             KeyCode::Char('r') => app.open_group_rename_modal(),
@@ -6592,7 +6817,9 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App, now: Instant) -> Vec<
         Some(Modal::WorkerAgentPicker(_)) => Some(Kind::WorkerAgent),
         Some(Modal::ConfirmCodexTrust) => Some(Kind::CodexTrust),
         Some(Modal::ConfirmDirectorReopen { .. }) => Some(Kind::DirectorReopen),
-        None => None,
+        // Enter on the reading screen is handled by its own key arm before it can
+        // get here; spelled out so a new modal has to choose.
+        Some(Modal::Reading(_)) | None => None,
     };
     match kind {
         Some(Kind::Archive) => confirm_archive_modal(app),
@@ -10506,6 +10733,7 @@ fn update_brigade_formed(
             request: None,
             interrupts: None,
             roster: Vec::new(),
+            progress: None,
         },
     );
     // A brigade formed in this run had no request when it was formed, so one that
@@ -12315,6 +12543,9 @@ mod newline_integration_tests;
 mod small_tile_tests;
 #[cfg(test)]
 mod untitled_session_tests;
+
+#[cfg(test)]
+mod reading_tests;
 
 #[cfg(test)]
 mod tests {
@@ -23231,6 +23462,7 @@ mod tests {
             request: None,
             interrupts: None,
             roster: Vec::new(),
+            progress: None,
         }
     }
 

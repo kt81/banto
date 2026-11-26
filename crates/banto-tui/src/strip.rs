@@ -182,9 +182,9 @@ fn parts_width(parts: &[(String, Color)]) -> usize {
 }
 
 /// The fixed tag a Director's tile and list row carry while its brigade waits on
-/// the operator's decision. A constant: no agent-written text reaches the screen
-/// (the question is in the Director's own pane), so it is the same on every row,
-/// is never cut and has no ellipsis.
+/// the operator's decision. A constant: the question does not reach the title row
+/// or the list row (it is drawn only on the reading screen), so the tag is the
+/// same on every row, is never cut and has no ellipsis.
 pub const REQUEST_TAG: &str = "\u{25b8} decision";
 
 /// The title row's status with the request tag after it: `Claude · busy ·

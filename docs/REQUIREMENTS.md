@@ -657,30 +657,39 @@ implementer's.
    safe by banto (control and format characters dropped, whitespace folded, cut on a
    cluster boundary), stored on the brigade, carried in the tick and drawn on the
    Director's list row and title row; it was tried and dropped for those reasons,
-   with its sanitising, its caps and the text it carried.
+   with its sanitising, its caps and the text it carried. *Revisited 2026-11-26:* a
+   place wide enough now exists, the reading screen, and the question is stored and
+   drawn there and nowhere else; the list row and the title row still carry the fixed
+   tag only ("Decision (2026-11-26)").
 6. **The default Director briefing's second point:** when the operator alone can
-   decide and work stops on it, write the question in your own output and then call
-   `request_decision`; it shows the operator that you are waiting, not the question,
-   and does not block. An operator's own `director_prompt` is not touched.
+   decide and work stops on it, write the question in your own output first and then
+   call `request_decision` with that same text as `question`; the list shows only that
+   you are waiting, and the call does not block. (Until 2026-11-26 it said to write
+   the question in the pane and that the tool "shows the operator that you are
+   waiting, not the question".) An operator's own `director_prompt` is not touched.
 
-*What the code does.* The tool takes no parameters and records only that the brigade
-is waiting on the operator's decision; the Director writes the question in its own
-pane first, and the tool's description and result say so. A caller that still sends
-`text` (an agent briefed by an older prompt) has it ignored, and nothing an agent
-wrote is stored, carried or drawn through this path. It resolves the caller by the
+*What the code does.* The tool records that the brigade is waiting on the operator's
+decision. Its one optional parameter, `question`, was added on 2026-11-26 ("Decision
+(2026-11-26)"); the Director also writes the question in its own pane, where the
+operator answers, and the tool's description and result say so. A caller that still
+sends `text` (an agent briefed by an older prompt) has it ignored, and `question` is
+the only text of the Director's that this path stores; it is never carried in the
+tick and is drawn only on the reading screen. It resolves the caller by the
 store's live membership (a Worker or a Goinkyo gets a tool error; outside a brigade,
 or in a disbanded one, the usual refusal), and `Store::set_request` re-checks inside
 its own transaction that the caller's token is still the brigade's Director, and
 writes nothing otherwise. The store keeps it on the brigade: `brigades.request_text`
 holds the constant `open` while a request is open and NULL otherwise, `request_seq`
 counts requests (so a second call is a new request though nothing in the row
-differs), `request_at_ms` stamps the time, there is no migration, and an open
+differs), `request_at_ms` stamps the time, it needed no migration when it landed
+(v24 later added `request_question` beside it), and an open
 request is "not NULL", so a hand-edited value cannot fail the read;
 `Store::clear_request` clears only while the sequence is still the one answered, so
 a newer request is never wiped, and the sequence stays. It reaches the core in the
 per-tick brigade facts as its sequence number alone (`BrigadeNameFacts::request`, a
-defaulted field, so an older recording still parses, and a recorded Tick holds none
-of the Director's words); a store read error leaves the brigade out of that tick's
+defaulted field, so an older recording still parses, and a recorded Tick holds no
+request question; the Progress stage line is the one other Director-written text it
+carries, "Decision (2026-11-26)"); a store read error leaves the brigade out of that tick's
 facts and the core keeps what it had. The open state is adopted at every tick. A
 request is *new* only when its sequence is above the highest the core acted on; a
 request that already stood when this run first saw a brigade is silent: the first
@@ -963,6 +972,105 @@ no legacy flat spelling (a flat `goinkyo_model` is, and stays, the Claude Goinky
 and their built-in is the empty string, not a word: a Codex Goinkyo runs the
 operator's own Codex default unless a key says otherwise. See "Goinkyo's product"
 below.
+
+## Decision (2026-11-26): Progress, the decision's question, and the reading screen
+
+Decisions of the operator of 2026-11-26, written from the code as built. The
+reasons are the Director's and the implementer's unless marked as his. Together they move what a Director says to the
+operator out of its pane: the pane had become the only record of the state of the
+work, and it filled with relayed reports the operator had to scroll past to find the
+line he had to act on.
+
+1. **Progress: the state of the work, written by the Director, replaced whole.** One
+   per brigade, through `update_progress(stage, tasks?, off_plan?)`. `stage` is one line
+   of what phase the work is in (required); `tasks` are `{id, state, note?}` in the order
+   to show them, the state one of banto's five words (`todo`, `doing`, `blocked`, `done`,
+   `dropped`), ids unique; `off_plan` is a list of one-line items, work being done outside
+   what was agreed. Every call replaces the whole Progress: it shows the latest state,
+   not a history, so a Director sends everything that still matters. *Why structured:* so
+   that banto can draw a stage line, a task list and an off-plan list without parsing
+   prose, and so that a later Plan can be linked to a task by its id.
+2. **Bounds, and a refusal rather than a cut.** `stage` 200 characters, task id 16,
+   task note 200, `off_plan` item 200, at most 40 tasks and 20 `off_plan` items, a
+   decision question 4000. Counted in characters, not columns. Over a limit the call is
+   refused with the field and the limit named, and nothing is written, so the Director
+   writes a shorter one instead of the operator reading a sentence that stops. Control
+   and invisible characters are dropped and every field but the question is folded to
+   one line; the operator's language is kept as written.
+3. **Stored on the brigade, and kept when a Worker leaves.** `brigade_progress` holds one
+   row per brigade (schema v24, with `banto.db.before-v24` taken on the first open);
+   `seq` counts the writes and the stamp is banto's clock at the write. A write that
+   changes nothing is still a write, since the stamp says when the Director last looked.
+   Disbanding or deleting the brigade deletes it; dismissing a Worker does not touch it.
+   The write checks inside its own transaction that the caller is still the brigade's
+   Director, like `Store::set_request`.
+4. **`request_decision` takes an optional `question`.** This revisits item 5 of
+   "Decision (2026-11-15)" ("No text: a short fixed tag only"). *His reason then:* no
+   place was wide enough to read a sentence. The reading screen below is that place, so
+   the text now exists, and only there: the list row and the title row keep the fixed
+   `▸ decision` tag as before. The question is stored beside the open request
+   (`brigades.request_question`) with the request's lifetime: set by the call, replaced
+   by a second call, cleared by the operator's Enter in the Director's pane, deleted
+   with the brigade; the sequence rules are unchanged. Line breaks are kept (a
+   line-preserving sanitiser, `display_lines`, beside the one-line one, which is
+   unchanged). Without a question the request works as it did, and the screen says the
+   question is in the Director's pane.
+5. **The reading screen, `F5`.** A read-only modal in the `Modal` family
+   (`Modal::Reading`), drawn by `banto-tui` from the state, up to 100 columns wide with a
+   two-column margin, over the list. `F5` was free: from a pane it reached the child as
+   no bytes (the `F1`, `F5`..`F12` group), and now it is banto's key like `F2`..`F4`.
+   *Which brigade:* from a pane, the staged one; from the list, the brigade of the
+   selected row when it belongs to one (a Director's row, or a hosted member's), otherwise
+   the staged one; with none, a status line (`no brigade to read: select a Director or
+   stage a brigade first`) and no modal. It works for a brigade that is not staged, and
+   opening it stages and resumes nobody. *Content, top to bottom:* Decision (how long ago,
+   and the question; or that the question is in the Director's pane; or that no decision
+   is open) and Progress (when it was last written, the stage, each task as its state
+   word, id and note, the off-plan items; or that none has been written yet). Ages are
+   told as of the moment of drawing, so they advance while the screen stays open. The
+   text wraps by display width (a Japanese line breaks at half as many characters), and
+   a hanging indent keeps a long note under its text, not under its state word.
+   *Keys:* `Up`/`k`, `Down`/`j`, `PgUp`, `PgDn`, `Home`, `End` scroll, never past the text
+   (the wrapping is computed in the core so the key handler knows where the end is);
+   `Esc` closes; with a decision open, `Enter` closes the screen and goes to the
+   Director's pane the way `Enter` on the Director's row does (the same
+   membership resolution, so it needs that row in the list, and says so in the status
+   line when it is not there); any other key does nothing, reaches no pane and swaps no
+   dialog in. A refresh keeps the scroll position. Task states have their own colours
+   (the waiting magenta is not one of them: it means "wants the operator" everywhere
+   else).
+6. **How the screen is fed.** The per-tick brigade facts carry a `ProgressGlance` (the
+   write count and the stage line; a defaulted field, so an older recording still
+   parses), next to the request's sequence number. While the screen is open the core
+   emits one `Cmd` to read the bodies when it opens and again whenever the facts show
+   that the request or the Progress of that brigade changed; the shell answers with an
+   `Event` carrying the readings, with ages computed by the shell so that the core never
+   reads a clock. While it is closed nothing is read. An answer for a brigade other than
+   the one on screen is dropped, and so is a decision the operator has already answered.
+   A store read error is shown on the screen with its reason; on the tick it leaves the
+   brigade's Progress out for that tick without hiding the brigade from the roster.
+7. **No stage on the list row.** The Progress `stage` was first drawn on the
+   Director's row, on line two after the `▸ decision` tag, and was taken out again after
+   the operator looked at it in a real sidebar: the sidebar is too narrow for a stage
+   line (he found it "completely crushed"). The row is as it was, the tag or the cwd.
+   The `stage` stays in the per-tick facts (`ProgressGlance`) with nothing drawing it,
+   since where it is shown is still to be decided.
+8. **A quieter Director, by text only.** The default Director briefing says that in its
+   own pane the Director writes answers to what the operator asked there and decision
+   requests, and that a Worker's report, what it did next and the state of the work go to
+   Progress, when state changes and not on every report; a turn banto started is not the
+   operator speaking, and when it leaves nothing for him it ends after `update_progress`,
+   or with no call at all. The same change reaches the consultation paragraph (it said to
+   tell the operator in one line), the preface a Director reads on `check_messages`
+   (conditional: "if banto started this turn and not the operator"), and the result of
+   `update_progress`. `RELAY_NUDGE_LINE` is unchanged, since Workers read it too, and an
+   operator's own `director_prompt` is never edited. A Codex Director is told about
+   `update_progress` with the other Director-only tools.
+
+*Not built.* A Planner role, a Plan (per brigade, versioned, a third section of the same
+screen below Progress, approved by an operator key on it), a link from a task id to the
+Plan, and a mark on lines changed since the screen was last closed. The screen's sections
+and the facts' sequence number are kept easy to extend for them.
 
 ## Goinkyo's product: `goinkyo_agent` (2026-11-23)
 
@@ -1504,7 +1612,13 @@ that rebuilds `brigade_members` must copy it), and, on `brigades`, `request_text
 `request_seq` and `request_at_ms`, a Director's open decision request (NULL, 0 and NULL
 are "none"; `request_text` holds the constant `open` while one is open; one per
 brigade, on `brigades` so that disbanding deletes it; `request_decision`, "Decision
-(2026-11-15)").
+(2026-11-15)"). v24 added `brigades.request_question` (nullable TEXT; the question a
+Director attached to its open request, with that column's lifetime: set by the
+request, cleared by the answer, deleted with the brigade; NULL is "no question", which
+is every request made before v24) and the `brigade_progress` table (one row per
+brigade: `stage`, `tasks` and `off_plan` as JSON text, `seq` counting the writes,
+`updated_at_ms`), deleted with its brigade and left alone when a Worker is dismissed
+("Decision (2026-11-26)").
 
 ## The emporium: hosted panes
 
@@ -1886,6 +2000,7 @@ A Worker added later gets the mean of the others' height.
 | `F2` | Move focus between the list and the panes |
 | `F3` | Make the next pane of the staged brigade the current one (collapsed tiles are skipped); pressed from the list, the keyboard stays on the list |
 | `F4` | Switch the brigade bell between silent-while-the-Director's-pane-is-focused (the default) and ringing there too (bell only, no mark); says which in the status line, and a standing `BELL ALWAYS` badge shows left of the counts while it is on. One keystroke from the list or from a pane, taken by banto like `F2`/`F3` and never forwarded to the agent; with a modal or the search box open the key goes to that, and with the prefix armed it is an unbound prefix key (no toggle), as for `F2`/`F3` |
+| `F5` | Open the reading screen ("The reading screen" in "Decision (2026-11-26)"): a read-only modal with a brigade's open decision and its Progress. From a pane it reads the staged brigade; from the list, the selected row's brigade (a Director's, or a hosted member's), otherwise the staged one; with none, a status line says so and nothing opens. It stages and resumes nobody. Taken by banto like `F2`/`F3`/`F4` and never forwarded to the agent (it used to reach a pane as no bytes); with a modal or the search box open the key goes to that |
 | `q`/`Esc` (list focused) | Quit — at once when every hosted session is known to be idle (or none is hosted); otherwise the first press only shows the sessions it counts, each with its reason, for example `Esc again to quit — 2 not idle: a (unknown), b (busy)`, background commands as `(bg)` or `2 in background: x, y` (the forms and the naming are in "Is it idle? (the quit question)") and a second `q`/`Esc` within 3 seconds quits, since quitting ends every hosted process. N counts hosted sessions (staged or off-stage, collapsed tiles included) that are not known idle; "Is it idle? (the quit question)" below says what that is. Any other key, a mouse press, the focus leaving the list, every session becoming known idle or the window running out drops the prompt silently. Esc stays one of the two keys because an IME swallows `q`. Once quitting is decided the status line reads `Closing — ending N session(s)…` until the process exits. |
 | prefix chord (`Ctrl+B` default, `[keys] prefix` in config.toml), from sidebar or pane, then: | |
 | … `o`/`Tab` | cycle focus through sidebar and panes |
@@ -1904,11 +2019,11 @@ A Worker added later gets the mean of the others' height.
 While the prefix is armed, the status bar shows the full binding table.
 Otherwise its idle hints follow the focus, because that is where keys go: with
 the session list focused, the list keys (`Tab grouped/flat`, `F2 pane`, `F3 next
-pane`, `F4 bell`, …, plus `D restore` while an archived row is on screen); with a pane
+pane`, `F4 bell`, `F5 read`, …, plus `D restore` while an archived row is on screen); with a pane
 focused, only what banto itself takes there — the configured prefix chord as the
 operator would name it (`Ctrl+B`, or a bare character), `F2 list`, `F3 next
-pane` when the staged brigade has more than one tile that is not collapsed, and
-`F4 bell` always; while
+pane` when the staged brigade has more than one tile that is not collapsed, `F4 bell`
+always and `F5 read` when a brigade is staged; while
 searching, the search keys. A transient status replaces the hints. The text is
 built by one pure function (`banto_tui::hints`). While the brigade bell's switch
 is on, the badge `BELL ALWAYS` stands in the right-hand segment of the bar, left
@@ -3501,9 +3616,9 @@ how the rendered text reaches the member differs by product:
   agent of a different, unrelated multi-agent feature — measured end to end
   in `docs/notes/codex-briefing-spike.md`. So the addendum names every tool
   the member's role may call: the three any member has, and to a Director
-  only, its own five (`request_decision`, `name_member`, `consult_goinkyo`,
-  `dismiss_goinkyo`, `interrupt_worker`). Until 2026-11-16 it named only the
-  three, so a Codex Director was never told the four it had then; a test checks
+  only, its own six (`request_decision`, `update_progress`, `name_member`,
+  `consult_goinkyo`, `dismiss_goinkyo`, `interrupt_worker`). Until 2026-11-16 it named
+  only the three, so a Codex Director was never told the four it had then; a test checks
   every advertised tool against the two lists.
 
   **Delivered once, not on every resume.** Codex stores every
@@ -3626,9 +3741,16 @@ has banto refuse its next tool calls until it reads such a correction or stop;
 reworded when the Esc was dropped), and (since
 2026-11-15) three points about reaching the operator: banto itself tells him when
 the brigade has gone quiet, so do not announce completion; when he alone can decide
-and work stops on it, write the question in your own output and then call
-`request_decision`, which shows him that you are waiting, not the question; use the
-agent's own question picker only when no Worker is running. These apply to the
+and work stops on it, write it in your own output first and then call `request_decision` with
+that same text as `question` (before 2026-11-26: write it in the pane and call the tool,
+which showed him that you are waiting, not the question); use the
+agent's own question picker only when no Worker is running. Since 2026-11-26 the
+default prompt also says that in its own pane the Director writes only answers and
+decision requests, and records a Worker's report, what it did next and the state of the
+work in Progress with `update_progress` (when state changes, not on every report); the
+two places that said to "tell the operator in one line" (after delegating, after
+keeping work) say "record that in Progress", and so do the consultation paragraph's
+two sentences (that it consulted; that it went against the Goinkyo's advice). These apply to the
 default prompt only: an operator's own `director_prompt` does not get them. That policy
 is intentionally a setting the operator can change, not a fixed behavior. (No
 placeholder was added for names: the template still substitutes only `{brigade}`,
@@ -4150,15 +4272,22 @@ same `tools/list`:
   a standing role — and that the token stays the address: `send_to_peer`'s `to`
   takes tokens only, and a display name given there is refused with the list of
   token-and-name pairs.
-- `request_decision()` — Director-only (by the store's live membership, checked
-  again in the write's transaction): records that the brigade is waiting on the
-  operator's decision, and returns at once. It takes no parameters (a `text` a
-  caller still sends is ignored and nothing of it is stored); the Director writes
-  the question in its own pane first, and the description and the result say that
-  banto shows THAT it is waiting, not the question. It does not block, is not named
-  as an ask, and its result claims no bell or notification, true whether
-  `request_attention` is on or off; a second call while one is open is a new
-  request. See "Decision (2026-11-15)".
+- `request_decision(question?)` — Director-only (by the store's live membership,
+  checked again in the write's transaction): records that the brigade is waiting on the
+  operator's decision, and returns at once. `question` is optional (at most 4000
+  characters, line breaks kept, a longer one refused rather than cut; a `text` a caller
+  still sends is ignored and nothing of it is stored); the Director writes the
+  question in its own pane first, where the operator answers, then passes the same
+  text as `question`, and the description and the result say that the question is read on the reading screen while the list and the
+  title show only the fixed tag. Without `question` the request works as before and the
+  screen says the question is in the pane. It does not block, is not named as an ask,
+  and its result claims no bell or notification, true whether `request_attention` is on
+  or off; a second call while one is open is a new request and replaces the question.
+  See "Decision (2026-11-15)" and "Decision (2026-11-26)".
+- `update_progress(stage, tasks?, off_plan?)` — Director-only, checked as
+  `request_decision` is: replaces the brigade's Progress with what it sent, whole or not
+  at all. Its result tells the Director the write was recorded and that it may end its
+  turn with no text for the operator. See "Decision (2026-11-26)".
 - `interrupt_worker(member, text)` — Director-only (by the store's live membership,
   checked again in the write's transaction): delivers `text` to a Worker as an
   ordinary message and, for a Claude Worker whose relay is on, has banto refuse that

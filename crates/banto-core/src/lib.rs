@@ -21,6 +21,8 @@
 //! - [`display_text`] the one policy for someone else's text shown on a banto line
 //! - [`member_name`] the rule for a brigade member's display name
 //! - [`consultation`] the rule for a Goinkyo consultation's title, and how the list shows it
+//! - [`progress`] a Director's Progress and a decision's question, and the rule that accepts a write
+//! - [`reading`] the F5 reading screen: its state, geometry and wrapped lines
 //! - [`screen`] the emporium's per-pane `vt100` terminal model
 //! - [`key_encode`] key-event -> PTY-child-stdin byte encoding
 //! - [`replay`] the record/replay event-stream format (`docs/DISCIPLINE.md` §8)
@@ -39,6 +41,8 @@ pub mod member_name;
 pub mod model;
 pub mod pane_log;
 pub mod program_state;
+pub mod progress;
+pub mod reading;
 pub mod replay;
 pub mod screen;
 pub mod search;

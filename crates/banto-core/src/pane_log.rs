@@ -209,6 +209,7 @@ pub fn event_name(ev: &Event) -> &'static str {
         Event::GroupJoinDone { .. } => "GroupJoinDone",
         Event::GroupRenameDone { .. } => "GroupRenameDone",
         Event::GroupDeleteDone { .. } => "GroupDeleteDone",
+        Event::BrigadeReadingRead { .. } => "BrigadeReadingRead",
         Event::MembershipResolved { .. } => "MembershipResolved",
         Event::SidebarWidthLoaded { .. } => "SidebarWidthLoaded",
         Event::BellWhenFocusedLoaded { .. } => "BellWhenFocusedLoaded",
@@ -256,6 +257,7 @@ pub fn pane_facts_key(ev: &Event) -> Option<&SessionKey> {
         | Event::GroupRenameDone { .. }
         | Event::GroupDeleteDone { .. }
         | Event::MembershipResolved { .. }
+        | Event::BrigadeReadingRead { .. }
         | Event::SidebarWidthLoaded { .. }
         | Event::BellWhenFocusedLoaded { .. }
         | Event::LastWorkerAgentLoaded { .. }
@@ -439,6 +441,7 @@ pub fn event_lines(ev: &Event, facts: &PaneFacts) -> Vec<Line> {
         | Event::GroupJoinDone { .. }
         | Event::GroupRenameDone { .. }
         | Event::GroupDeleteDone { .. }
+        | Event::BrigadeReadingRead { .. }
         | Event::SidebarWidthLoaded { .. }
         | Event::BellWhenFocusedLoaded { .. }
         | Event::LastWorkerAgentLoaded { .. }
@@ -662,6 +665,7 @@ fn store_line(intent: &StoreIntent, by: &'static str) -> Option<Line> {
         | StoreIntent::SaveSidebarWidth { .. }
         | StoreIntent::SaveBellWhenFocused { .. }
         | StoreIntent::ClearRequest { .. }
+        | StoreIntent::ReadBrigadeReading { .. }
         | StoreIntent::SaveLastWorkerAgent { .. } => return None,
     };
     Some(line)

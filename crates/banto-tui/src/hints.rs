@@ -4,7 +4,7 @@
 //! bar itself only draws what these return. What the idle bar offers follows the
 //! focus, because that is where keys go: with the session list focused banto
 //! takes the list keys, with a pane focused every key goes to the session inside
-//! it and banto itself takes only the prefix chord, `F2` and `F3`.
+//! it and banto itself takes only the prefix chord and `F2`–`F5`.
 
 use banto_core::app::Mode;
 use banto_core::engine::Focus;
@@ -22,7 +22,7 @@ pub const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
 pub const PREFIX_HINTS: &str = "prefix: Esc cancel · o/Tab cycle · arrows move · Shift+Up/Down reorder · m collapse · z solo · M restore · = reset sizes · 1-9 pane · b literal · s sidebar · x close";
 
 const LIST_HINTS: &str = "j/k move · Enter open · F2 pane · B brigade/disband · x close · b +worker · \
-                          F3 next pane · F4 bell · / search · n new · d archive · g group · \
+                          F3 next pane · F4 bell · F5 read · / search · n new · d archive · g group · \
                           Tab grouped/flat · p pin · a reveal · q/Esc quit";
 
 /// Appended only while an archived row is on screen. The bar was already tight
@@ -66,6 +66,11 @@ pub fn idle_hints(input: &IdleHintsInput<'_>) -> String {
                 hints.push_str(" · F3 next pane");
             }
             hints.push_str(" · F4 bell");
+            // Only with a brigade staged, which is also when there are tiles to
+            // count: a lone session has no brigade for F5 to read.
+            if input.focusable_tiles > 0 {
+                hints.push_str(" · F5 read");
+            }
             hints
         }
     }
@@ -106,7 +111,7 @@ mod tests {
         assert_eq!(
             hints,
             "j/k move · Enter open · F2 pane · B brigade/disband · x close · b +worker · \
-             F3 next pane · F4 bell · / search · n new · d archive · g group · \
+             F3 next pane · F4 bell · F5 read · / search · n new · d archive · g group · \
              Tab grouped/flat · p pin · a reveal · q/Esc quit"
         );
         assert!(!hints.contains("Tab view"));
@@ -128,7 +133,10 @@ mod tests {
     #[test]
     fn pane_focus_offers_only_what_banto_takes_there() {
         let hints = idle_hints(&input(Focus::Pane, Mode::Normal));
-        assert_eq!(hints, "Ctrl+B prefix · F2 list · F3 next pane · F4 bell");
+        assert_eq!(
+            hints,
+            "Ctrl+B prefix · F2 list · F3 next pane · F4 bell · F5 read"
+        );
         for key in LIST_ONLY_KEYS {
             assert!(!hints.contains(key), "{key:?} in {hints:?}");
         }
@@ -149,6 +157,21 @@ mod tests {
         let mut solo = input(Focus::Pane, Mode::Normal);
         solo.focusable_tiles = 0;
         assert_eq!(idle_hints(&solo), "Ctrl+B prefix · F2 list · F4 bell");
+    }
+
+    #[test]
+    fn f5_is_offered_in_a_pane_only_when_a_brigade_is_staged() {
+        for (tiles, offered) in [(0, false), (1, true), (3, true)] {
+            let mut pane = input(Focus::Pane, Mode::Normal);
+            pane.focusable_tiles = tiles;
+            assert_eq!(
+                idle_hints(&pane).contains("F5 read"),
+                offered,
+                "{tiles} focusable tiles"
+            );
+        }
+        // From the list it is always offered: it reads the selected row's brigade.
+        assert!(idle_hints(&input(Focus::Sidebar, Mode::Normal)).contains("F5 read"));
     }
 
     #[test]

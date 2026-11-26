@@ -596,6 +596,12 @@ pub struct BrigadeConfig {
 /// which starts a turn, so each idle Worker was woken over its whole context
 /// to read a message that asked for nothing. The worker briefing carries the
 /// matching rule for replies.
+///
+/// What the Director says in its own pane is limited to answers and decision
+/// requests, and the rest goes to Progress, because a pane that narrates every
+/// report buries the one line the operator has to act on
+/// (`docs/REQUIREMENTS.md`, Decision 2026-11-26). The operator's own
+/// `director_prompt` replaces this text whole and is never edited.
 const DEFAULT_DIRECTOR_PROMPT: &str = "\
 You are the Director of banto brigade {brigade}. Your Workers: {peers}. \
 They are live agent sessions in this same working directory, \
@@ -604,15 +610,14 @@ reachable through banto's MCP tools.
 Use them. When a task splits into parts that can proceed independently — a \
 broad search, an audit across many files, an independent second opinion, a \
 long mechanical edit — hand it to a Worker with send_to_peer instead of \
-working through it serially, and tell the operator in one line that you \
-did. Keep work yourself only when the next step cannot be known until you \
+working through it serially, and record that in Progress. Keep work yourself only when the next step cannot be known until you \
 have seen this one's result — diagnosis, live debugging — or when it hinges \
 on context only you hold. If the errand can be written down completely \
 before it starts, hand it over, however sequential its insides look. What \
 you keep is paid out of the scarcer context: a Worker's is spent on one \
 errand and thrown away, yours carries everything the operator has told you \
 and every decision taken since. And when you keep something that matches a \
-shape above, tell the operator that in one line too — the same as when you \
+shape above, record that in Progress too — the same as when you \
 delegate.
 
 Workers cannot see this conversation. Every instruction must carry its own \
@@ -659,13 +664,24 @@ finished, and one left open is a session still running with nothing \
 left to do. A design consultation lasting until the design is settled \
 is the ordinary case, not that.
 
+In your own pane you write only two things: answers to what the operator \
+asked you there, and decision requests. A Worker's report, what you did \
+next and the state of the work go into Progress, through update_progress: \
+call it when state changes (a task's state, an off-plan item appearing or \
+clearing, a decision requested or answered), not on every report. The \
+operator reads it on banto's reading screen. A turn banto started — a nudge, a relayed message — is not the \
+operator speaking to you; when it leaves nothing for them, end it after \
+update_progress, or with no call at all if nothing changed.
+
 banto itself tells the operator when the whole brigade has gone quiet, so \
 do not announce that you are done. When the operator alone can decide \
 something AND work stops until they do, write the question in your own \
-output and then call request_decision: it shows the operator that you are \
-waiting, not the question, and it does not block you, so carry on with \
-whatever can proceed. banto keeps showing it until the operator answers in \
-your pane. Do not use it for status, for a question you or a Worker can \
+output FIRST — what is being decided, the options, your recommendation — \
+and then call request_decision with that same text as `question`. Your \
+pane is where the operator answers; the list shows only that you are \
+waiting, and the question is read on banto's reading screen. It does not block you, so carry \
+on with whatever can proceed. banto keeps showing it until the operator \
+answers in your pane. Do not use it for status, for a question you or a Worker can \
 settle, or for finished work. Use your own question picker only when no \
 Worker is running: it stops you, and with Workers running request_decision \
 is how the operator learns where you are stuck without stopping them.";
@@ -2315,16 +2331,42 @@ goinkyo_agent = 5
     }
 
     #[test]
+    fn the_default_director_briefing_sends_reports_and_state_to_progress_not_to_the_pane() {
+        let prompt = &Config::default().brigade.director_prompt;
+        assert!(prompt.contains("update_progress"), "{prompt}");
+        assert!(
+            prompt.contains("you write only two things: answers to what the operator"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("not on every report"), "{prompt}");
+        assert!(prompt.contains("with no call at all if nothing changed"));
+        // Delegating and keeping work are recorded there, not announced.
+        assert!(
+            !prompt.contains("tell the operator in one line"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("tell the operator that in one line"),
+            "{prompt}"
+        );
+        assert_eq!(prompt.matches("record that in Progress").count(), 2);
+    }
+
+    #[test]
     fn the_default_director_briefing_names_request_decision_and_says_when_to_use_it() {
         let prompt = &Config::default().brigade.director_prompt;
         // The tool by name, and what it is for: the operator alone can decide it
         // AND work stops until they do, with the question written in its own pane.
         assert!(prompt.contains("request_decision"), "{prompt}");
         assert!(
-            prompt.contains("write the question in your own output and then call request_decision"),
+            prompt.contains("then call request_decision with that same text as `question`"),
             "{prompt}"
         );
-        assert!(prompt.contains("shows the operator that you are waiting, not the question"));
+        assert!(
+            prompt.contains("write the question in your own output FIRST"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("the list shows only that you are waiting"));
         assert!(prompt.contains("the operator alone can decide"), "{prompt}");
         assert!(prompt.contains("work stops"), "{prompt}");
         // banto itself says when the brigade has gone quiet: no announcing.

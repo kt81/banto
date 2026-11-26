@@ -23,12 +23,15 @@ mod consultations;
 mod groups;
 mod migrations;
 mod pins;
+mod progress;
 mod ui_prefs;
 
 pub use banto_core::model::{
     Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken,
 };
-pub use brigades::{InterruptState, MAX_WORKER_NUMBER, MemberNaming, UnreadInterrupt, glance_line};
+pub use brigades::{
+    InterruptState, MAX_WORKER_NUMBER, MemberNaming, RequestDetail, UnreadInterrupt, glance_line,
+};
 pub use groups::{Group, GroupId};
 pub use migrations::SCHEMA_VERSION;
 
