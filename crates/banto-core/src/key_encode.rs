@@ -43,6 +43,11 @@ pub fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
         KeyCode::Enter => out.push(b'\r'),
         KeyCode::Tab => out.push(b'\t'),
         KeyCode::BackTab => out.extend_from_slice(b"\x1b[Z"),
+        // Alt without Ctrl sends ESC DEL, the bytes Ghostty 1.4.0 on macOS sends
+        // for Option+Backspace (raw byte dump, 2026-11-26). Claude and Codex in a
+        // pane delete a word on it; a bare DEL deleted one character. The Ctrl
+        // rule is the Alt+Enter one above. The arrows and Delete still drop Alt.
+        KeyCode::Backspace if alt && !ctrl => out.extend_from_slice(b"\x1b\x7f"),
         KeyCode::Backspace => out.push(0x7f),
         KeyCode::Esc => out.push(0x1b),
         KeyCode::Left => out.extend_from_slice(b"\x1b[D"),
@@ -233,6 +238,35 @@ mod tests {
         assert_eq!(bytes(KeyCode::Char('a'), Modifiers::NONE), b"a");
         assert_eq!(bytes(KeyCode::Enter, Modifiers::NONE), b"\r");
         assert_eq!(bytes(KeyCode::Backspace, Modifiers::NONE), vec![0x7f]);
+    }
+
+    #[test]
+    fn an_alt_backspace_without_ctrl_is_escape_then_delete() {
+        let alt_shift = Modifiers {
+            ctrl: false,
+            alt: true,
+            shift: true,
+        };
+        for mods in [Modifiers::ALT, alt_shift] {
+            assert_eq!(bytes(KeyCode::Backspace, mods), b"\x1b\x7f", "{mods:?}");
+        }
+    }
+
+    #[test]
+    fn any_other_backspace_is_a_bare_delete() {
+        let ctrl_alt = Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: false,
+        };
+        for mods in [
+            Modifiers::NONE,
+            Modifiers::SHIFT,
+            Modifiers::CONTROL,
+            ctrl_alt,
+        ] {
+            assert_eq!(bytes(KeyCode::Backspace, mods), vec![0x7f], "{mods:?}");
+        }
     }
 
     #[test]
