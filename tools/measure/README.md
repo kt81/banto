@@ -11,6 +11,35 @@ networking module.
 
 ## What each script answers
 
+**`director_turns.py`: what a Claude Director wrote in each turn.** It prints
+each Director session's turns, their trigger (`operator-typed`, `relay-woken` or
+`other/unknown`), assistant text characters and lines, and whether it called
+`request_decision`; the session totals count turns by trigger and decision calls.
+It prints counts and session metadata, no conversation text, and writes no file.
+Run `python tools/measure/director_turns.py --project PROJECT --since 2026-11-01`
+to select a project and a starting date. The shared `--root`, `--project`,
+`--since` and `--until` flags are described below.
+
+- A turn starts at a user record and continues to the next; text or a decision
+  before the first user record is an unknown turn. The old typed relay line and
+  the async wake's task notification both count as relay wakes. To avoid calling
+  ambiguous input human, only a non-tagged record with `origin.kind = human`
+  counts as operator-typed; an absent origin, another notification or an
+  unrecognized tag counts as unknown. This conservative rule can miss operator
+  messages in older transcripts without an origin. Relay-prefix checks can also
+  mistake an operator who typed that exact prefix for a wake.
+- Only assistant text blocks outside sidechains count; tool inputs, tool results
+  and thinking do not. Characters are Unicode code points, and lines are counted
+  separately per text block using `splitlines()` (a trailing newline adds no empty
+  line). Decision calls are counted, not matched to answers or checked for success.
+  Text blocks are not proof that a person read them.
+- `--since` is inclusive and `--until` exclusive, applied to the turn's start;
+  the whole turn is counted even if it ends after the window. Untimestamped turns
+  are included only without bounds. Sessions are files, and a Director is identified
+  by a Director-only tool call; a Director that never calls one is missed. Repeated
+  records with UUIDs are deduplicated across files; records without UUIDs cannot be
+  reliably deduplicated. Codex sessions are not read.
+
 **`usage_report.py`: where the tokens went.** It attributes the usage of each
 API call to its session and to an errand, and writes the per-call, per-session,
 per-errand and per-context figures to CSV files. An errand is one unit of

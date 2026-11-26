@@ -497,6 +497,7 @@ class Session:
         # field, so every consumer of the event shapes is untouched. The block-index forms are
         # positional inside the record: stable only because the transcript is append-only.
         self.keys = {}
+        self.sidechain_events = set()
         self.tools = Counter()
         self.compactions = []
         self.first_ts = None
@@ -695,7 +696,7 @@ def _read_assistant(s, d, ts, check_ids, detail):
                         checks.append(tool_id)
                 elif short == "request_decision" and detail:
                     events.append(("decision", ts))
-                    subkeys.append(None)
+                    subkeys.append(f"#u{tool_id}" if tool_id else f"#b{block_no}")
                 elif short == "send_to_peer":
                     to = inp.get("to")
                     text = inp.get("text", "")
@@ -725,6 +726,8 @@ def _read_assistant(s, d, ts, check_ids, detail):
     for offset, sub in enumerate(subkeys):
         if sub is not None:
             _key(s, d, len(s.events) + offset, sub)
+    if d.get("isSidechain"):
+        s.sidechain_events.update(range(len(s.events), len(s.events) + len(events)))
     s.events.extend(events)
     s.tools.update(tools)
     check_ids.update(checks)
