@@ -742,7 +742,7 @@ count, which the tag is not, so showing it on the row and on the tile double-cou
 nothing. It stays, even while the Director's pane is focused, until the operator
 sends Enter into that pane: the key that submits what was typed, which reaches the
 child as a carriage return. Another key, a paste, any mouse event, a focus change,
-Shift+Enter, Ctrl+J, an Enter into another pane, and relay wakes do not clear it.
+Shift+Enter, Alt+Enter, Ctrl+J, an Enter into another pane, and relay wakes do not clear it.
 Clearing removes the tag from the
 core and issues the conditional store clear. Disbanding drops all of it with the
 brigade's row. There is no collapsed-body rule: a collapsed Director cannot exist

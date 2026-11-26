@@ -28,9 +28,18 @@ pub fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
         // banto was confirmed on the operator's machine (2026-11-10) to take
         // a Ctrl+J LF as a newline. Shift+Enter used to send CR like any
         // Enter, so what the operator meant as a newline sent the message.
-        // Alt and Ctrl+Enter stay CR: Ctrl+Enter is send-now to Claude, and
-        // Alt+Enter rarely reaches banto at all (Windows Terminal takes it).
         KeyCode::Enter if key.modifiers.shift && !ctrl && !alt => out.push(b'\n'),
+        // Alt without Ctrl sends ESC CR, with or without Shift: Ghostty 1.4.0
+        // on macOS sends Option+Enter as ESC CR (raw byte dump, 2026-11-26) and
+        // crossterm reads it as Enter+ALT, so a bare CR here submitted a Claude
+        // prompt the operator meant as a newline. Claude Code documents
+        // Option+Enter as a newline, and Codex's composer binds Alt+Enter to
+        // one. ESC CR rather than LF because it is the bytes the terminal
+        // itself sent for the key, so each agent's own documentation holds in
+        // a pane. Every Enter with Ctrl stays CR: Ctrl+Enter is send-now to
+        // Claude, and on Windows AltGr arrives as Ctrl+Alt, which must stay a
+        // plain Enter.
+        KeyCode::Enter if alt && !ctrl => out.extend_from_slice(b"\x1b\r"),
         KeyCode::Enter => out.push(b'\r'),
         KeyCode::Tab => out.push(b'\t'),
         KeyCode::BackTab => out.extend_from_slice(b"\x1b[Z"),
@@ -324,12 +333,24 @@ mod tests {
             alt: false,
             shift: true,
         };
+        let alt_shift = Modifiers {
+            ctrl: false,
+            alt: true,
+            shift: true,
+        };
+        let ctrl_alt = Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: false,
+        };
         for (mods, submits) in [
             (Modifiers::NONE, true),
             (Modifiers::SHIFT, false),
-            (Modifiers::ALT, true),
+            (Modifiers::ALT, false),
+            (alt_shift, false),
             (Modifiers::CONTROL, true),
             (both, true),
+            (ctrl_alt, true),
         ] {
             let key = KeyEvent::new(KeyCode::Enter, mods);
             let effect = input_effect(&key);
@@ -359,10 +380,32 @@ mod tests {
     }
 
     #[test]
-    fn an_alt_or_ctrl_enter_is_the_same_bytes_as_a_plain_one() {
-        // Only Shift alone is told apart; anything else is a plain send.
-        for mods in [Modifiers::NONE, Modifiers::ALT, Modifiers::CONTROL] {
+    fn a_ctrl_enter_is_the_same_bytes_as_a_plain_one() {
+        // AltGr arrives as Ctrl+Alt on Windows, so Alt does not change that.
+        let ctrl_alt = Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: false,
+        };
+        let ctrl_shift = Modifiers {
+            ctrl: true,
+            alt: false,
+            shift: true,
+        };
+        for mods in [Modifiers::NONE, Modifiers::CONTROL, ctrl_alt, ctrl_shift] {
             assert_eq!(bytes(KeyCode::Enter, mods), b"\r", "{mods:?}");
+        }
+    }
+
+    #[test]
+    fn an_alt_enter_without_ctrl_is_escape_then_carriage_return() {
+        let alt_shift = Modifiers {
+            ctrl: false,
+            alt: true,
+            shift: true,
+        };
+        for mods in [Modifiers::ALT, alt_shift] {
+            assert_eq!(bytes(KeyCode::Enter, mods), b"\x1b\r", "{mods:?}");
         }
     }
 

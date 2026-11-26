@@ -3190,11 +3190,12 @@ fn only_an_enter_into_the_directors_pane_answers_it_and_clears_the_store() {
 
 #[test]
 fn nothing_but_an_enter_answers_it() {
-    // A letter, a paste, Shift+Enter (the child receives a line feed, not a send),
-    // the wheel, a click, a focus change, and banto's own wake.
+    // A letter, a paste, Shift+Enter and Alt+Enter (the child receives a line feed
+    // or ESC CR, not a send), the wheel, a click, a focus change, and banto's own
+    // wake.
     // What the operator (or banto) does in the Director's pane.
     type Act = fn(&mut EmporiumState, &mut App, &SessionKey, Instant);
-    let cases: [(&str, Act); 6] = [
+    let cases: [(&str, Act); 7] = [
         ("a key", |state, app, _, at| {
             press(state, app, KeyCode::Char('x'), at);
         }),
@@ -3208,6 +3209,9 @@ fn nothing_but_an_enter_answers_it() {
         }),
         ("shift+enter", |state, app, _, at| {
             press_with(state, app, KeyCode::Enter, Modifiers::SHIFT, at);
+        }),
+        ("alt+enter", |state, app, _, at| {
+            press_with(state, app, KeyCode::Enter, Modifiers::ALT, at);
         }),
         ("the pointer", |state, app, director, at| {
             state.size = (120, 40);

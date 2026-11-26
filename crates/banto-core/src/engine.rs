@@ -5469,10 +5469,10 @@ fn operator_gave_work(state: &mut EmporiumState, pane: &SessionKey) {
 /// An operator's key forwarded into `director`'s pane answers its brigade's
 /// request when it is the key that sends what was typed (a plain Enter, which
 /// reaches the child as a carriage return; Shift+Enter reaches it as a line feed
-/// and is not one): the request goes from the core, and the store is told to clear
-/// it if it is still that request. Nothing else answers: not another key, a
-/// paste, the pointer, a focus change, and not banto's own nudge, which is
-/// written by the relay and never comes through here.
+/// and Alt+Enter as ESC CR, and neither is one): the request goes from the core,
+/// and the store is told to clear it if it is still that request. Nothing else
+/// answers: not another key, a paste, the pointer, a focus change, and not
+/// banto's own nudge, which is written by the relay and never comes through here.
 fn answer_request_on_enter(
     state: &mut EmporiumState,
     director: &SessionKey,
