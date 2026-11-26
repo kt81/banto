@@ -139,6 +139,11 @@ fn ctrl_byte(c: char) -> Option<u8> {
         ']' => Some(0x1d),
         '^' => Some(0x1e),
         '_' => Some(0x1f),
+        // crossterm's Unix parser reads the bytes 0x1C..=0x1F as Ctrl+'4'..'7'
+        // (xterm sends those same bytes for Ctrl+4..7), so a Ctrl+\ ] ^ _ pressed
+        // on macOS or Linux arrives as a digit. Without these arms the Ctrl is
+        // lost and the pane gets the bare digit.
+        '4'..='7' => Some(0x1c + (c as u8 - b'4')),
         _ => None,
     }
 }
@@ -229,6 +234,40 @@ mod tests {
     #[test]
     fn ctrl_c_is_etx() {
         assert_eq!(bytes(KeyCode::Char('c'), Modifiers::CONTROL), vec![0x03]);
+    }
+
+    #[test]
+    fn the_control_symbols_and_the_digits_crossterm_reads_them_as_send_the_same_bytes() {
+        // The digits are how crossterm's Unix parser reports 0x1C..=0x1F;
+        // Windows reports Ctrl+^ as Ctrl+Shift+'6'.
+        for (symbol, digit, byte) in [
+            ('\\', '4', 0x1c),
+            (']', '5', 0x1d),
+            ('^', '6', 0x1e),
+            ('_', '7', 0x1f),
+        ] {
+            assert_eq!(bytes(KeyCode::Char(symbol), Modifiers::CONTROL), vec![byte]);
+            assert_eq!(bytes(KeyCode::Char(digit), Modifiers::CONTROL), vec![byte]);
+        }
+        let ctrl_shift = Modifiers {
+            ctrl: true,
+            alt: false,
+            shift: true,
+        };
+        assert_eq!(bytes(KeyCode::Char('6'), ctrl_shift), vec![0x1e]);
+    }
+
+    #[test]
+    fn a_digit_without_control_stays_a_digit() {
+        for digit in ['3', '4', '5', '6', '7', '8'] {
+            assert_eq!(
+                bytes(KeyCode::Char(digit), Modifiers::NONE),
+                digit.to_string().into_bytes()
+            );
+        }
+        // Ctrl+3 and Ctrl+8 have no control byte here and keep the digit.
+        assert_eq!(bytes(KeyCode::Char('3'), Modifiers::CONTROL), b"3");
+        assert_eq!(bytes(KeyCode::Char('8'), Modifiers::CONTROL), b"8");
     }
 
     #[test]
