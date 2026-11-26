@@ -11,6 +11,47 @@ networking module.
 
 ## What each script answers
 
+**`plan_metrics.py`: four Claude Director metrics.** It prints counts and session
+metadata only, writes no file, and takes `--root`, `--project`, `--since` and
+`--until`. For example, `python tools/measure/plan_metrics.py --project PROJECT
+--since 2026-11-01` reads the selected Claude transcripts. The bounds are UTC,
+inclusive at the start and exclusive at the end. Turns are selected by their
+start; Progress writes and Plan notices by their own timestamps.
+
+- A successful `request_decision` makes the next operator-typed turn an answer;
+  other operator turns are step-ins. This is a counting convention, not proof
+  of what a message meant. Like `quality_report`, it accepts absent or human
+  origin and excludes relay lines, tags, tool results and nonhuman origins;
+  `director_turns.py` is stricter and requires an explicit human origin. The
+  report also gives Worker reports, active UTC days and operator turns in Planner
+  sessions. It processes earlier turns before the window to find a pending request.
+  Claude's `typed`, `queued` and `suggestion_accepted` prompt sources all count
+  as operator inputs; the report separately shows suggestion-accepted Director
+  turns, answers and step-ins.
+- For relay-woken turns with a Worker delivery, output tokens are the sum of
+  Claude assistant-call output usage for the whole turn, divided by delivered
+  Worker messages; pane characters count assistant text blocks only. Worker reports
+  in operator turns are counted separately. A wake is not itself a report, and a
+  banto-only notice is not a Worker report. Report batches share one turn's cost.
+- Each successful `update_progress` gives the count of `off_plan` items at the
+  tool call's timestamp. The report interleaves Plan approval, release and close
+  notices rather than inferring a Plan span. It counts notices from banto by
+  Plan and version, counting approvals after the first and Planner releases.
+  Earlier approval notices are used to identify the first when windowing.
+  Attempts without a matching successful result are not counted. Duplicated
+  notices of the same kind, Plan and version are counted once per brigade. A
+  successful Director `close_planner` call and an operator close notice have
+  separate labels; only the latter identifies the Plan.
+- Brigade identity comes from the Director's or Planner's first system-prompt snapshot; it is
+  `?` when that snapshot does not name one. The report cannot join unknown
+  brigades across files or recover missing transcripts, tool results, notices or
+  copied records without UUIDs. Repeated prefixes are replayed to recover pending
+  calls and requests; a result without its call in that file remains unlinked.
+  The counts are limited to recorded activity;
+  `api-request-blob` copies are ignored. Codex sessions are not read.
+  The inbox parser accepts both banto-only and relayed-message prefaces and
+  recognizes banto's own-record header separately from member senders.
+
 **`director_turns.py`: what a Claude Director wrote in each turn.** It prints
 each Director session's turns, their trigger (`operator-typed`, `relay-woken`,
 `banto-notice` or `other/unknown`), assistant text characters and lines, and whether it called
@@ -175,7 +216,7 @@ characters of a session id, and no conversation text.
   `mcp_tool_call_end` whose `invocation.server` is `banto` and `invocation.tool` is
   `consult_goinkyo`, its `kind` from `invocation.arguments`. A Director is a session that
   called any Director-only banto tool (`consult_goinkyo`, `dismiss_goinkyo`, `name_member`,
-  `request_decision`, `open_planner`, `close_planner`, the same rule as `transcripts.py`), so a Director that never consulted
+  `request_decision`, `update_progress`, `open_planner`, `close_planner`, the same rule as `transcripts.py`), so a Director that never consulted
   still has a row of zeros on each day it was active. A subagent's file is left out.
 - **Refused calls are not consultations.** banto refuses a consultation (a Goinkyo is
   already in the cell, a missing argument) with an error result. In Claude Code that is a

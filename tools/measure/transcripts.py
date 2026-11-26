@@ -53,7 +53,7 @@ ASSUMPTION = (
 # banto's MCP tools reach the agent as mcp__banto__<tool>.
 BANTO_TOOL_PREFIX = "mcp__banto__"
 # Tools only a Director is given; a session that calls one is a Director.
-DIRECTOR_ONLY_TOOLS = {"consult_goinkyo", "dismiss_goinkyo", "name_member", "request_decision", "open_planner", "close_planner"}
+DIRECTOR_ONLY_TOOLS = {"consult_goinkyo", "dismiss_goinkyo", "name_member", "request_decision", "update_progress", "open_planner", "close_planner"}
 PLANNER_ONLY_TOOLS = {"write_plan", "release_plan"}
 # Text banto types into an agent's pane to make it call check_messages.
 NUDGE_PREFIX = "[banto relay]"
@@ -62,11 +62,11 @@ NUDGE_PREFIX = "[banto relay]"
 # errand builder skips them and its boundaries stay what they were before they existed.
 MARK_EVENTS = ("decision", "result")
 # The first line of a check_messages answer that delivered mail.
-DELIVERED_RE = re.compile(r"^\s*\d+ message\(s\) relayed by banto")
+DELIVERED_RE = re.compile(r"^\s*\d+ message\(s\) (?:relayed by banto|from banto itself)")
 # The header banto puts above each delivered message: [from worker-2 "name" — to you]
 FROM_RE = re.compile(r"^\[from [^\]]*\]\s*$")
 FROM_HDR_RE = re.compile(r"^\[from ([^\]]+)\]\s*$", re.M)
-FROM_PARTS_RE = re.compile(r'^(worker-\d+|goinkyo|director|planner|operator|banto)(?: "([^"]*)")?(?: — (to you|broadcast))?$')
+FROM_PARTS_RE = re.compile(r'^(worker-\d+|goinkyo|director|planner|operator|banto)(?: "([^"]*)")?(?: \(banto\'s own record, not another AI\'s words\))?(?: — (to you|broadcast))?(?: — banto refused tool calls .*)?$')
 # The first message a Worker / Goinkyo receives names its place in a brigade.
 WORKER_BRIEFING_RE = re.compile(r"You are (worker-\d+), a Worker in banto brigade (\d+)")
 GOINKYO_BRIEFING_RE = re.compile(r"You are the Goinkyo of banto brigade (\d+)")
