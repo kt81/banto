@@ -2531,7 +2531,7 @@ dialog, and the idle notice would be false in a brigade, where members are idle
 while the Director works. Relaying or converting it would ring once per idle member
 per turn, and the bell is meant to be rarer than every turn.
 
-**banto's own notification (`[attention] notify`, `auto` by default).** When it is
+**banto's own notification (`[attention] notify`, on by default).** When it is
 on, banto writes a desktop notification of its own to the host terminal each time it
 rings the host bell: `ESC ] 777 ; notify ; banto ; <body> ESC \` (`Cmd::NotifyHost`,
 built by `build_host_notification`), so the operator gets a banner naming what wants
@@ -2549,34 +2549,30 @@ system` the bell's sound and the notification's sound can both play. With
 `BANTO_BELL_LOG` set the notification gets a `notify` line of its own after the
 bell's, holding the byte count and whether the write worked, never the body.
 
-*The setting.* `auto` (the default), `osc777` or `off`, case-insensitive. `osc777`
-writes it in any terminal, `off` never does, and `auto` writes it exactly when
-`TERM_PROGRAM` is `ghostty` (an exact, case-sensitive match, read once at startup:
-`Env::term_program`, resolved by `resolve_host_notify` into the bool the core holds,
-so `auto` never reaches the bell). Unset, empty, `Ghostty`, `WezTerm`, `tmux` or
-anything else gets the bell alone, which is what banto did before. `auto` decides
-only whether to speak the one dialect banto has, OSC 777, and never picks a dialect.
-Why an exact `TERM_PROGRAM`: a positive match that falls back to silence cannot reach
-ConEmu or Windows Terminal, which guessing between OSC 9 and 777 could (OSC 9 means
-something else there). tmux sets `TERM_PROGRAM=tmux`, so it gets the bell alone, and
-tmux drops an OSC it does not know besides; ssh does not carry `TERM_PROGRAM`, so it
-gets the bell alone too, and whoever wants a banner over ssh or inside tmux writes
-`osc777`.
-
-*The list.* A terminal is added only after a banner was seen on a real machine from
-banto's own bytes, and what it does while its window is focused is known. Today that
-is Ghostty alone. Each terminal added changes what an operator who never touched the
-config gets on upgrade. What is known of Ghostty: on macOS (1.4.0) it was measured
-that the banner shows only when the window is not key or the surface is not focused
-(`shouldPresentNotification`), and that it needs the OS's notification permission for
-Ghostty. On GTK it was read in the source and not seen: the banner is shown even while
-the window is focused and withdrawn after 3 seconds; that is accepted and banto adds
-no focus gate of its own. Other terminals, read from their sources and not seen:
-WezTerm, kitty, foot and Fedora's patched VTE show an OSC 777 `notify`, upstream VTE
-does not (it gates 777 behind a property that is off by default and shows no toast),
-and Windows Terminal takes it only in 1.26 previews behind
-`compatibility.allowOSC777`. iTerm2, xterm, Alacritty, tmux and screen swallow it
-silently (read, not seen). None of those is on the list.
+The setting is `osc777` (the default) or `off`, case-insensitive. The default
+writes it in every terminal, with no
+guess about which terminal is on the other end, because an OSC 777 a terminal does not
+understand is swallowed silently. That was read in the sources, not seen, for xterm,
+xterm.js (so VS Code), Alacritty, iTerm2, Windows Terminal at its default settings,
+conhost with VT processing on, tmux, GNU screen and the Linux console. Two cases are
+unverified: Terminal.app (closed source), and conhost with
+`ENABLE_VIRTUAL_TERMINAL_PROCESSING` off, where the raw bytes may print; banto
+already writes OSC 52 and OSC 8 there unconditionally, so this adds no new kind of
+exposure. Where it is shown: Ghostty 1.4.0 on macOS was measured (the operator,
+2026-11-27) to show a banner from banto's own bytes while its window is in the
+background and none while it is focused (it needs the OS's notification permission
+for Ghostty). Ghostty on GTK, WezTerm, kitty, foot and Fedora's patched VTE were read
+in the source and not seen: Ghostty on GTK shows it even while focused and withdraws
+it after 3 seconds. Windows Terminal shows it only in 1.26 previews behind
+`compatibility.allowOSC777`, read in the source and not seen. Upstream VTE does not
+show it (read, not seen: it gates 777 behind a property that is off by default and
+shows no toast). tmux drops an OSC it does not know (read, not seen), so inside tmux
+the operator gets the bell alone; whoever wants more there has to let tmux pass it
+through. It is OSC 777 and not OSC 9, the other common dialect, because OSC 9 means
+something else on ConEmu and Windows Terminal, where it would not be ignored. The
+consequence is that a terminal which shows banners while its window is focused will
+show one for each ring too, and `off` is the way out; banto adds no focus gate of its
+own.
 
 **One event, one ring.** The bell is rung for events, not for row marks, and does
 not depend on what the list shows (a search that hides the Director's row does not

@@ -469,7 +469,7 @@ prefix = "C-b"      # pane prefix chord; a backslash is written 'C-\' or "C-\\" 
                     # on macOS/Linux, portable chords are a-z except i and m, space, \ ] ^ _ and their digit twins 4-7
 
 [attention]
-notify = "auto"     # "auto": a desktop notification (OSC 777) with each bell in Ghostty; "osc777": in any terminal; "off": the bell only
+notify = "osc777"   # a desktop notification (OSC 777) with each bell; terminals without it ignore it. "off": the bell only
 ```
 
 When banto writes a notification, the banner names the session or brigade by its title, and the terminal needs the OS's notification permission.

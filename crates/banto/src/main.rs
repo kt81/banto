@@ -366,7 +366,6 @@ fn main() -> Result<()> {
                     brigade: &config.brigade,
                     keys: &config.keys,
                     attention: &config.attention,
-                    term_program: inputs.env.term_program.as_deref(),
                     agent_binaries: &config.agent_binaries,
                     resolved_agents: &resolved_agents,
                     child: &resolved,

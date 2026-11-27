@@ -72,24 +72,23 @@ impl<'de> Deserialize<'de> for RelayMode {
 /// Whether banto also writes a desktop notification to its own terminal each
 /// time it rings the host bell (`[attention] notify` in config.toml).
 ///
-/// `auto` decides only *whether* to speak the one dialect banto has, OSC 777; it
-/// never picks a dialect, because OSC 9, the other common one, means something
-/// else on ConEmu and Windows Terminal. Which terminals show 777, and which were
-/// seen doing it, is in `docs/REQUIREMENTS.md` ("banto's own notification").
+/// On by default because every terminal and multiplexer checked swallows an OSC
+/// 777 it does not understand without a trace, so the bytes cost nothing where
+/// they are not shown; the terminals that do show them, and the two cases left
+/// unverified, are in `docs/REQUIREMENTS.md` ("banto's own notification"). It is
+/// OSC 777 and not OSC 9, the other common dialect, because OSC 9 means
+/// something else on ConEmu and Windows Terminal, where it would not be ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HostNotify {
-    /// OSC 777 when [`resolve_host_notify`] knows the terminal, the bell alone
-    /// otherwise.
+    /// `ESC ] 777 ; notify ; <title> ; <body> ESC \`, whatever the terminal.
     #[default]
-    Auto,
+    Osc777,
     /// The bell only.
     Off,
-    /// `ESC ] 777 ; notify ; <title> ; <body> ESC \`, whatever the terminal.
-    Osc777,
 }
 
-/// `"auto"`, `"osc777"` or `"off"`, trimmed and case-insensitive like the other
-/// word settings.
+/// `"osc777"` or `"off"`, trimmed and case-insensitive like the other word
+/// settings.
 impl<'de> Deserialize<'de> for HostNotify {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -97,32 +96,10 @@ impl<'de> Deserialize<'de> for HostNotify {
     {
         let raw = String::deserialize(deserializer)?;
         match raw.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(HostNotify::Auto),
-            "off" => Ok(HostNotify::Off),
             "osc777" => Ok(HostNotify::Osc777),
-            _ => Err(not_accepted(
-                "notify",
-                &raw,
-                "\"auto\", \"osc777\" or \"off\"",
-            )),
+            "off" => Ok(HostNotify::Off),
+            _ => Err(not_accepted("notify", &raw, "\"osc777\" or \"off\"")),
         }
-    }
-}
-
-/// Whether banto writes the notification: the two-valued answer the core works
-/// with, so `Auto` never reaches the bell. `term_program` is `$TERM_PROGRAM` as
-/// banto started with it.
-///
-/// `auto` matches `ghostty` exactly, case-sensitively. A terminal joins this list
-/// only after a banner was seen on a real machine from banto's own bytes and its
-/// behaviour with the window focused is known (`docs/REQUIREMENTS.md`, "banto's
-/// own notification"); each one added changes what an operator who never touched
-/// the config gets.
-pub fn resolve_host_notify(setting: HostNotify, term_program: Option<&str>) -> bool {
-    match setting {
-        HostNotify::Off => false,
-        HostNotify::Osc777 => true,
-        HostNotify::Auto => term_program == Some("ghostty"),
     }
 }
 
@@ -2977,17 +2954,15 @@ data_dir = \"C:/synthetic/banto-data\"
     }
 
     #[test]
-    fn attention_notify_is_auto_unless_the_file_says_otherwise() {
-        assert_eq!(Config::default().attention.notify, HostNotify::Auto);
-        assert_eq!(parse("").attention.notify, HostNotify::Auto);
-        assert_eq!(parse("[attention]\n").attention.notify, HostNotify::Auto);
+    fn attention_notify_is_osc777_unless_the_file_says_otherwise() {
+        assert_eq!(Config::default().attention.notify, HostNotify::Osc777);
+        assert_eq!(parse("").attention.notify, HostNotify::Osc777);
+        assert_eq!(parse("[attention]\n").attention.notify, HostNotify::Osc777);
     }
 
     #[test]
-    fn attention_notify_takes_auto_osc777_or_off_and_refuses_anything_else() {
+    fn attention_notify_takes_osc777_or_off_and_refuses_anything_else() {
         for (ok, mode) in [
-            ("auto", HostNotify::Auto),
-            (" AUTO ", HostNotify::Auto),
             ("off", HostNotify::Off),
             ("Off", HostNotify::Off),
             ("osc777", HostNotify::Osc777),
@@ -3001,49 +2976,22 @@ data_dir = \"C:/synthetic/banto-data\"
                 "{ok}"
             );
         }
-        for bad in ["\"typo\"", "\"\"", "\"osc9\"", "\"osc 777\"", "\"on\""] {
+        for bad in [
+            "\"auto\"",
+            "\"typo\"",
+            "\"\"",
+            "\"osc9\"",
+            "\"osc 777\"",
+            "\"on\"",
+        ] {
             assert_refused_naming(
                 &format!("[attention]\nnotify = {bad}\n"),
                 "notify",
                 bad.trim_matches('"'),
-                &["auto", "osc777", "off"],
+                &["osc777", "off"],
             );
         }
         assert_wrong_type("[attention]\nnotify = true\n", "a string");
-    }
-
-    /// The list `auto` speaks to, pinned: adding a terminal is a deliberate edit
-    /// of this table as well as of [`resolve_host_notify`].
-    #[test]
-    fn auto_speaks_only_where_term_program_is_exactly_ghostty() {
-        let programs = [
-            Some("ghostty"),
-            Some("Ghostty"),
-            Some("GHOSTTY"),
-            Some(" ghostty"),
-            Some("ghostty "),
-            Some("WezTerm"),
-            Some("tmux"),
-            Some("iTerm.app"),
-            Some("vscode"),
-            Some(""),
-            None,
-        ];
-        for program in programs {
-            assert_eq!(
-                resolve_host_notify(HostNotify::Auto, program),
-                program == Some("ghostty"),
-                "auto with {program:?}"
-            );
-            assert!(
-                resolve_host_notify(HostNotify::Osc777, program),
-                "osc777 with {program:?}"
-            );
-            assert!(
-                !resolve_host_notify(HostNotify::Off, program),
-                "off with {program:?}"
-            );
-        }
     }
 
     #[test]

@@ -46,8 +46,8 @@ use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::app::{App, Mode};
 use banto_core::config::{
-    AgentBinaries, AttentionConfig, BrigadeConfig, GoinkyoConsult, KeysConfig, RelayMode,
-    ResolvedAgents,
+    AgentBinaries, AttentionConfig, BrigadeConfig, GoinkyoConsult, HostNotify, KeysConfig,
+    RelayMode, ResolvedAgents,
 };
 use banto_core::engine::{
     self, Axis, BellCause, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
@@ -368,9 +368,6 @@ pub struct EmporiumSettings<'a> {
     /// `[attention]`: whether a ring of the host bell also writes a desktop
     /// notification.
     pub attention: &'a AttentionConfig,
-    /// `TERM_PROGRAM` as banto started with it, which `attention.notify = "auto"`
-    /// is resolved against.
-    pub term_program: Option<&'a str>,
     /// `[agent_binaries]` — see `crate::launch::agent_binary`.
     pub agent_binaries: &'a AgentBinaries,
     /// `Config.agents`, resolved.
@@ -495,7 +492,7 @@ pub fn run(
         &mut app,
         &deps,
         keys,
-        banto_core::config::resolve_host_notify(settings.attention.notify, settings.term_program),
+        settings.attention.notify == HostNotify::Osc777,
         startup_notices,
     );
     let restored = restore_terminal();

@@ -1420,9 +1420,8 @@ pub struct EmporiumState {
     /// The same for the switch.
     persisted_bell_when_focused: bool,
     /// Whether a ring of the host bell also carries a desktop notification
-    /// (`[attention] notify`, resolved by [`crate::config::resolve_host_notify`]).
-    /// A bool, not the setting: `auto` is settled at the edge and cannot reach the
-    /// bell. Set once at startup, so a test that never sets it sees the bell alone.
+    /// (`[attention] notify`). A bool, not the setting: the shell maps it once at
+    /// startup, and a test that never sets it sees the bell alone.
     host_notify: bool,
     /// The agent the Worker picker was last confirmed with, which the next
     /// picker opens on (with that agent's defaults). `None` until one is
