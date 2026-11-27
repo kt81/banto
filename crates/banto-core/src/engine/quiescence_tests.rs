@@ -12011,3 +12011,208 @@ fn with_bell_always_on_a_pane_that_is_not_effectively_focused_still_records_mark
         assert!(app.has_brigade_mark("solo"));
     }
 }
+
+// --- a BEL from a session in no brigade that is not on stage --------------------------------------
+
+const BEL: &[u8] = b"\x07";
+
+#[test]
+fn a_bell_from_an_off_stage_lone_session_marks_its_row_and_rings_once_by_its_title() {
+    for staged_elsewhere in [false, true] {
+        let (mut state, mut app, panes, at) = lone_world(&["solo", "other"]);
+        let pane = &panes[0];
+        if staged_elsewhere {
+            state.stage = Stage::Solo(panes[1].clone());
+            tick(&mut state, &mut app, at);
+        }
+        let cmds = said(&mut state, &mut app, pane, BEL, at + SECOND);
+        let cmds = [cmds, tick(&mut state, &mut app, at + 2 * SECOND)].concat();
+        assert_eq!(
+            bell_causes(&cmds),
+            vec![BellCause::OffStagePaneBell {
+                pane: pane.clone(),
+                others: 0
+            }],
+            "staged elsewhere {staged_elsewhere}: {cmds:?}"
+        );
+        assert!(
+            app.has_brigade_mark("solo"),
+            "staged elsewhere {staged_elsewhere}: the row is marked"
+        );
+        assert!(app.is_waiting_id("solo"), "and counted");
+        assert!(
+            !state.attention_panes().contains(pane),
+            "no tile to speak by"
+        );
+        assert_eq!(
+            state.notification_body(&app, &bell_causes(&cmds)[0]),
+            "\"Fix relay\" rang the bell"
+        );
+    }
+}
+
+/// A BEL from `pane`, then the tick after it.
+fn bell_from(state: &mut EmporiumState, app: &mut App, pane: &SessionKey, at: Instant) -> Vec<Cmd> {
+    let cmds = said(state, app, pane, BEL, at);
+    [cmds, tick(state, app, at + SECOND)].concat()
+}
+
+#[test]
+fn a_second_bell_under_the_standing_latch_is_silent_and_a_looked_at_pane_rings_for_a_new_one() {
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    assert!(rang(&bell_from(&mut state, &mut app, pane, at)));
+    // Well past the cooldown, so only the latch can be what holds it back.
+    let cmds = bell_from(&mut state, &mut app, pane, at + 20 * SECOND);
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(app.has_brigade_mark("solo"));
+
+    // Looked at: the latch and the mark end, and the next bell is a new event.
+    state.stage = Stage::Solo(pane.clone());
+    state.focus = Focus::Pane;
+    tick(&mut state, &mut app, at + 30 * SECOND);
+    assert!(!app.has_brigade_mark("solo"));
+    state.stage = Stage::Empty;
+    state.focus = Focus::Sidebar;
+    tick(&mut state, &mut app, at + 31 * SECOND);
+    let cmds = bell_from(&mut state, &mut app, pane, at + 40 * SECOND);
+    assert!(rang(&cmds), "{cmds:?}");
+    assert!(app.has_brigade_mark("solo"));
+}
+
+#[test]
+fn staging_the_pane_moves_a_lone_sessions_bell_mark_to_its_tile_without_a_second_ring() {
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    assert!(rang(&bell_from(&mut state, &mut app, pane, at)));
+    assert!(app.has_brigade_mark("solo"));
+
+    // Staged with the focus still on the list: the tile speaks, nothing rings.
+    state.stage = Stage::Solo(pane.clone());
+    let cmds = tick(&mut state, &mut app, at + 20 * SECOND);
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(
+        state.attention_panes().contains(pane),
+        "the tile carries it"
+    );
+    assert!(!app.has_brigade_mark("solo"), "the row's mark moved");
+
+    // And back off stage with the latch still standing: marked again, still no ring.
+    state.stage = Stage::Empty;
+    let cmds = tick(&mut state, &mut app, at + 30 * SECOND);
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(app.has_brigade_mark("solo"));
+}
+
+#[test]
+fn reaching_a_lone_sessions_pane_clears_its_bell_mark_and_the_pane_going_drops_it() {
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    bell_from(&mut state, &mut app, pane, at);
+    state.stage = Stage::Solo(pane.clone());
+    state.focus = Focus::Pane;
+    let cmds = tick(&mut state, &mut app, at + 5 * SECOND);
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(!app.has_brigade_mark("solo"));
+    assert!(state.latched_attention_panes.is_empty());
+
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    bell_from(&mut state, &mut app, pane, at);
+    assert!(app.has_brigade_mark("solo"));
+    unhost(&mut state, pane);
+    tick(&mut state, &mut app, at + 5 * SECOND);
+    assert!(!app.has_brigade_mark("solo"));
+    assert!(state.row_announced_waits.is_empty() && state.latch_announced_waits.is_empty());
+}
+
+#[test]
+fn a_bell_with_the_operator_in_the_lone_sessions_pane_latches_nothing() {
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    state.stage = Stage::Solo(pane.clone());
+    state.focus = Focus::Pane;
+    let cmds = bell_from(&mut state, &mut app, pane, at);
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(!app.has_brigade_mark("solo"));
+}
+
+#[test]
+fn bells_from_two_off_stage_lone_sessions_in_one_tick_ring_once_naming_the_lowest_id() {
+    let (mut state, mut app, panes, at) = lone_world(&["b-solo", "a-solo"]);
+    // Each bell is its own event and announces at once, so two reaching one
+    // update means both latched since the last one: latched here directly.
+    for pane in &panes {
+        state.latched_attention_panes.insert(pane.clone());
+    }
+    let cmds = tick(&mut state, &mut app, at + SECOND);
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::OffStagePaneBell {
+            pane: key("a-solo"),
+            others: 1
+        }],
+        "{cmds:?}"
+    );
+    assert!(app.has_brigade_mark("a-solo") && app.has_brigade_mark("b-solo"));
+}
+
+#[test]
+fn a_bell_from_a_staged_lone_pane_and_from_an_off_stage_member_are_as_they_were() {
+    // A pane staged alone: its tile speaks, the row is not marked.
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    state.stage = Stage::Solo(pane.clone());
+    tick(&mut state, &mut app, at);
+    let cmds = bell_from(&mut state, &mut app, pane, at + SECOND);
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::StagedPaneBell {
+            pane: pane.clone(),
+            others: 0
+        }]
+    );
+    assert!(!app.has_brigade_mark("solo"));
+
+    // A live member off stage: its Director's row, never its own.
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    app.replace_rows(vec![titled("dir", "Fix relay"), titled("wk", "Worker")]);
+    state.stage = Stage::Empty;
+    tick(&mut state, &mut app, at);
+    let cmds = bell_from(&mut state, &mut app, &worker, at + SECOND);
+    assert_eq!(
+        bell_causes(&cmds)
+            .iter()
+            .map(|cause| matches!(cause, BellCause::OffStageMemberBell { .. }))
+            .collect::<Vec<_>>(),
+        vec![true],
+        "{cmds:?}"
+    );
+    assert!(app.has_brigade_mark("dir"), "the Director's row");
+    assert!(!app.has_brigade_mark("wk"));
+    let _ = director;
+}
+
+#[test]
+fn the_causes_of_a_session_in_no_brigade_read_as_one_line_of_ids_and_counts() {
+    let pane = key("solo");
+    let lines: Vec<String> = [
+        BellCause::PaneQuietRecorded {
+            pane: pane.clone(),
+            others: 1,
+        },
+        BellCause::PaneQuietFocused { pane: pane.clone() },
+        BellCause::OffStagePaneBell { pane, others: 2 },
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    assert_eq!(
+        lines,
+        [
+            "pane_quiet_recorded pane=solo others=1",
+            "pane_quiet_focused pane=solo",
+            "off_stage_pane_bell pane=solo others=2",
+        ]
+    );
+}

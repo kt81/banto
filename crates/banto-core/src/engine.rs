@@ -1743,13 +1743,13 @@ pub struct EmporiumState {
     request_answered: HashMap<BrigadeId, i64>,
     /// Brigades whose next quiet point a request has spent ([`apply_request_fact`]).
     request_spent: HashSet<BrigadeId>,
-    /// Members whose wait (a waiting session, a Codex pane reporting `blocked`, a
-    /// BEL) has rung through their Director's row while their brigade was not on
-    /// stage, and is still standing. Staging the brigade moves the mark onto the
-    /// member's tile but must not ring for the same wait a second time
-    /// ([`refresh_waiting_display`] counts these as already rung for). Ends with
-    /// the wait, so a new one rings. Keyed by pane, so [`EmporiumState::
-    /// rekey_pane_state`] carries it.
+    /// Panes whose wait (a waiting session, a Codex pane reporting `blocked`, a
+    /// BEL) has rung through a row while they were not on stage, and is still
+    /// standing: a member's through its Director's row, a session in no brigade's
+    /// BEL through its own. Staging the pane moves the mark onto its tile but must
+    /// not ring for the same wait a second time ([`refresh_waiting_display`]
+    /// counts these as already rung for). Ends with the wait, so a new one rings.
+    /// Keyed by pane, so [`EmporiumState::rekey_pane_state`] carries it.
     row_announced_waits: HashSet<SessionKey>,
     /// Members whose wait has been shown on their own tile, because their pane was
     /// on stage when it stood: it has had its ring, and a brigade that leaves the
@@ -2252,6 +2252,13 @@ impl EmporiumState {
                 format!(
                     "{} is waiting{}",
                     self.session_call(app, session),
+                    more(others)
+                )
+            }
+            BellCause::OffStagePaneBell { pane, others } => {
+                format!(
+                    "{} rang the bell{}",
+                    self.session_call(app, pane),
                     more(others)
                 )
             }
@@ -4462,6 +4469,10 @@ pub enum BellCause {
         brigade: BrigadeId,
         others: usize,
     },
+    /// A session that is no live member of a brigade and is not on stage rang
+    /// BEL, announced through its own list row (the lone counterpart of
+    /// [`Self::OffStageMemberBell`], which speaks through a Director's row).
+    OffStagePaneBell { pane: SessionKey, others: usize },
     /// A hosted member that is not on stage began waiting on the operator
     /// (a waiting session, or a Codex pane reporting `blocked`), announced
     /// through its Director's row.
@@ -4534,6 +4545,11 @@ impl std::fmt::Display for BellCause {
                 f,
                 "off_stage_member_bell member={} brigade={brigade} others={others}",
                 member.log_id()
+            ),
+            Self::OffStagePaneBell { pane, others } => write!(
+                f,
+                "off_stage_pane_bell pane={} others={others}",
+                pane.log_id()
             ),
             Self::OffStageMemberWait {
                 member,
@@ -5036,7 +5052,8 @@ pub fn update(
             }
             if rang && effective_focused_pane(state).as_ref() != Some(&key) {
                 state.latched_attention_panes.insert(key.clone());
-                // A latch on an off-stage member marks its Director's row.
+                // A latch on an off-stage pane marks a row: a member's
+                // Director's, or a session in no brigade's own.
                 overlay_may_have_changed = true;
             }
             cmds
@@ -6444,7 +6461,10 @@ fn go_to_director(
 /// each member's wait the first time it is announced. A session in no brigade
 /// that went quiet ([`EmporiumState::solo_attention`]) is marked in the same set
 /// by its own row, and its mark ends on effective focus, with its pane, or when
-/// the pane becomes a member; [`update_solo_quiet`] rings for it. A brigade wants him when it
+/// the pane becomes a member; [`update_solo_quiet`] rings for it. A session in no
+/// brigade that rang BEL while off stage speaks through its own row the way an
+/// off-stage member does through its Director's (nothing else announces it: it
+/// has no tile, and its row shows no Waiting for a BEL). A brigade wants him when it
 /// went quiet ([`EmporiumState::attention`]; [`update_brigade_quiet`] rings when
 /// it makes the record), or, for a member that is NOT on stage, when that member
 /// is waiting on him (its session file says `waiting`, or the Codex pane reports
@@ -6528,7 +6548,7 @@ fn sync_brigade_marks(state: &mut EmporiumState, app: &mut App, now: Instant) ->
     let mut on_tile_now: HashSet<SessionKey> = HashSet::new();
     let mut by_latch_now: HashSet<SessionKey> = HashSet::new();
     let mut ended: Vec<SessionKey> = Vec::new();
-    let mut news: Vec<(SessionKey, BrigadeId, bool)> = Vec::new();
+    let mut news: Vec<(SessionKey, Option<BrigadeId>, bool)> = Vec::new();
     for key in state.screens.keys() {
         let is_director = state.member_tokens.get(key).map(String::as_str) == Some(DIRECTOR_TOKEN);
         let activity = state.displayed_activity(app, key);
@@ -6557,6 +6577,23 @@ fn sync_brigade_marks(state: &mut EmporiumState, app: &mut App, now: Instant) ->
             on_tile_now.insert(key.clone());
             continue;
         }
+        if !state.is_live_member(key) {
+            // A session in no brigade, off stage, speaks through its own row,
+            // as a member does through its Director's. Only a BEL is news
+            // here: a Claude session that is Waiting, or a Codex pane that is
+            // blocked, already shows it on its row, and the list's own edge
+            // rings for it.
+            if latched {
+                marked.insert(key);
+                if !state.row_announced_waits.contains(key)
+                    && !state.tile_announced_waits.contains(key)
+                {
+                    news.push((key.clone(), None, true));
+                }
+                announced_now.insert(key.clone());
+            }
+            continue;
+        }
         let Some(&brigade_id) = state.member_brigades.get(key) else {
             continue;
         };
@@ -6568,7 +6605,7 @@ fn sync_brigade_marks(state: &mut EmporiumState, app: &mut App, now: Instant) ->
         }
         marked.insert(director);
         if !state.row_announced_waits.contains(key) && !state.tile_announced_waits.contains(key) {
-            news.push((key.clone(), brigade_id, latched));
+            news.push((key.clone(), Some(brigade_id), latched));
         }
         announced_now.insert(key.clone());
     }
@@ -6607,18 +6644,21 @@ fn sync_brigade_marks(state: &mut EmporiumState, app: &mut App, now: Instant) ->
         return Vec::new();
     };
     let others = news.len() - 1;
-    let cause = if latched {
-        BellCause::OffStageMemberBell {
+    let cause = match brigade {
+        None => BellCause::OffStagePaneBell {
+            pane: member,
+            others,
+        },
+        Some(brigade) if latched => BellCause::OffStageMemberBell {
             member,
             brigade,
             others,
-        }
-    } else {
-        BellCause::OffStageMemberWait {
+        },
+        Some(brigade) => BellCause::OffStageMemberWait {
             member,
             brigade,
             others,
-        }
+        },
     };
     ring_host_bell(state, app, now, cause)
 }
@@ -31922,6 +31962,14 @@ mod tests {
                 others: 1
             }),
             "worker-2 of \"Fix relay\" rang the bell (+1 more)"
+        );
+        assert_eq!(
+            body(BellCause::OffStagePaneBell {
+                pane: SessionKey::from_id("plain"),
+                others: 1
+            }),
+            "\"Plain one\" rang the bell (+1 more)",
+            "a lone session is named by its title, not as a member"
         );
         // No title, no stored name: the number, never an empty quote.
         assert_eq!(

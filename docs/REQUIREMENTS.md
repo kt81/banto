@@ -1350,8 +1350,21 @@ brigade lost from the store by another path, which leaves its panes in neither
 watch. A solo Codex pane keeps the key of the thread it was opened on ("Codex data
 sources", *Not covered*), so the mark and the banner may name the old thread.
 
-*Not changed.* A BEL a lone session's child rang while it was off stage is latched
-and announced by nothing, as before.
+*The BEL of a lone session off stage (a gap, now closed).* A BEL a lone session's
+child rang while it was off stage was latched and announced by nothing: no row mark,
+no `waiting N`, no bell, no banner, because a staged pane speaks through its tile and
+a member through its Director's row, and this pane had neither. The operator's words:
+"BELの件も直してください" (*fix the BEL too*). It now speaks through its own list
+row, the rule the other two follow ("Attention", *On stage and off*): the row gets the
+waiting-colour dot and counts in `waiting N`, and the host bell rings once, with the
+banner `"<title>" rang the bell` (cause `off_stage_pane_bell`). Staging the pane
+moves the mark to its tile with no second ring; a second BEL under the latch is
+silent; the latch ends, as any BEL latch does, when the pane is effectively focused,
+and with its pane. Only a BEL is news for it: a lone session that is Waiting, or a
+Codex pane that is `blocked`, already shows on its row, and the list's own edge rings
+for it. A disband leaves the surviving Director's pane open as a lone one, so its BEL
+speaks through its own row too, and for the moment a disband is in flight its Workers
+read the same way.
 
 ## Goinkyo's product: `goinkyo_agent` (2026-11-23)
 
@@ -1969,7 +1982,8 @@ leaves no mark when the operator is in the Director's pane with F4 on),
 mark), `staged_pane_bell`
 (pane, others: a staged pane's BEL), `staged_pane_wait` (pane, others),
 `list_row_waiting` (session, others: a list row that began Waiting and is on no
-tile), `off_stage_member_bell` and `off_stage_member_wait` (member, brigade,
+tile), `off_stage_pane_bell` (pane, others: a BEL from a session in no brigade that
+is not on stage), `off_stage_member_bell` and `off_stage_member_wait` (member, brigade,
 others); where several waits gained a place in the same update the cause names one
 and `others` counts the rest. A ring the cooldown swallowed is never a bell and is
 not logged. The cause changes no decision: it is carried on `Cmd::RingHostBell` for
@@ -2582,7 +2596,11 @@ its own (members are hidden from the list), so its Director's row speaks for it:
 when the member is Claude `waiting`, a Codex pane reporting `blocked`, or its child
 rang BEL while the pane was not effectively focused, the Director's row gets the
 waiting-colour dot and counts in `waiting N`. A member that is waiting only on a
-dialog the operator opened neither marks nor rings, as everywhere. A quiet brigade's
+dialog the operator opened neither marks nor rings, as everywhere. A session in no
+brigade has no Director, so when its pane is not on stage and its child rang BEL
+while it was not effectively focused, its own row gets the dot and counts in
+`waiting N` and the bell rings once, with the banner `"<title>" rang the bell`
+(until 2026-11-27 nothing announced it: "Decision (2026-11-27)"). A quiet brigade's
 fire, or a Director's decision request with `request_attention` on, marks the row
 the same way whether or not the brigade is on stage (and the Director's tile, if it
 is, since the tile reads the same Waiting row); the mark counts in `waiting N`,
@@ -2664,7 +2682,8 @@ Director's row when its pane was off stage, or on its own tile when it was on st
 It does not ring again when its brigade moves on or off the stage with the wait
 still standing: staging moves the mark from the row to the member's tile with no
 second ring, and leaving a brigade for another with a wait that began on stage still
-standing marks the row without one. A second member's wait rings even while the
+standing marks the row without one; the same holds for a lone session's BEL, whose
+row is its own. A second member's wait rings even while the
 Director's row is already marked; a second quiet fire under a quiet mark that is
 still standing does not, being the same unlooked-at attention (the quiet fire rings
 when its record is made). A wait ends when something is known about the pane that is
