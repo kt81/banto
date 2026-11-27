@@ -477,6 +477,150 @@ pub fn read_plan_text(role: BrigadeRole, view: Option<&PlanView>) -> String {
     out
 }
 
+/// [`read_plan_text`] as the parts one `read_plan` call hands over, each at most
+/// `budget` bytes of UTF-8 with its own header and footer. A view that fits is a
+/// single part and its text is `read_plan_text`'s, byte for byte.
+///
+/// The view is cut because the reader's product cuts a long tool output in the
+/// middle without an error; unlike a mailbox, a Plan can be asked for again, so
+/// the cut is made here, at line boundaries, and the reader asks for the rest.
+pub fn read_plan_parts(role: BrigadeRole, view: Option<&PlanView>, budget: usize) -> Vec<String> {
+    let text = read_plan_text(role, view);
+    let Some(view) = view else {
+        return vec![text];
+    };
+    let number = view.plan.number;
+    let in_force = view.in_force.as_ref().map(|version| version.version);
+    let draft = view
+        .pending
+        .as_ref()
+        .filter(|_| role == BrigadeRole::Planner)
+        .map(|version| version.version);
+    split_into_parts(
+        &text,
+        budget,
+        |part, of| part_header(number, in_force, draft, part, of),
+        part_footer,
+    )
+}
+
+/// What a part of a view begins with when the view has more than one: the Plan, the
+/// versions its text shows (a draft only where the reader is shown one), and where
+/// the part stands. The versions are there because a Plan can change between two
+/// calls, and a reader holding parts of two versions must know to start over.
+pub fn part_header(
+    number: i64,
+    in_force: Option<i64>,
+    draft: Option<i64>,
+    part: usize,
+    of: usize,
+) -> String {
+    let in_force = in_force.map_or_else(|| "none".to_string(), |version| version.to_string());
+    let draft = draft.map_or_else(String::new, |version| format!(", draft {version}"));
+    format!("[banto] Plan {number}, version in force {in_force}{draft}, part {part} of {of}\n\n")
+}
+
+/// What every part but the last ends with.
+pub fn part_footer(part: usize) -> String {
+    format!(
+        "\n[banto] More of this Plan follows: call read_plan with part = {}.\n",
+        part + 1
+    )
+}
+
+/// Split `text` into parts of at most `budget` bytes, header and footer counted,
+/// cut at line boundaries (a line longer than a part is cut at a character
+/// boundary). Text that fits is returned whole with no header and no footer. Taking
+/// the parts apart again, `header(i, n)` + piece + `footer(i)` for every part but
+/// the last, which has no footer, gives the pieces back in order, and joined they
+/// are `text`.
+///
+/// The frame's width depends on how many digits the part numbers have, and the
+/// count of parts on the width of the frame, so the room is reserved for the
+/// widest numbers of a given digit count and that count is raised until the parts
+/// that result need no more digits than it was reserved for. A frame never
+/// outgrows its reservation, so no part exceeds the budget, provided the budget
+/// leaves room for the frame of the widest part numbers it needs and four bytes
+/// (the longest character) of text beside it. A budget below that cannot be kept:
+/// the pieces are then four bytes or more and the parts exceed it, and a debug
+/// build stops there. The caller passes a budget measured in kilobytes against a
+/// frame of about a hundred bytes.
+pub fn split_into_parts(
+    text: &str,
+    budget: usize,
+    header: impl Fn(usize, usize) -> String,
+    footer: impl Fn(usize) -> String,
+) -> Vec<String> {
+    if text.len() <= budget {
+        return vec![text.to_string()];
+    }
+    for digits in 1..=usize::MAX.ilog10() as usize {
+        let widest = 10usize.pow(digits as u32) - 1;
+        let frame = header(widest, widest).len() + footer(widest).len();
+        // Room for a character, whatever the frame takes: a budget that small is
+        // not a real one, and the cut below needs at least four bytes to place.
+        let room = budget.saturating_sub(frame).max(4);
+        let pieces = split_at_lines(text, room);
+        if pieces.len().to_string().len() > digits {
+            continue;
+        }
+        debug_assert!(
+            budget >= frame + 4,
+            "a budget of {budget} bytes cannot hold a frame of {frame} and a character"
+        );
+        let of = pieces.len();
+        return pieces
+            .into_iter()
+            .enumerate()
+            .map(|(index, piece)| {
+                let part = index + 1;
+                let footer = if part < of {
+                    footer(part)
+                } else {
+                    String::new()
+                };
+                format!("{}{piece}{footer}", header(part, of))
+            })
+            .collect();
+    }
+    vec![text.to_string()]
+}
+
+/// `text` in consecutive pieces of at most `room` bytes, each ending at the end of
+/// a line when it can. `room` is at least four, the longest character.
+fn split_at_lines(text: &str, room: usize) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut end = 0;
+    for line in text.split_inclusive('\n') {
+        if end - start + line.len() <= room {
+            end += line.len();
+            continue;
+        }
+        if end > start {
+            pieces.push(&text[start..end]);
+            start = end;
+        }
+        // A line that is more than a piece is cut where a character ends; what is
+        // left of it, short enough, goes on being filled by the lines after it.
+        let mut rest = line;
+        while rest.len() > room {
+            let mut at = room;
+            while !rest.is_char_boundary(at) {
+                at -= 1;
+            }
+            pieces.push(&text[start..start + at]);
+            start += at;
+            rest = &rest[at..];
+        }
+        end = start + rest.len();
+    }
+    if end > start {
+        pieces.push(&text[start..end]);
+    }
+    pieces
+}
+
 /// The file a Planner reads on its first turn: the operator's request in their own
 /// words, and what the Director already knows, kept apart so the Planner can tell
 /// which is which. The first turn cannot call banto's tools (they are not
@@ -924,6 +1068,206 @@ mod tests {
             read_plan_text(BrigadeRole::Worker, None),
             "This brigade has no open Plan."
         );
+    }
+
+    /// A frame of fixed width for the splitting tests: the budget arithmetic is
+    /// then plain, and the real header and footer have their own test.
+    fn frame_header(part: usize, of: usize) -> String {
+        format!("<{part}/{of}>\n")
+    }
+
+    fn frame_footer(part: usize) -> String {
+        format!("\n(next {})\n", part + 1)
+    }
+
+    fn split(text: &str, budget: usize) -> Vec<String> {
+        split_into_parts(text, budget, frame_header, frame_footer)
+    }
+
+    /// The pieces of `parts` with every header and footer taken off, joined.
+    fn unframed(parts: &[String]) -> String {
+        let of = parts.len();
+        parts
+            .iter()
+            .enumerate()
+            .map(|(index, part)| {
+                let part_no = index + 1;
+                let rest = part
+                    .strip_prefix(&frame_header(part_no, of))
+                    .unwrap_or_else(|| panic!("part {part_no} has no header: {part:?}"));
+                if part_no < of {
+                    rest.strip_suffix(&frame_footer(part_no))
+                        .unwrap_or_else(|| panic!("part {part_no} has no footer: {part:?}"))
+                } else {
+                    assert!(
+                        !rest.contains("(next"),
+                        "the last part has a footer: {part:?}"
+                    );
+                    rest
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_view_that_fits_is_one_part_and_is_returned_as_it_is() {
+        let text = "line one\nline two\n";
+        assert_eq!(split(text, text.len()), vec![text.to_string()]);
+        assert_eq!(split("", 10), vec![String::new()]);
+        let view = PlanView {
+            plan: plan(PlanState::Approved),
+            in_force: Some(version(1, VersionKind::OperatorApproved)),
+            pending: None,
+        };
+        assert_eq!(
+            read_plan_parts(BrigadeRole::Worker, Some(&view), 32_000),
+            vec![read_plan_text(BrigadeRole::Worker, Some(&view))]
+        );
+        assert_eq!(
+            read_plan_parts(BrigadeRole::Worker, None, 5),
+            vec!["This brigade has no open Plan.".to_string()],
+            "the words about there being no Plan are not cut"
+        );
+    }
+
+    #[test]
+    fn one_byte_over_the_budget_makes_two_parts_each_within_it() {
+        let line = "0123456789\n";
+        let text = line.repeat(4);
+        // Room for exactly two lines after the frame of a one-digit part.
+        let frame = frame_header(9, 9).len() + frame_footer(9).len();
+        let budget = frame + 2 * line.len();
+        let parts = split(&text, budget);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(parts.iter().all(|part| part.len() <= budget), "{parts:?}");
+        assert_eq!(unframed(&parts), text);
+        assert_eq!(parts[0], format!("<1/2>\n{}\n(next 2)\n", line.repeat(2)));
+
+        // The text itself at the budget is one part; one byte less is not.
+        assert_eq!(split(&text, text.len()).len(), 1);
+        assert!(split(&text, text.len() - 1).len() > 1);
+    }
+
+    #[test]
+    fn japanese_text_is_counted_in_bytes_and_cut_between_lines() {
+        let line = "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{884c}\u{3067}\u{3059}\u{3002}\n";
+        assert_eq!(line.len(), 25);
+        let text = line.repeat(10);
+        let budget = 100;
+        let parts = split(&text, budget);
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|part| part.len() <= budget), "{parts:?}");
+        for part in &parts {
+            let body_start = part.find('\n').unwrap() + 1;
+            assert!(
+                part[body_start..]
+                    .lines()
+                    .all(|l| l.is_empty() || l.starts_with('\u{65e5}') || l.starts_with('(')),
+                "a line was cut: {part:?}"
+            );
+        }
+        assert_eq!(unframed(&parts), text);
+    }
+
+    #[test]
+    fn a_line_longer_than_a_part_is_cut_on_a_character_boundary() {
+        // A three-byte character, with the cut landing on each of its bytes.
+        for lead in 0..3 {
+            let text = format!("{}{}\ntail\n", "a".repeat(lead), "\u{3042}".repeat(60));
+            let parts = split(&text, 60);
+            assert!(parts.len() > 2, "{parts:?}");
+            assert!(parts.iter().all(|part| part.len() <= 60), "{parts:?}");
+            assert_eq!(unframed(&parts), text, "lead {lead}");
+        }
+        // What is left of a cut line goes on being filled by the lines after it.
+        let text = format!("{}\nshort\n", "x".repeat(100));
+        let parts = split(&text, 70);
+        assert_eq!(unframed(&parts), text);
+        assert!(parts.last().unwrap().contains("short"), "{parts:?}");
+    }
+
+    #[test]
+    fn every_part_but_the_last_ends_with_the_footer_that_names_the_next() {
+        let text = "row\n".repeat(200);
+        let parts = split(&text, 120);
+        assert!(parts.len() > 3);
+        for (index, part) in parts.iter().enumerate() {
+            let part_no = index + 1;
+            assert!(part.starts_with(&frame_header(part_no, parts.len())));
+            assert_eq!(
+                part.ends_with(&frame_footer(part_no)),
+                part_no < parts.len(),
+                "part {part_no}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_room_set_aside_follows_the_digits_of_the_part_count() {
+        // Past nine parts the numbers have two digits and the frame grows: no part
+        // may then exceed the budget, and the count in the headers must be right.
+        let text = "row\n".repeat(400);
+        let parts = split(&text, 60);
+        assert!(parts.len() > 9, "{}", parts.len());
+        assert!(parts.iter().all(|part| part.len() <= 60), "{parts:?}");
+        assert_eq!(unframed(&parts), text);
+    }
+
+    #[test]
+    fn the_header_names_the_plan_and_the_versions_the_text_shows() {
+        assert_eq!(
+            part_header(3, Some(5), None, 2, 4),
+            "[banto] Plan 3, version in force 5, part 2 of 4\n\n"
+        );
+        assert_eq!(
+            part_header(3, Some(5), Some(6), 1, 4),
+            "[banto] Plan 3, version in force 5, draft 6, part 1 of 4\n\n"
+        );
+        assert_eq!(
+            part_header(3, None, Some(1), 1, 2),
+            "[banto] Plan 3, version in force none, draft 1, part 1 of 2\n\n"
+        );
+        assert_eq!(
+            part_footer(2),
+            "\n[banto] More of this Plan follows: call read_plan with part = 3.\n"
+        );
+    }
+
+    #[test]
+    fn a_long_view_is_cut_with_the_header_of_what_its_reader_is_shown() {
+        let mut in_force = version(1, VersionKind::OperatorApproved);
+        in_force.body = "spec line\n".repeat(120);
+        let mut draft = version(2, VersionKind::Draft);
+        draft.body = "draft line\n".repeat(120);
+        let view = PlanView {
+            plan: plan(PlanState::Approved),
+            in_force: Some(in_force),
+            pending: Some(draft),
+        };
+        let budget = 400;
+        let planner = read_plan_parts(BrigadeRole::Planner, Some(&view), budget);
+        let worker = read_plan_parts(BrigadeRole::Worker, Some(&view), budget);
+        assert!(planner.len() > 1 && worker.len() > 1);
+        assert!(
+            planner
+                .iter()
+                .chain(&worker)
+                .all(|part| part.len() <= budget)
+        );
+        assert!(
+            planner[0].starts_with("[banto] Plan 3, version in force 1, draft 2, part 1 of "),
+            "{:?}",
+            planner[0]
+        );
+        assert!(
+            worker[0].starts_with("[banto] Plan 3, version in force 1, part 1 of "),
+            "{:?}",
+            worker[0]
+        );
+        let planner_all = planner.concat();
+        assert_eq!(planner_all.matches("spec line").count(), 120);
+        assert_eq!(planner_all.matches("draft line").count(), 120);
+        assert_eq!(worker.concat().matches("draft line").count(), 0);
     }
 
     #[test]

@@ -1191,7 +1191,22 @@ reasons are the Director's and the implementer's unless marked as his.
    but the Planner only that a newer draft awaits approval: a Worker must not build a
    draft, and the Director's context should not carry two bodies. Whether a Plan is
    approved is what `read_plan` says; a message that says so only tells the Director to
-   look. `write_plan(body, summary)` (Planner) records a new draft version and never
+   look. A view too long for one result (the same 32,000-byte budget as a
+   `check_messages` page, for the same reason: Codex cuts the middle out of a tool
+   output over about 40,000 bytes, silently) comes in parts. `read_plan(part?)` takes a
+   whole number from 1 and, without one, returns part 1. banto renders the view as it
+   always did and cuts it at line boundaries (a line longer than a part, at a character
+   boundary), so a view that fits is one part and unchanged. Every part of a longer one
+   begins `[banto] Plan N, version in force V, part i of n`, with `, draft D` after the
+   version for the Planner when it has a pending draft, and every part but the last ends
+   `[banto] More of this Plan follows: call read_plan with part = i+1.` A `part` past n
+   is an error that says n, and one that is not a whole number of 1 or more is an
+   argument error. The versions are in the header because the Plan can change between
+   two calls and nothing holds a reader's place: the tool description tells a reader
+   whose header shows another version than the previous part's to start again from
+   part 1. There is no version argument, and no cap on a Plan's size beyond the limits
+   above: what the operator writes is not shaped by one product's display limit.
+   `write_plan(body, summary)` (Planner) records a new draft version and never
    replaces what is in force. `release_plan` (Planner) puts the latest draft in force
    without the operator, for a Plan he already approved and only to split or reorder its
    tasks; scope and completion conditions go back to his key. `close_planner(result)`
@@ -4744,7 +4759,8 @@ same `tools/list`:
   at all. Its result tells the Director the write was recorded and that it may end its
   turn with no text for the operator. See "Decision (2026-11-26)".
 - `open_planner(title, request, known?)`, `close_planner(result)` — Director-only;
-  `read_plan` — every member; `write_plan(body, summary)` and `release_plan` —
+  `read_plan(part?)` — every member, in parts when the view is long (item 8 of "Decision
+  (2026-11-26): the Planner"); `write_plan(body, summary)` and `release_plan` —
   Planner-only. Each checks the caller's role from the store at call time and again
   inside the write's transaction. See "Decision (2026-11-26): the Planner".
 - `interrupt_worker(member, text)` — Director-only (by the store's live membership,

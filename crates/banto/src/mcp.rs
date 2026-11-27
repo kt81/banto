@@ -74,7 +74,7 @@ use banto_core::model::{
     InterruptOutcome, MemberToken, SessionId,
 };
 use banto_core::plan::{
-    PlanResult, check_known, check_request, check_write, read_plan_text, render_export,
+    PlanResult, check_known, check_request, check_write, read_plan_parts, render_export,
     render_request_file,
 };
 use banto_core::progress::{Progress, RawTask, check_progress, check_question};
@@ -497,7 +497,7 @@ fn tools_list_result() -> Value {
                 "description": format!(
                     "Pull any new messages your brigade peer has sent you via banto (since \
                      you last checked). Call it at natural checkpoints. A call returns the \
-                     oldest messages that fit in {INBOX_PAGE_BUDGET} bytes; when the result \
+                     oldest messages that fit in {TOOL_RESULT_BUDGET} bytes; when the result \
                      ends by saying more are waiting, call it again for them. \
                      {CHECK_MESSAGES_INTERRUPT_SENTENCE}"
                 ),
@@ -676,8 +676,23 @@ fn tools_list_result() -> Value {
                                 is not in force and is not shown to anyone but the Planner. \
                                 Only the version in force is settled: work from it, and from \
                                 nothing else. Whether a version is approved is what this tool \
-                                says; a message that says so only tells you to look.",
-                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+                                says; a message that says so only tells you to look. A long \
+                                Plan comes in parts: with `part` you ask for part 1, 2, and so \
+                                on, and a part's header says how many there are. If the version \
+                                in a part's header differs from the previous part's, read again \
+                                from part 1.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "part": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Optional. Which part of a Plan too long for one \
+                                            result to read, counting from 1. Omitted, part 1."
+                        }
+                    },
+                    "additionalProperties": false,
+                },
             },
             {
                 "name": "write_plan",
@@ -923,7 +938,7 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
         "consult_goinkyo" => tool_consult_goinkyo(ctx, msg),
         "dismiss_goinkyo" => tool_dismiss_goinkyo(ctx),
         "open_planner" => tool_open_planner(ctx, msg),
-        "read_plan" => tool_read_plan(ctx),
+        "read_plan" => tool_read_plan(ctx, msg),
         "write_plan" => tool_write_plan(ctx, msg),
         "release_plan" => tool_release_plan(ctx),
         "close_planner" => tool_close_planner(ctx, msg),
@@ -1545,26 +1560,27 @@ fn tool_check_messages(ctx: &mut ServerContext) -> Value {
     }
 }
 
-/// What one `check_messages` result may weigh, in bytes of UTF-8, counted over the
-/// whole text: banto's preface, every header, the bodies and the line that says
-/// more is waiting.
+/// What one `check_messages` result or one `read_plan` part may weigh, in bytes of
+/// UTF-8, counted over the whole text: for a page, banto's preface, every header,
+/// the bodies and the line that says more is waiting; for a part, its header,
+/// its piece of the view and its footer.
 ///
 /// Codex 0.172.0 cuts any tool output above about 40,000 bytes of UTF-8, keeping
 /// its head and tail and dropping the middle without an error (measured on
 /// 2026-11-27: ASCII is cut near 40,000 characters, Japanese near 13,000 to
-/// 15,000, and no setting raises it). The cursor having moved past what was cut,
-/// the recipient never sees it again. The budget sits eight kilobytes under the
-/// cut. The largest delivery on record (32,246 B, two messages) is over it and
+/// 15,000, and no setting raises it). A mailbox's cursor having moved past what was
+/// cut, the recipient never sees it again; a Plan is asked for again, in parts.
+/// The budget sits eight kilobytes under the cut. The largest delivery on record (32,246 B, two messages) is over it and
 /// would now go in two pages; no other delivery on record was past 30 KB, so
 /// ordinary traffic still arrives whole.
-const INBOX_PAGE_BUDGET: usize = 32_000;
+const TOOL_RESULT_BUDGET: usize = 32_000;
 
 /// The most a single message body may weigh when it is sent, in bytes of UTF-8,
 /// for every sender and every recipient: a sender cannot know the recipient's
 /// product, and one rule is simpler than two.
 ///
 /// It sits just above the largest message on record (24,780 B, measured over
-/// 2026-08-07 to 2026-11-27) and below [`INBOX_PAGE_BUDGET`] by more than the
+/// 2026-08-07 to 2026-11-27) and below [`TOOL_RESULT_BUDGET`] by more than the
 /// framing a delivery adds (766 B at most, measured the same way, plus the line
 /// that says more is waiting), so one message always fits a page of its own.
 /// Raising it past that margin turns the delivery of a legacy message that large
@@ -1585,11 +1601,11 @@ const MESSAGE_BODY_LIMIT: usize = 25_000;
 /// forever, and an empty page with mail waiting would have the member asking
 /// again for ever.
 fn inbox_page_len(unread: usize, render: impl Fn(usize) -> String) -> usize {
-    if unread > 0 && render(unread).len() <= INBOX_PAGE_BUDGET {
+    if unread > 0 && render(unread).len() <= TOOL_RESULT_BUDGET {
         return unread;
     }
     let mut taken = unread.min(1);
-    while taken + 1 < unread && render(taken + 1).len() <= INBOX_PAGE_BUDGET {
+    while taken + 1 < unread && render(taken + 1).len() <= TOOL_RESULT_BUDGET {
         taken += 1;
     }
     taken
@@ -2739,7 +2755,7 @@ fn tool_interrupt_gate(ctx: &mut ServerContext, msg: &Value) -> Value {
 ///
 /// The words are written over the unread interrupts of this Worker, all of them,
 /// not only the newest: the header is per message, and a pull may stop short of
-/// some (a page holds [`INBOX_PAGE_BUDGET`] bytes), so an interrupt that comes on
+/// some (a page holds [`TOOL_RESULT_BUDGET`] bytes), so an interrupt that comes on
 /// a later page must already carry the words when that page is read.
 ///
 /// Reading an earlier page neither clears the gate nor resets the counts, so a
@@ -3107,16 +3123,42 @@ fn tool_open_planner(ctx: &mut ServerContext, msg: &Value) -> Value {
 }
 
 /// `read_plan`: any member reads what is in force; only the Planner is also given
-/// its unapproved draft (see [`read_plan_text`]).
-fn tool_read_plan(ctx: &mut ServerContext) -> Value {
+/// its unapproved draft (see [`read_plan_parts`]). The view is read whole and cut
+/// into parts for each call, so a part is always one version's text; a Plan that
+/// changes between two calls is the reader's to notice, from the header.
+fn tool_read_plan(ctx: &mut ServerContext, msg: &Value) -> Value {
+    let part = match parse_part_arg(msg) {
+        Ok(part) => part.unwrap_or(1),
+        Err(err) => return tool_error(&err),
+    };
     let (brigade, _, role) = match live_membership(ctx) {
         Ok(Some(membership)) => membership,
         Ok(None) => return not_in_brigade(),
         Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
     };
     match ctx.store.open_plan_view(brigade) {
-        Ok(view) => tool_text(read_plan_text(role, view.as_ref()), false),
+        Ok(view) => {
+            let mut parts = read_plan_parts(role, view.as_ref(), TOOL_RESULT_BUDGET);
+            if part > parts.len() {
+                return tool_error(&format!(
+                    "`part` is {part}, but this Plan has {} part(s).",
+                    parts.len()
+                ));
+            }
+            tool_text(parts.swap_remove(part - 1), false)
+        }
         Err(err) => tool_error(&format!("failed to read the Plan: {err}")),
+    }
+}
+
+/// The optional `part` of `read_plan`: a whole number of 1 or more.
+fn parse_part_arg(msg: &Value) -> Result<Option<usize>, String> {
+    match msg.pointer("/params/arguments/part") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match value.as_u64().and_then(|n| usize::try_from(n).ok()) {
+            Some(part) if part >= 1 => Ok(Some(part)),
+            _ => Err("`part` must be a whole number of 1 or more.".to_string()),
+        },
     }
 }
 
@@ -6605,9 +6647,9 @@ mod tests {
         // What the second message may weigh for a page of two to be exactly the
         // budget: the page is measured with the line about the third in it.
         let overhead = rendered(&unread)(2).len();
-        let fits = INBOX_PAGE_BUDGET - overhead;
+        let fits = TOOL_RESULT_BUDGET - overhead;
         unread[1].body = "b".repeat(fits);
-        assert_eq!(rendered(&unread)(2).len(), INBOX_PAGE_BUDGET);
+        assert_eq!(rendered(&unread)(2).len(), TOOL_RESULT_BUDGET);
         assert_eq!(inbox_page_len(unread.len(), rendered(&unread)), 2);
 
         unread[1].body = "b".repeat(fits + 1);
@@ -6618,11 +6660,11 @@ mod tests {
     fn a_page_is_never_empty_while_mail_is_waiting_and_a_message_too_big_alone_goes_alone() {
         assert_eq!(inbox_page_len(0, |_| unreachable!()), 0);
         let unread = vec![
-            page_message(1, "a".repeat(INBOX_PAGE_BUDGET + 5_000)),
+            page_message(1, "a".repeat(TOOL_RESULT_BUDGET + 5_000)),
             page_message(2, "small".to_string()),
         ];
         assert_eq!(inbox_page_len(unread.len(), rendered(&unread)), 1);
-        let unread = vec![page_message(1, "a".repeat(INBOX_PAGE_BUDGET * 2))];
+        let unread = vec![page_message(1, "a".repeat(TOOL_RESULT_BUDGET * 2))];
         assert_eq!(inbox_page_len(1, rendered(&unread)), 1);
     }
 
@@ -6637,9 +6679,9 @@ mod tests {
             page_message(3, "x".to_string()),
         ];
         let overhead = rendered(&unread)(3).len();
-        unread[1].body = "b".repeat(INBOX_PAGE_BUDGET - overhead);
-        assert_eq!(rendered(&unread)(3).len(), INBOX_PAGE_BUDGET);
-        assert!(rendered(&unread)(2).len() > INBOX_PAGE_BUDGET);
+        unread[1].body = "b".repeat(TOOL_RESULT_BUDGET - overhead);
+        assert_eq!(rendered(&unread)(3).len(), TOOL_RESULT_BUDGET);
+        assert!(rendered(&unread)(2).len() > TOOL_RESULT_BUDGET);
         assert_eq!(inbox_page_len(unread.len(), rendered(&unread)), 3);
 
         // One byte more and the whole no longer fits: the largest page that
@@ -6686,8 +6728,8 @@ mod tests {
         message.interrupted = Some(InterruptOutcome::Capped);
         let page = format_page(&[message], 99_999, &[], BrigadeRole::Director);
         assert!(
-            page.len() <= INBOX_PAGE_BUDGET,
-            "{} bytes against {INBOX_PAGE_BUDGET}",
+            page.len() <= TOOL_RESULT_BUDGET,
+            "{} bytes against {TOOL_RESULT_BUDGET}",
             page.len()
         );
     }
@@ -6711,7 +6753,7 @@ mod tests {
         let mut worker = worker_with_mail(&bodies);
 
         let first = pull(&mut worker);
-        assert!(first.len() <= INBOX_PAGE_BUDGET, "{} bytes", first.len());
+        assert!(first.len() <= TOOL_RESULT_BUDGET, "{} bytes", first.len());
         for n in 0..3 {
             assert!(first.contains(&format!("<<{n}>>")), "{n} on the first page");
         }
@@ -6747,7 +6789,7 @@ mod tests {
     #[test]
     fn a_message_stored_before_the_limit_that_is_too_big_for_a_page_is_delivered_alone() {
         let bodies = vec![
-            format!("<<big>>{}", "a".repeat(INBOX_PAGE_BUDGET + 8_000)),
+            format!("<<big>>{}", "a".repeat(TOOL_RESULT_BUDGET + 8_000)),
             "<<small>>".to_string(),
         ];
         let mut worker = worker_with_mail(&bodies);
@@ -9239,6 +9281,112 @@ enabled = true
             );
             assert!(text.contains("nothing is settled"), "{token}: {text}");
         }
+    }
+
+    /// A Planner's context whose draft, with the request, is more than a result
+    /// may carry: a 19,000-character request and a body of numbered lines.
+    fn planner_with_a_long_draft() -> (ServerContext, tempfile::TempDir) {
+        let (mut ctx, tmp) = planner_world();
+        let (failed, text) = run_tool(
+            &mut ctx,
+            "open_planner",
+            json!({ "title": "Long", "request": "r".repeat(19_000) }),
+        );
+        assert!(!failed, "{text}");
+        let mut planner = speaking_as(ctx, "planner", BrigadeRole::Planner);
+        let body: String = (0..2_900).map(|n| format!("line {n:04}\n")).collect();
+        let (failed, text) = run_tool(
+            &mut planner,
+            "write_plan",
+            json!({ "body": body, "summary": "long" }),
+        );
+        assert!(!failed, "{text}");
+        (planner, tmp)
+    }
+
+    #[test]
+    fn read_plan_hands_a_long_plan_over_in_parts_and_asks_for_the_next() {
+        let (mut planner, _tmp) = planner_with_a_long_draft();
+
+        let (failed, default) = run_tool(&mut planner, "read_plan", json!({}));
+        assert!(!failed, "{default}");
+        let (_, first) = run_tool(&mut planner, "read_plan", json!({ "part": 1 }));
+        assert_eq!(default, first, "no argument is part 1");
+        assert!(
+            first.starts_with("[banto] Plan 1, version in force none, draft 1, part 1 of 2\n\n"),
+            "{}",
+            &first[..80]
+        );
+        assert!(
+            first.ends_with("\n[banto] More of this Plan follows: call read_plan with part = 2.\n"),
+            "{}",
+            &first[first.len() - 100..]
+        );
+
+        let (failed, second) = run_tool(&mut planner, "read_plan", json!({ "part": 2 }));
+        assert!(!failed, "{second}");
+        assert!(
+            second.starts_with("[banto] Plan 1, version in force none, draft 1, part 2 of 2\n\n")
+        );
+        assert!(
+            !second.contains("More of this Plan follows"),
+            "the last part names no next"
+        );
+        assert!(
+            second.ends_with("line 2899\n"),
+            "{}",
+            &second[second.len() - 40..]
+        );
+        assert!(first.len() <= TOOL_RESULT_BUDGET && second.len() <= TOOL_RESULT_BUDGET);
+    }
+
+    #[test]
+    fn a_part_that_is_not_there_or_not_a_whole_number_is_an_error() {
+        let (mut planner, _tmp) = planner_with_a_long_draft();
+        let (failed, text) = run_tool(&mut planner, "read_plan", json!({ "part": 3 }));
+        assert!(failed);
+        assert_eq!(text, "`part` is 3, but this Plan has 2 part(s).");
+
+        for bad in [json!(0), json!(-1), json!(1.5), json!("2"), json!(true)] {
+            let (failed, text) = run_tool(&mut planner, "read_plan", json!({ "part": bad }));
+            assert!(failed, "{bad}: {text}");
+            assert_eq!(text, "`part` must be a whole number of 1 or more.", "{bad}");
+        }
+
+        // A Plan that is one part says so to a caller asking past it, and a caller
+        // that is shown less is told its own count, not the Planner's.
+        let mut worker = speaking_as(planner, "worker-1", BrigadeRole::Worker);
+        let (failed, text) = run_tool(&mut worker, "read_plan", json!({ "part": 2 }));
+        assert!(failed);
+        assert_eq!(text, "`part` is 2, but this Plan has 1 part(s).");
+        let (failed, text) = run_tool(&mut worker, "read_plan", json!({ "part": 1 }));
+        assert!(!failed, "{text}");
+        assert!(
+            !text.starts_with("[banto]"),
+            "a view that fits has no header"
+        );
+    }
+
+    #[test]
+    fn read_plan_says_in_its_description_how_to_read_parts_and_when_to_start_over() {
+        let tools = tools_list_result();
+        let tool = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "read_plan")
+            .expect("read_plan is listed");
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.contains("`part`"), "{description}");
+        assert!(
+            description.contains(
+                "If the version in a part's header differs from the previous part's, read \
+                 again from part 1."
+            ),
+            "{description}"
+        );
+        assert_eq!(tool["inputSchema"]["properties"]["part"]["type"], "integer");
+        assert_eq!(tool["inputSchema"]["properties"]["part"]["minimum"], 1);
     }
 
     #[test]
