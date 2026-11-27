@@ -1419,6 +1419,11 @@ pub struct EmporiumState {
     bell_when_focused: bool,
     /// The same for the switch.
     persisted_bell_when_focused: bool,
+    /// Whether a ring of the host bell also carries a desktop notification
+    /// (`[attention] notify`, resolved by [`crate::config::resolve_host_notify`]).
+    /// A bool, not the setting: `auto` is settled at the edge and cannot reach the
+    /// bell. Set once at startup, so a test that never sets it sees the bell alone.
+    host_notify: bool,
     /// The agent the Worker picker was last confirmed with, which the next
     /// picker opens on (with that agent's defaults). `None` until one is
     /// confirmed and when the store held nothing usable: the picker then opens
@@ -1924,6 +1929,7 @@ impl EmporiumState {
             persisted_sidebar_width: SIDEBAR_WIDTH,
             bell_when_focused: false,
             persisted_bell_when_focused: false,
+            host_notify: false,
             last_worker_agent: None,
             persisted_last_worker_agent: None,
             last_prompted: HashMap::new(),
@@ -2189,6 +2195,74 @@ impl EmporiumState {
         if !self.stage.is_active() {
             self.focus = Focus::Sidebar;
         }
+    }
+
+    /// What a ring's notification says, in a short English phrase that names what
+    /// wants the operator: the brigade by its Director's title, a member as
+    /// `worker-2 of "title"`, a plain session by its own title in quotes. Where
+    /// several waits gained a place in one update the cause names one and counts
+    /// the rest, which the phrase ends with (` (+2 more)`). Built from ids and the
+    /// names the status lines already use, never from text a child printed.
+    fn notification_body(&self, app: &App, cause: &BellCause) -> String {
+        let more = |others: &usize| match others {
+            0 => String::new(),
+            n => format!(" (+{n} more)"),
+        };
+        match cause {
+            BellCause::QuietFocused { brigade, .. } | BellCause::QuietRecorded { brigade, .. } => {
+                format!("{} went quiet", self.brigade_name(app, *brigade))
+            }
+            BellCause::Request { brigade, .. } => {
+                format!("{} asks for a decision", self.brigade_name(app, *brigade))
+            }
+            BellCause::StagedPaneWait { pane, others } => {
+                format!("{} is waiting{}", self.pane_call(app, pane), more(others))
+            }
+            BellCause::StagedPaneBell { pane, others } => {
+                format!(
+                    "{} rang the bell{}",
+                    self.pane_call(app, pane),
+                    more(others)
+                )
+            }
+            BellCause::ListRowWaiting { session, others } => {
+                format!(
+                    "{} is waiting{}",
+                    self.session_call(app, session),
+                    more(others)
+                )
+            }
+            BellCause::OffStageMemberWait { member, others, .. } => {
+                format!("{} is waiting{}", self.pane_call(app, member), more(others))
+            }
+            BellCause::OffStageMemberBell { member, others, .. } => {
+                format!(
+                    "{} rang the bell{}",
+                    self.pane_call(app, member),
+                    more(others)
+                )
+            }
+        }
+    }
+
+    /// A pane as a notification names it: a brigade member as in a status
+    /// (`worker-2 of "title"`), any other pane as its session.
+    fn pane_call(&self, app: &App, key: &SessionKey) -> String {
+        if self.member_tokens.contains_key(key) {
+            self.pane_label(app, key)
+        } else {
+            self.session_call(app, key)
+        }
+    }
+
+    /// A session by its own title in quotes, reduced and cut like a brigade's
+    /// ([`quote_name`]); `a session` when its row is unknown or has no title,
+    /// never its id.
+    fn session_call(&self, app: &App, key: &SessionKey) -> String {
+        app.row_for_id(key.as_str())
+            .and_then(SessionRow::title)
+            .and_then(display_name)
+            .map_or_else(|| "a session".to_string(), |name| quote_name(&name))
     }
 
     /// The pane's member as the operator is told about it in a status:
@@ -3334,6 +3408,11 @@ impl EmporiumState {
         self.bell_when_focused
     }
 
+    /// Whether every host bell also writes a desktop notification (OSC 777).
+    pub fn set_host_notify(&mut self, on: bool) {
+        self.host_notify = on;
+    }
+
     /// The status line once quitting has been decided: it has priority over
     /// everything else that line can show, and is the one text for every way
     /// of getting here. The count is every hosted session, idle or not — all
@@ -4289,6 +4368,15 @@ pub enum Cmd {
     /// says. A ring the cooldown swallowed is never a `Cmd`, so it is not here.
     RingHostBell {
         cause: BellCause,
+    },
+    /// Write banto's own desktop notification to the host terminal, right after
+    /// the [`Self::RingHostBell`] it goes with (`[attention] notify`, off by
+    /// default). `bytes` is the complete OSC 777 sequence from
+    /// [`build_host_notification`], made by banto from ids and names it holds and
+    /// never from anything a child printed; the shell writes it verbatim. Like
+    /// the bell it is one per ring, so a ring the cooldown swallowed has neither.
+    NotifyHost {
+        bytes: Vec<u8>,
     },
     Store(StoreIntent),
     Reload,
@@ -5425,6 +5513,7 @@ fn director_pane_of(state: &EmporiumState, brigade_id: BrigadeId) -> Option<Sess
 /// neither a mark nor a bell is made for it.
 fn apply_request_fact(
     state: &mut EmporiumState,
+    app: &App,
     config: &BrigadeConfig,
     brigade_id: BrigadeId,
     fact: Option<RequestFact>,
@@ -5466,12 +5555,12 @@ fn apply_request_fact(
     };
     if effective_focused_pane(state).as_ref() == Some(&director) {
         if state.bell_when_focused {
-            return ring_host_bell(state, now, cause).into_iter().collect();
+            return ring_host_bell(state, app, now, cause);
         }
         return Vec::new();
     }
     state.attention.insert(brigade_id, AttentionCause::Request);
-    ring_host_bell(state, now, cause).into_iter().collect()
+    ring_host_bell(state, app, now, cause)
 }
 
 /// The operator gave `pane` something to do (a key or a paste forwarded to it, the
@@ -5774,32 +5863,80 @@ fn update_brigade_quiet(
                     brigade: brigade_id,
                     director,
                 };
-                cmds.extend(ring_host_bell(state, now, cause));
+                cmds.extend(ring_host_bell(state, app, now, cause));
             }
         } else if state.bell_when_focused {
             let cause = BellCause::QuietFocused {
                 brigade: brigade_id,
                 director,
             };
-            cmds.extend(ring_host_bell(state, now, cause));
+            cmds.extend(ring_host_bell(state, app, now, cause));
         }
     }
     cmds
 }
 
-/// The host bell, under the cooldown every attention bell shares. A ring the
-/// cooldown swallows is `None`, so it leaves no trace anywhere.
-fn ring_host_bell(state: &mut EmporiumState, now: Instant, cause: BellCause) -> Option<Cmd> {
+/// The host bell, under the cooldown every attention bell shares, and with it,
+/// when `[attention] notify` asks, the notification for the same ring. A ring the
+/// cooldown swallows is an empty list, so it leaves no trace anywhere: neither
+/// the bell nor the notification is made for it.
+///
+/// The notification is built here, where `app` is at hand to name what rang:
+/// [`BellCause`] holds ids only (its own contract), and the names come from the
+/// same reduction every status line uses.
+fn ring_host_bell(
+    state: &mut EmporiumState,
+    app: &App,
+    now: Instant,
+    cause: BellCause,
+) -> Vec<Cmd> {
     if state
         .last_attention_bell
-        .is_none_or(|last| now.saturating_duration_since(last) >= ATTENTION_BELL_COOLDOWN)
+        .is_some_and(|last| now.saturating_duration_since(last) < ATTENTION_BELL_COOLDOWN)
     {
-        state.last_attention_bell = Some(now);
-        Some(Cmd::RingHostBell { cause })
-    } else {
-        None
+        return Vec::new();
     }
+    state.last_attention_bell = Some(now);
+    let notification = state.host_notify.then(|| Cmd::NotifyHost {
+        bytes: build_host_notification(&state.notification_body(app, &cause)),
+    });
+    let mut cmds = vec![Cmd::RingHostBell { cause }];
+    cmds.extend(notification);
+    cmds
 }
+
+/// The OSC 777 sequence that shows `body` as a desktop notification titled
+/// `banto`: `ESC ] 777 ; notify ; banto ; <body> ESC \`. The terminator is ST
+/// rather than BEL so the sequence cannot also read as a bell.
+///
+/// `body` is made of names that were reduced for display, and is still cleaned
+/// here, because this is the one place that decides what reaches the host
+/// terminal: `;` is the field separator, so it becomes `,`; every control
+/// character (ESC and BEL among them, and the C1 range a terminal may take as a
+/// sequence introducer) is dropped; and the body is cut to
+/// [`HOST_NOTIFICATION_BODY_BYTES`] on a character boundary, as terminals differ
+/// in how much of an OSC string they take.
+pub fn build_host_notification(body: &str) -> Vec<u8> {
+    let mut clean = String::with_capacity(body.len().min(HOST_NOTIFICATION_BODY_BYTES));
+    for c in body.chars() {
+        let c = match c {
+            ';' => ',',
+            c if c.is_control() => continue,
+            c => c,
+        };
+        if clean.len() + c.len_utf8() > HOST_NOTIFICATION_BODY_BYTES {
+            break;
+        }
+        clean.push(c);
+    }
+    let mut bytes = b"\x1b]777;notify;banto;".to_vec();
+    bytes.extend_from_slice(clean.as_bytes());
+    bytes.extend_from_slice(b"\x1b\\");
+    bytes
+}
+
+/// The most bytes of body a notification carries.
+const HOST_NOTIFICATION_BODY_BYTES: usize = 255;
 
 /// Lay what hosted Codex panes report about themselves over the session list: a
 /// pane reporting `blocked` shows and counts as Waiting, exactly like a Claude
@@ -6249,7 +6386,7 @@ fn sync_brigade_marks(state: &mut EmporiumState, app: &mut App, now: Instant) ->
             others,
         }
     };
-    ring_host_bell(state, now, cause).into_iter().collect()
+    ring_host_bell(state, app, now, cause)
 }
 
 /// Refresh the one fact behind both attention views: a mark is on screen when
@@ -6426,7 +6563,7 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
             others,
         }
     };
-    ring_host_bell(state, now, cause).into_iter().collect()
+    ring_host_bell(state, app, now, cause)
 }
 
 /// Resize every currently-staged tile's `Screen` to match the current
@@ -11207,12 +11344,19 @@ pub fn brigade_label(title: Option<&str>, stored_name: &str, brigade_id: Brigade
         .or_else(|| display_name(stored_name))
     {
         // An ASCII quote inside the name would end the outer quoting early.
-        Some(name) => format!(
-            "\"{}\"",
-            shorten_to_columns(&name.replace('"', "'"), BRIGADE_NAME_COLUMNS)
-        ),
+        Some(name) => quote_name(&name),
         None => format!("brigade {brigade_id}"),
     }
+}
+
+/// A reduced name as a sentence quotes it: an ASCII `"` inside it becomes `'`,
+/// it is cut to [`BRIGADE_NAME_COLUMNS`] display columns, and it goes in quotes.
+/// The one rule for a brigade's title and a session's alike.
+fn quote_name(name: &str) -> String {
+    format!(
+        "\"{}\"",
+        shorten_to_columns(&name.replace('"', "'"), BRIGADE_NAME_COLUMNS)
+    )
 }
 
 /// Open the Director wired (MCP config / Codex `-c` overrides — see
@@ -12011,7 +12155,9 @@ fn update_tick(
                 .map(|fact| (brigade_id, fact)),
         );
         state.brigade_names.insert(brigade_id, facts);
-        cmds.extend(apply_request_fact(state, brigade, brigade_id, request, now));
+        cmds.extend(apply_request_fact(
+            state, app, brigade, brigade_id, request, now,
+        ));
     }
 
     // What each observed member's collapsed tile shows. A member the shell did
@@ -31354,6 +31500,226 @@ mod tests {
         );
         assert!(cmds.is_empty());
         assert!(!state.attention_panes().contains(&key));
+    }
+
+    // --- the host notification that goes with a ring (`[attention] notify`) ---
+
+    /// The sequence for `body`, spelled out so a change of terminator or title
+    /// shows up here.
+    fn osc777(body: &str) -> Vec<u8> {
+        format!("\x1b]777;notify;banto;{body}\x1b\\").into_bytes()
+    }
+
+    #[test]
+    fn osc777_sends_a_notification_right_after_the_bell_it_goes_with() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.set_host_notify(true);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        let mut app = app_with(vec![titled("sess-1", Some("Fix \"login\"; now"))]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WindowFocusChanged { focused: false },
+            now,
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key: key.clone(),
+                chunk: b"\x07".to_vec(),
+            },
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(
+            cmds,
+            vec![
+                Cmd::RingHostBell {
+                    cause: BellCause::StagedPaneBell {
+                        pane: key,
+                        others: 0
+                    }
+                },
+                Cmd::NotifyHost {
+                    // The title's `"` became `'`, and the `;` the sequence's own
+                    // separator, in the builder.
+                    bytes: osc777("\"Fix 'login', now\" rang the bell"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn off_rings_the_bell_and_writes_no_notification() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let app = app_with(vec![]);
+        let cause = BellCause::ListRowWaiting {
+            session: SessionKey::from_id("s"),
+            others: 0,
+        };
+        let cmds = ring_host_bell(&mut state, &app, test_instant(), cause.clone());
+        assert_eq!(cmds, vec![Cmd::RingHostBell { cause }]);
+    }
+
+    #[test]
+    fn a_ring_the_cooldown_swallows_makes_neither_the_bell_nor_the_notification() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.set_host_notify(true);
+        let app = app_with(vec![]);
+        let cause = || BellCause::ListRowWaiting {
+            session: SessionKey::from_id("s"),
+            others: 0,
+        };
+        let now = test_instant();
+        assert_eq!(ring_host_bell(&mut state, &app, now, cause()).len(), 2);
+        let inside = now + ATTENTION_BELL_COOLDOWN - Duration::from_millis(1);
+        assert!(ring_host_bell(&mut state, &app, inside, cause()).is_empty());
+        let after = now + ATTENTION_BELL_COOLDOWN;
+        assert_eq!(ring_host_bell(&mut state, &app, after, cause()).len(), 2);
+    }
+
+    #[test]
+    fn every_cause_has_a_short_phrase_naming_what_wants_the_operator() {
+        let mut state = state_with_facts(vec![name_facts(7, "Fix relay", None)]);
+        let app = app_with(vec![
+            titled("plain", Some("Plain one")),
+            titled("untitled", None),
+        ]);
+        let member = SessionKey::from_id("m");
+        state
+            .member_tokens
+            .insert(member.clone(), "worker-2".into());
+        state.member_brigades.insert(member.clone(), 7);
+        let plain = SessionKey::from_id("plain");
+        let director = SessionKey::from_id("d");
+        let body = |cause: BellCause| state.notification_body(&app, &cause);
+
+        for cause in [
+            BellCause::QuietFocused {
+                brigade: 7,
+                director: director.clone(),
+            },
+            BellCause::QuietRecorded {
+                brigade: 7,
+                director: director.clone(),
+            },
+        ] {
+            assert_eq!(body(cause), "\"Fix relay\" went quiet");
+        }
+        assert_eq!(
+            body(BellCause::Request {
+                brigade: 7,
+                director
+            }),
+            "\"Fix relay\" asks for a decision"
+        );
+        assert_eq!(
+            body(BellCause::StagedPaneWait {
+                pane: plain.clone(),
+                others: 0
+            }),
+            "\"Plain one\" is waiting"
+        );
+        assert_eq!(
+            body(BellCause::StagedPaneBell {
+                pane: plain,
+                others: 2
+            }),
+            "\"Plain one\" rang the bell (+2 more)"
+        );
+        assert_eq!(
+            body(BellCause::ListRowWaiting {
+                session: SessionKey::from_id("untitled"),
+                others: 0
+            }),
+            "a session is waiting",
+            "a row without a title is never named by its id"
+        );
+        assert_eq!(
+            body(BellCause::OffStageMemberWait {
+                member: member.clone(),
+                brigade: 7,
+                others: 0
+            }),
+            "worker-2 of \"Fix relay\" is waiting"
+        );
+        assert_eq!(
+            body(BellCause::OffStageMemberBell {
+                member,
+                brigade: 7,
+                others: 1
+            }),
+            "worker-2 of \"Fix relay\" rang the bell (+1 more)"
+        );
+        // No title, no stored name: the number, never an empty quote.
+        assert_eq!(
+            state.notification_body(
+                &app,
+                &BellCause::QuietRecorded {
+                    brigade: 9,
+                    director: SessionKey::from_id("d")
+                }
+            ),
+            "brigade 9 went quiet"
+        );
+    }
+
+    #[test]
+    fn a_long_title_is_cut_to_the_status_lines_width() {
+        let state = EmporiumState::new(PrefixKey::default());
+        let app = app_with(vec![titled(
+            "long",
+            Some("an exceedingly long session title that goes on"),
+        )]);
+        let body = state.notification_body(
+            &app,
+            &BellCause::ListRowWaiting {
+                session: SessionKey::from_id("long"),
+                others: 0,
+            },
+        );
+        assert_eq!(body, "\"an exceedingly long session\u{2026}\" is waiting");
+    }
+
+    #[test]
+    fn the_builder_frames_the_body_and_ends_in_st() {
+        assert_eq!(
+            build_host_notification("hello"),
+            b"\x1b]777;notify;banto;hello\x1b\\".to_vec()
+        );
+    }
+
+    #[test]
+    fn the_builder_replaces_the_field_separator_and_drops_every_control_character() {
+        let bytes = build_host_notification("a;b\x1b]52;c;x\x07\u{9b}\x00\r\nc\u{7f}d");
+        assert_eq!(bytes, osc777("a,b]52,c,xcd"));
+        // The only ESC and the only `;` left are the frame's own.
+        let inside = &bytes[b"\x1b]777;notify;banto;".len()..bytes.len() - 2];
+        assert!(!inside.contains(&0x1b) && !inside.contains(&b';') && !inside.contains(&0x07));
+    }
+
+    #[test]
+    fn the_builder_caps_the_body_at_255_bytes_on_a_character_boundary() {
+        let frame = osc777("").len();
+        let ascii = build_host_notification(&"x".repeat(1000));
+        assert_eq!(ascii.len() - frame, 255);
+        // `é` is two bytes: 127 of them are 254, and a 128th would make 256.
+        let wide = build_host_notification(&"é".repeat(1000));
+        let body = std::str::from_utf8(&wide[b"\x1b]777;notify;banto;".len()..wide.len() - 2])
+            .expect("cut on a boundary");
+        assert_eq!(body.chars().count(), 127);
+        assert_eq!(body.len(), 254);
+        assert!(wide.ends_with(b"\x1b\\"));
+        // Exactly 255 is kept whole.
+        assert_eq!(build_host_notification(&"x".repeat(255)).len() - frame, 255);
     }
 
     #[test]

@@ -46,7 +46,8 @@ use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::app::{App, Mode};
 use banto_core::config::{
-    AgentBinaries, BrigadeConfig, GoinkyoConsult, KeysConfig, RelayMode, ResolvedAgents,
+    AgentBinaries, AttentionConfig, BrigadeConfig, GoinkyoConsult, KeysConfig, RelayMode,
+    ResolvedAgents,
 };
 use banto_core::engine::{
     self, Axis, BellCause, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
@@ -364,6 +365,12 @@ pub struct EmporiumSettings<'a> {
     pub brigade: &'a BrigadeConfig,
     /// `[keys]`: the tmux-style prefix chord for pane operations.
     pub keys: &'a KeysConfig,
+    /// `[attention]`: whether a ring of the host bell also writes a desktop
+    /// notification.
+    pub attention: &'a AttentionConfig,
+    /// `TERM_PROGRAM` as banto started with it, which `attention.notify = "auto"`
+    /// is resolved against.
+    pub term_program: Option<&'a str>,
     /// `[agent_binaries]` — see `crate::launch::agent_binary`.
     pub agent_binaries: &'a AgentBinaries,
     /// `Config.agents`, resolved.
@@ -488,6 +495,7 @@ pub fn run(
         &mut app,
         &deps,
         keys,
+        banto_core::config::resolve_host_notify(settings.attention.notify, settings.term_program),
         startup_notices,
     );
     let restored = restore_terminal();
@@ -597,10 +605,12 @@ fn event_loop(
     app: &mut App,
     deps: &Deps,
     keys: &KeysConfig,
+    host_notify: bool,
     startup_notices: Vec<String>,
 ) -> Result<()> {
     let brigade = deps.brigade;
     let mut state = EmporiumState::new(PrefixKey::parse(&keys.prefix));
+    state.set_host_notify(host_notify);
     let mut handles: HashMap<SessionKey, PtyHandle> = HashMap::new();
     let mut discovery: Vec<DiscoveryTracker> = Vec::new();
     let mut watch = LiveWatch::new(
@@ -930,6 +940,15 @@ fn event_loop(
                         event: produced_by.as_deref().unwrap_or(""),
                     });
                     ring_host_bell_to(&mut io::stdout(), cause, entry);
+                    continue;
+                }
+                if let Cmd::NotifyHost { bytes } = &cmd {
+                    let entry = bell_log.as_mut().map(|file| BellEntry {
+                        file,
+                        since_start: now.saturating_duration_since(run_start),
+                        event: produced_by.as_deref().unwrap_or(""),
+                    });
+                    notify_host_to(&mut io::stdout(), bytes, entry);
                     continue;
                 }
                 // Cloned before `execute_cmd` consumes the Cmd, and only for the
@@ -1320,6 +1339,14 @@ fn execute_cmd(
             ring_host_bell_to(&mut std::io::stdout(), &cause, None);
             Vec::new()
         }
+        Cmd::NotifyHost { bytes } => {
+            // The same standing as the bell and OSC 52 above: an OSC string
+            // moves neither the cursor nor a cell, so it is safe to write
+            // between frames. The event loop notifies through here too, with its
+            // log.
+            notify_host_to(&mut std::io::stdout(), &bytes, None);
+            Vec::new()
+        }
     }
 }
 
@@ -1359,6 +1386,33 @@ fn ring_host_bell_to<W: io::Write>(host: &mut W, cause: &BellCause, log: Option<
         entry.file,
         "{wall_ms} emporium: bell +{}ms cause={cause} event={} {outcome}",
         entry.since_start.as_millis(),
+        entry.event,
+    );
+}
+
+/// Write the host notification and, when `log` is given, one line saying
+/// whether the write worked. The line names no cause and no text: the bell it
+/// goes with was logged just before it, with the cause, and the body is made of
+/// session titles, which a log must not hold (`BellCause`'s own contract). A
+/// failed write is no error, for the reason [`ring_host_bell_to`] gives.
+fn notify_host_to<W: io::Write>(host: &mut W, bytes: &[u8], log: Option<BellEntry<'_>>) {
+    let written = host.write_all(bytes).and_then(|()| host.flush());
+    let Some(entry) = log else {
+        return;
+    };
+    let wall_ms = std::time::UNIX_EPOCH
+        .elapsed()
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let outcome = match written {
+        Ok(()) => "written".to_string(),
+        Err(error) => format!("failed={:?}", error.kind()),
+    };
+    let _ = writeln!(
+        entry.file,
+        "{wall_ms} emporium: notify +{}ms bytes={} event={} {outcome}",
+        entry.since_start.as_millis(),
+        bytes.len(),
         entry.event,
     );
 }
@@ -17340,6 +17394,65 @@ mod tests {
         assert_eq!(host, b"\x07");
         // And a host that fails is not an error anywhere.
         ring_host_bell_to(&mut BrokenSink, &quiet_cause(), None);
+    }
+
+    #[test]
+    fn a_notification_is_written_verbatim_and_logged_without_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(dir.path().join("bell.log"))
+            .unwrap();
+        let bytes = b"\x1b]777;notify;banto;\"Secret title\" is waiting\x1b\\";
+        let mut host = Vec::new();
+        notify_host_to(
+            &mut host,
+            bytes,
+            Some(BellEntry {
+                file: &mut file,
+                since_start: Duration::from_millis(7),
+                event: "Tick",
+            }),
+        );
+        assert_eq!(host, bytes, "the core's bytes, untouched");
+        let lines = log_lines(&mut file);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let rest = lines[0].split_once(' ').unwrap().1;
+        assert_eq!(
+            rest,
+            format!(
+                "emporium: notify +7ms bytes={} event=Tick written",
+                bytes.len()
+            )
+        );
+        assert!(!lines[0].contains("Secret"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_notification_that_could_not_be_written_is_logged_as_such_and_breaks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(dir.path().join("bell.log"))
+            .unwrap();
+        notify_host_to(
+            &mut BrokenSink,
+            b"x",
+            Some(BellEntry {
+                file: &mut file,
+                since_start: Duration::ZERO,
+                event: "Tick",
+            }),
+        );
+        assert!(
+            log_lines(&mut file)[0].ends_with("event=Tick failed=BrokenPipe"),
+            "bad line"
+        );
+        notify_host_to(&mut BrokenSink, b"x", None);
     }
 
     #[test]

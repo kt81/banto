@@ -62,6 +62,9 @@ pub struct Env {
     /// database lives by default, and where banto keeps its MCP configs,
     /// consultation requests and message logs whatever the database path is.
     pub data_dir: Option<PathBuf>,
+    /// `TERM_PROGRAM`, which [`banto_core::config::resolve_host_notify`] reads
+    /// for `[attention] notify = "auto"`. Unset and not-UTF-8 are both `None`.
+    pub term_program: Option<String>,
 }
 
 impl Env {
@@ -76,6 +79,7 @@ impl Env {
             banto_data_dir: std::env::var_os("BANTO_DATA_DIR").map(PathBuf::from),
             default_config: io_config::default_config_path(),
             data_dir: DataDir::default_root(),
+            term_program: std::env::var("TERM_PROGRAM").ok(),
         }
     }
 

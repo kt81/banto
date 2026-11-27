@@ -488,6 +488,7 @@ pub fn cmd_handle_key(cmd: &Cmd) -> Option<&SessionKey> {
         | Cmd::SweepDataDir
         | Cmd::ForwardClipboardToHost { .. }
         | Cmd::RingHostBell { .. }
+        | Cmd::NotifyHost { .. }
         | Cmd::Reload => None,
     }
 }
@@ -513,6 +514,7 @@ pub fn is_logged_cmd(cmd: &Cmd) -> bool {
         | Cmd::SweepDataDir
         | Cmd::ForwardClipboardToHost { .. }
         | Cmd::RingHostBell { .. }
+        | Cmd::NotifyHost { .. }
         | Cmd::Reload => false,
     }
 }
@@ -578,6 +580,7 @@ pub fn cmd_line(cmd: &Cmd, by: &'static str, facts: CmdFacts) -> Option<Line> {
         | Cmd::SweepDataDir
         | Cmd::ForwardClipboardToHost { .. }
         | Cmd::RingHostBell { .. }
+        | Cmd::NotifyHost { .. }
         | Cmd::Reload => return None,
     };
     Some(line)

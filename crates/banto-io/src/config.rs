@@ -28,7 +28,9 @@
 use std::path::{Path, PathBuf};
 
 use banto_core::config::legacy_brigade_keys_in;
-pub use banto_core::config::{ActivityConfig, BrigadeConfig, Config, KeysConfig, RelayMode};
+pub use banto_core::config::{
+    ActivityConfig, AttentionConfig, BrigadeConfig, Config, HostNotify, KeysConfig, RelayMode,
+};
 
 /// `dirs::config_dir()/banto/config.toml`
 /// (e.g. `%APPDATA%\banto\config.toml` on Windows,
