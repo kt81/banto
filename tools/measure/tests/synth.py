@@ -73,8 +73,9 @@ def compact(when, pre, post, dur, trigger="auto"):
             "compactMetadata": {"trigger": trigger, "preTokens": pre, "postTokens": post, "durationMs": dur}}
 
 
-def delivery(*messages, recipient=None):
-    """A synthetic format_inbox answer; each message is (sender header, body)."""
+def delivery(*messages, recipient=None, waiting=0):
+    """A synthetic check_messages answer; each message is (sender header, body). `waiting` is how
+    many more unread messages the page says it left behind."""
     own = sum(header.split()[0] == "banto" for header, _ in messages)
     roles = set()
     for header, _ in messages:
@@ -102,6 +103,8 @@ def delivery(*messages, recipient=None):
         if header.startswith("banto — "):
             header = header.replace("banto — ", "banto (banto's own record, not another AI's words) — ", 1)
         out += f"\n[from {header}]\n{body}\n"
+    if waiting:
+        out += f"\n[banto] {waiting} more message(s) waiting. Call check_messages again to read them.\n"
     return out
 
 

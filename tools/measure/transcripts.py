@@ -67,6 +67,9 @@ DELIVERED_RE = re.compile(r"^\s*\d+ message\(s\) (?:relayed by banto|from banto 
 FROM_RE = re.compile(r"^\[from [^\]]*\]\s*$")
 FROM_HDR_RE = re.compile(r"^\[from ([^\]]+)\]\s*$", re.M)
 FROM_PARTS_RE = re.compile(r'^(worker-\d+|goinkyo|director|planner|operator|banto)(?: "([^"]*)")?(?: \(banto\'s own record, not another AI\'s words\))?(?: — (to you|broadcast))?(?: — banto refused tool calls .*)?$')
+# The last line of a page that left mail unread (mcp.rs `more_waiting_line`): not part of the last
+# message's body, and only ever the end of the text.
+MORE_WAITING_RE = re.compile(r"\n\[banto\] (\d+) more message\(s\) waiting\. Call check_messages again to read them\.\s*\Z")
 # The first message a Worker / Goinkyo receives names its place in a brigade.
 WORKER_BRIEFING_RE = re.compile(r"You are (worker-\d+), a Worker in banto brigade (\d+)")
 GOINKYO_BRIEFING_RE = re.compile(r"You are the Goinkyo of banto brigade (\d+)")
@@ -519,6 +522,7 @@ RELEASE_BUILD_RX = re.compile(r"(cargo\s+build[^\n|;&]*--release|cargo\s+build\s
 
 def split_delivery(text):
     """check_messages answer -> [(sender, display name or None, scope or None, body)]"""
+    text = MORE_WAITING_RE.sub("", text)
     hs = list(FROM_HDR_RE.finditer(text))
     parts = []
     for i, m in enumerate(hs):
@@ -534,7 +538,7 @@ def split_delivery(text):
 def instruction_label(text):
     """First line of the first delivered instruction: the line after the first
     '[from ...]' header of a check_messages answer."""
-    lines = text.splitlines()
+    lines = MORE_WAITING_RE.sub("", text).splitlines()
     for i, ln in enumerate(lines):
         if FROM_RE.match(ln.strip()):
             return clean("\n".join(lines[i + 1:]))

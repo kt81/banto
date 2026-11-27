@@ -383,8 +383,10 @@ fn initialize_result(msg: &Value) -> Value {
 
 /// What a refused call of the main agent is told, while an interrupt is unread.
 const GATE_REASON_MAIN: &str = "[banto] The Director interrupted you. Call check_messages now \
-    and follow the message. This is not an error and not the user refusing the call: banto \
-    held it back for that message, and the call did not run.";
+    and follow the message; if its result says more messages are waiting, keep calling it \
+    until it no longer does, because the interrupt may be on a later page. This is not an \
+    error and not the user refusing the call: banto held it back for that message, and the \
+    call did not run.";
 
 /// What a refused call of a subagent is told, while an interrupt is unread: also
 /// its own `check_messages`, which is refused outside the count.
@@ -446,22 +448,31 @@ fn tools_list_result() -> Value {
             {
                 "name": "send_to_peer",
                 "_meta": always_loaded(),
-                "description": "Send a message to your brigade peer through banto: a Director \
-                                reaches every Worker by default, a Worker, a Goinkyo or a \
-                                Planner reaches the Director. banto's relay, on by default, \
-                                wakes an idle \
-                                recipient to read the message, which costs \
-                                it a turn over its whole context; it reads the text with \
-                                check_messages. A wake is not guaranteed (the relay can be off, or \
-                                held while the recipient is busy), so do not take a send as a \
-                                read. Optionally set `to` to address one \
-                                specific member instead of broadcasting — the only way a \
-                                Director reaches a Goinkyo or the Planner, since a broadcast \
-                                never does. Workers and the Goinkyo cannot reach the Planner.",
+                "description": format!(
+                    "Send a message to your brigade peer through banto: a Director \
+                     reaches every Worker by default, a Worker, a Goinkyo or a \
+                     Planner reaches the Director. banto's relay, on by default, \
+                     wakes an idle \
+                     recipient to read the message, which costs \
+                     it a turn over its whole context; it reads the text with \
+                     check_messages. A wake is not guaranteed (the relay can be off, or \
+                     held while the recipient is busy), so do not take a send as a \
+                     read. Optionally set `to` to address one \
+                     specific member instead of broadcasting — the only way a \
+                     Director reaches a Goinkyo or the Planner, since a broadcast \
+                     never does. Workers and the Goinkyo cannot reach the Planner. \
+                     A text over {MESSAGE_BODY_LIMIT} bytes of UTF-8 is refused, not cut: \
+                     split it, or write the long part to a file and send the path."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "text": { "type": "string", "description": "The message to relay." },
+                        "text": {
+                            "type": "string",
+                            "description": format!(
+                                "The message to relay, at most {MESSAGE_BODY_LIMIT} bytes of UTF-8."
+                            )
+                        },
                         "to": {
                             "type": "string",
                             "description": "Optional: address one specific brigade member by \
@@ -485,7 +496,10 @@ fn tools_list_result() -> Value {
                 "_meta": always_loaded(),
                 "description": format!(
                     "Pull any new messages your brigade peer has sent you via banto (since \
-                     you last checked). Call it at natural checkpoints. {CHECK_MESSAGES_INTERRUPT_SENTENCE}"
+                     you last checked). Call it at natural checkpoints. A call returns the \
+                     oldest messages that fit in {INBOX_PAGE_BUDGET} bytes; when the result \
+                     ends by saying more are waiting, call it again for them. \
+                     {CHECK_MESSAGES_INTERRUPT_SENTENCE}"
                 ),
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             },
@@ -866,9 +880,12 @@ fn tools_list_result() -> Value {
                         },
                         "text": {
                             "type": "string",
-                            "description": "The message, delivered as send_to_peer's is. Say \
-                                            why the turn was stopped and what to do next; \
-                                            the Worker reads it when it next pulls its mail."
+                            "description": format!(
+                                "The message, delivered as send_to_peer's is, and no longer \
+                                 than its text may be ({MESSAGE_BODY_LIMIT} bytes of UTF-8). \
+                                 Say why the turn was stopped and what to do next; the Worker \
+                                 reads it when it next pulls its mail."
+                            )
                         }
                     },
                     "required": ["member", "text"],
@@ -1202,6 +1219,9 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
     if text.trim().is_empty() {
         return tool_error("send_to_peer requires a non-empty `text`.");
     }
+    if let Some(refusal) = refuse_oversized("send_to_peer", text) {
+        return refusal;
+    }
     let to = match parse_to_arg(msg) {
         Ok(to) => to,
         Err(message) => return tool_error(&message),
@@ -1501,21 +1521,115 @@ fn tool_check_messages(ctx: &mut ServerContext) -> Value {
         Ok(None) => return not_in_brigade(),
         Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
     };
-    match ctx.store.fetch_brigade_messages(brigade, &token, role) {
-        Ok(messages) if messages.is_empty() => {
+    // Read before the fetch, which sizes its page by the text built from the
+    // roster. A failed lookup degrades the framing sentence's wording, never the
+    // delivery: the cursor moves with the fetch, so erroring the call out after it
+    // would drop messages the caller can never pull again.
+    let members = ctx.store.brigade_members(brigade).unwrap_or_default();
+    let page = ctx
+        .store
+        .fetch_brigade_messages_page(brigade, &token, role, |unread| {
+            inbox_page_len(unread.len(), |taken| {
+                format_page(&unread[..taken], unread.len() - taken, &members, role)
+            })
+        });
+    match page {
+        Ok(page) if page.messages.is_empty() => {
             tool_text("No new messages from your brigade peer.".to_string(), false)
         }
-        Ok(messages) => {
-            // `fetch_brigade_messages` already advanced the cursor above —
-            // these messages are spoken for either way, so a roster lookup
-            // failure here degrades the framing sentence's wording, never
-            // the delivery: erroring the whole call out now would drop
-            // messages the caller can never pull again.
-            let members = ctx.store.brigade_members(brigade).unwrap_or_default();
-            tool_text(format_inbox(&messages, &members, role), false)
-        }
+        Ok(page) => tool_text(
+            format_page(&page.messages, page.remaining, &members, role),
+            false,
+        ),
         Err(err) => tool_error(&format!("failed to read messages: {err}")),
     }
+}
+
+/// What one `check_messages` result may weigh, in bytes of UTF-8, counted over the
+/// whole text: banto's preface, every header, the bodies and the line that says
+/// more is waiting.
+///
+/// Codex 0.172.0 cuts any tool output above about 40,000 bytes of UTF-8, keeping
+/// its head and tail and dropping the middle without an error (measured on
+/// 2026-11-27: ASCII is cut near 40,000 characters, Japanese near 13,000 to
+/// 15,000, and no setting raises it). The cursor having moved past what was cut,
+/// the recipient never sees it again. The budget sits eight kilobytes under the
+/// cut. The largest delivery on record (32,246 B, two messages) is over it and
+/// would now go in two pages; no other delivery on record was past 30 KB, so
+/// ordinary traffic still arrives whole.
+const INBOX_PAGE_BUDGET: usize = 32_000;
+
+/// The most a single message body may weigh when it is sent, in bytes of UTF-8,
+/// for every sender and every recipient: a sender cannot know the recipient's
+/// product, and one rule is simpler than two.
+///
+/// It sits just above the largest message on record (24,780 B, measured over
+/// 2026-08-07 to 2026-11-27) and below [`INBOX_PAGE_BUDGET`] by more than the
+/// framing a delivery adds (766 B at most, measured the same way, plus the line
+/// that says more is waiting), so one message always fits a page of its own.
+/// Raising it past that margin turns the delivery of a legacy message that large
+/// into an exception again.
+const MESSAGE_BODY_LIMIT: usize = 25_000;
+
+/// How many of `unread` messages, oldest first, go out in one page: as many as
+/// the budget holds, one at least. `render(taken)` is the page built from the
+/// first `taken` of them, line about the rest included, and the page is the one
+/// that is measured, not the bodies.
+///
+/// All of them are tried first, because that page has no line about the rest and
+/// so can fit where a shorter one, which carries the line, does not: sizes are not
+/// monotonic in the count. Without that, a page that fits whole is cut short.
+///
+/// A message that does not fit alone is delivered alone: one written before
+/// [`MESSAGE_BODY_LIMIT`], when nothing bounded it, is not worth holding back
+/// forever, and an empty page with mail waiting would have the member asking
+/// again for ever.
+fn inbox_page_len(unread: usize, render: impl Fn(usize) -> String) -> usize {
+    if unread > 0 && render(unread).len() <= INBOX_PAGE_BUDGET {
+        return unread;
+    }
+    let mut taken = unread.min(1);
+    while taken + 1 < unread && render(taken + 1).len() <= INBOX_PAGE_BUDGET {
+        taken += 1;
+    }
+    taken
+}
+
+/// [`format_inbox`] for one page, with the line that tells the reader the rest of
+/// its mail is still unread when `remaining` is not zero.
+fn format_page(
+    messages: &[BrigadeMessage],
+    remaining: usize,
+    members: &[BrigadeMember],
+    recipient: BrigadeRole,
+) -> String {
+    let mut out = format_inbox(messages, members, recipient);
+    out.push_str(&more_waiting_line(remaining));
+    out
+}
+
+/// The last line of a page that leaves mail unread. A fixed form on purpose:
+/// `tools/measure` recognises it to keep it out of the last message's body.
+fn more_waiting_line(remaining: usize) -> String {
+    if remaining == 0 {
+        return String::new();
+    }
+    format!(
+        "\n[banto] {remaining} more message(s) waiting. Call check_messages again to read them.\n"
+    )
+}
+
+/// The refusal of a message body over [`MESSAGE_BODY_LIMIT`], or `None` when it fits.
+/// Refused, not cut: a cut message is one the sender believes was whole.
+fn refuse_oversized(tool: &str, text: &str) -> Option<Value> {
+    (text.len() > MESSAGE_BODY_LIMIT).then(|| {
+        tool_error(&format!(
+            "Nothing was sent: `text` is {} bytes of UTF-8 and {tool} takes at most \
+             {MESSAGE_BODY_LIMIT} (a Japanese character is three). Split it into several \
+             messages, or write the long part to a file and send its path.",
+            text.len()
+        ))
+    })
 }
 
 /// `consult_goinkyo`: files a written consultation request and creates the
@@ -2359,6 +2473,9 @@ fn interrupt_worker(ctx: &mut ServerContext, msg: &Value, wait: Duration) -> Val
         Ok(None) => return tool_error("`text` is required."),
         Err(message) => return tool_error(&message),
     };
+    if let Some(refusal) = refuse_oversized("interrupt_worker", text) {
+        return refusal;
+    }
     let members = match ctx.store.brigade_members(brigade) {
         Ok(members) => members,
         Err(err) => return tool_error(&format!("failed to read the brigade roster: {err}")),
@@ -2621,7 +2738,14 @@ fn tool_interrupt_gate(ctx: &mut ServerContext, msg: &Value) -> Value {
 ///    one of its helpers.
 ///
 /// The words are written over the unread interrupts of this Worker, all of them,
-/// because one pull reads them all and the header is per message.
+/// not only the newest: the header is per message, and a pull may stop short of
+/// some (a page holds [`INBOX_PAGE_BUDGET`] bytes), so an interrupt that comes on
+/// a later page must already carry the words when that page is read.
+///
+/// Reading an earlier page neither clears the gate nor resets the counts, so a
+/// Worker that reads one page and goes on with other tools is refused
+/// [`GATE_REFUSALS`] times and then let through with the interrupt still unread.
+/// The refusal note asks it to keep calling `check_messages` for that reason.
 ///
 /// A failure to read the store allows the call, like every failure of the gate: a
 /// subagent's `check_messages` is then let through too, because what it would be
@@ -5176,7 +5300,7 @@ mod tests {
             }
             assert_eq!(gate(&mut ctx, "Read", agent), None);
         }
-        // Both unread interrupts took the words, since one pull reads both: the
+        // Both unread interrupts took the words, since a pull that holds both reads both: the
         // second one's `gated` and `capped` are written over the second only,
         // the first stays `capped`.
         assert_eq!(
@@ -6444,6 +6568,339 @@ mod tests {
         );
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("No new messages"), "got {text:?}");
+    }
+
+    // --- bounded pages and the size of a message --------------------------------
+
+    fn page_message(id: i64, body: String) -> BrigadeMessage {
+        BrigadeMessage {
+            id,
+            from_token: "director".to_string(),
+            body,
+            to_member: None,
+            interrupted: None,
+        }
+    }
+
+    /// `render` for [`inbox_page_len`]: the page of the first `taken` of `unread`
+    /// as `check_messages` builds it.
+    fn rendered(unread: &[BrigadeMessage]) -> impl Fn(usize) -> String + '_ {
+        move |taken| {
+            format_page(
+                &unread[..taken],
+                unread.len() - taken,
+                &[],
+                BrigadeRole::Worker,
+            )
+        }
+    }
+
+    #[test]
+    fn a_page_ending_exactly_on_the_budget_is_kept_and_one_byte_more_is_not() {
+        let mut unread = vec![
+            page_message(1, "a".repeat(10_000)),
+            page_message(2, String::new()),
+            page_message(3, "c".repeat(5_000)),
+        ];
+        // What the second message may weigh for a page of two to be exactly the
+        // budget: the page is measured with the line about the third in it.
+        let overhead = rendered(&unread)(2).len();
+        let fits = INBOX_PAGE_BUDGET - overhead;
+        unread[1].body = "b".repeat(fits);
+        assert_eq!(rendered(&unread)(2).len(), INBOX_PAGE_BUDGET);
+        assert_eq!(inbox_page_len(unread.len(), rendered(&unread)), 2);
+
+        unread[1].body = "b".repeat(fits + 1);
+        assert_eq!(inbox_page_len(unread.len(), rendered(&unread)), 1);
+    }
+
+    #[test]
+    fn a_page_is_never_empty_while_mail_is_waiting_and_a_message_too_big_alone_goes_alone() {
+        assert_eq!(inbox_page_len(0, |_| unreachable!()), 0);
+        let unread = vec![
+            page_message(1, "a".repeat(INBOX_PAGE_BUDGET + 5_000)),
+            page_message(2, "small".to_string()),
+        ];
+        assert_eq!(inbox_page_len(unread.len(), rendered(&unread)), 1);
+        let unread = vec![page_message(1, "a".repeat(INBOX_PAGE_BUDGET * 2))];
+        assert_eq!(inbox_page_len(1, rendered(&unread)), 1);
+    }
+
+    #[test]
+    fn a_page_that_fits_whole_is_not_cut_short_by_the_line_a_shorter_page_would_carry() {
+        // The page of all three has no line about the rest; the page of two has
+        // one, and it is longer than the third message, so two do not fit where
+        // three do.
+        let mut unread = vec![
+            page_message(1, "a".repeat(16_000)),
+            page_message(2, String::new()),
+            page_message(3, "x".to_string()),
+        ];
+        let overhead = rendered(&unread)(3).len();
+        unread[1].body = "b".repeat(INBOX_PAGE_BUDGET - overhead);
+        assert_eq!(rendered(&unread)(3).len(), INBOX_PAGE_BUDGET);
+        assert!(rendered(&unread)(2).len() > INBOX_PAGE_BUDGET);
+        assert_eq!(inbox_page_len(unread.len(), rendered(&unread)), 3);
+
+        // One byte more and the whole no longer fits: the largest page that
+        // does, line included, is one message.
+        unread[1].body.push('b');
+        assert_eq!(inbox_page_len(unread.len(), rendered(&unread)), 1);
+    }
+
+    #[test]
+    fn the_line_about_what_is_still_waiting_has_one_fixed_form_and_is_absent_when_nothing_is() {
+        assert_eq!(more_waiting_line(0), "");
+        assert_eq!(
+            more_waiting_line(7),
+            "\n[banto] 7 more message(s) waiting. Call check_messages again to read them.\n"
+        );
+        let page = format_page(
+            &[page_message(1, "body".to_string())],
+            3,
+            &[],
+            BrigadeRole::Worker,
+        );
+        assert!(
+            page.ends_with(
+                "body\n\n[banto] 3 more message(s) waiting. Call check_messages again to read them.\n"
+            ),
+            "{page:?}"
+        );
+        assert!(
+            !format_page(
+                &[page_message(1, "body".to_string())],
+                0,
+                &[],
+                BrigadeRole::Worker
+            )
+            .contains("waiting")
+        );
+    }
+
+    #[test]
+    fn the_largest_message_that_may_be_sent_always_fits_a_page_of_its_own() {
+        // The framing at its heaviest: a Director's note, a header that says banto
+        // refused calls for it, and the line about the mail behind it.
+        let mut message = page_message(1, "a".repeat(MESSAGE_BODY_LIMIT));
+        message.interrupted = Some(InterruptOutcome::Capped);
+        let page = format_page(&[message], 99_999, &[], BrigadeRole::Director);
+        assert!(
+            page.len() <= INBOX_PAGE_BUDGET,
+            "{} bytes against {INBOX_PAGE_BUDGET}",
+            page.len()
+        );
+    }
+
+    /// `worker-1`'s own context, with the Director's broadcasts already queued.
+    fn worker_with_mail(bodies: &[String]) -> ServerContext {
+        let ctx = named_ctx();
+        for body in bodies {
+            ctx.store
+                .enqueue_brigade_message(1, "director", BrigadeRole::Worker, None, body)
+                .unwrap();
+        }
+        worker_ctx_of(ctx, "worker-1")
+    }
+
+    #[test]
+    fn check_messages_hands_over_a_page_a_call_oldest_first_and_says_what_is_left() {
+        let bodies: Vec<String> = (0..5)
+            .map(|n| format!("<<{n}>>{}", "a".repeat(9_000)))
+            .collect();
+        let mut worker = worker_with_mail(&bodies);
+
+        let first = pull(&mut worker);
+        assert!(first.len() <= INBOX_PAGE_BUDGET, "{} bytes", first.len());
+        for n in 0..3 {
+            assert!(first.contains(&format!("<<{n}>>")), "{n} on the first page");
+        }
+        assert!(!first.contains("<<3>>"));
+        assert!(
+            first.ends_with(
+                "\n[banto] 2 more message(s) waiting. Call check_messages again to read them.\n"
+            ),
+            "{:?}",
+            &first[first.len() - 120..]
+        );
+        assert!(
+            worker
+                .store
+                .has_unseen_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+                .unwrap(),
+            "what is left is still unread"
+        );
+
+        let second = pull(&mut worker);
+        assert!(second.contains("<<3>>") && second.contains("<<4>>"));
+        assert!(!second.contains("<<2>>"), "nothing is delivered twice");
+        assert!(!second.contains("more message(s) waiting"), "{second:?}");
+        assert!(
+            !worker
+                .store
+                .has_unseen_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+        );
+        assert!(pull(&mut worker).contains("No new messages"));
+    }
+
+    #[test]
+    fn a_message_stored_before_the_limit_that_is_too_big_for_a_page_is_delivered_alone() {
+        let bodies = vec![
+            format!("<<big>>{}", "a".repeat(INBOX_PAGE_BUDGET + 8_000)),
+            "<<small>>".to_string(),
+        ];
+        let mut worker = worker_with_mail(&bodies);
+        let first = pull(&mut worker);
+        assert!(first.contains("<<big>>") && !first.contains("<<small>>"));
+        assert!(first.ends_with(
+            "[banto] 1 more message(s) waiting. Call check_messages again to read them.\n"
+        ));
+        let second = pull(&mut worker);
+        assert!(second.contains("<<small>>") && !second.contains("<<big>>"));
+    }
+
+    /// A body of exactly `bytes` bytes of UTF-8 made of three-byte characters and
+    /// at most two ASCII ones, so a count of characters could not pass for it.
+    fn japanese_body(bytes: usize) -> String {
+        let mut body = "\u{3042}".repeat(bytes / 3);
+        body.push_str(&"a".repeat(bytes % 3));
+        assert_eq!(body.len(), bytes);
+        body
+    }
+
+    #[test]
+    fn send_to_peer_takes_a_body_of_the_limit_and_refuses_one_byte_more() {
+        let mut ctx = named_ctx();
+        let fits = japanese_body(MESSAGE_BODY_LIMIT);
+        assert!(fits.chars().count() < MESSAGE_BODY_LIMIT / 2);
+        let response = send_with(&mut ctx, json!({"text": fits}));
+        assert!(!is_error(&response), "{}", result_text(&response));
+
+        let response = send_with(
+            &mut ctx,
+            json!({"text": japanese_body(MESSAGE_BODY_LIMIT + 1)}),
+        );
+        assert!(is_error(&response));
+        assert_eq!(
+            result_text(&response),
+            "Nothing was sent: `text` is 25001 bytes of UTF-8 and send_to_peer takes at most \
+             25000 (a Japanese character is three). Split it into several messages, or write \
+             the long part to a file and send its path."
+        );
+        // The other spelling of the argument is counted the same way.
+        let response = send_with(
+            &mut ctx,
+            json!({"message": japanese_body(MESSAGE_BODY_LIMIT + 3)}),
+        );
+        assert!(is_error(&response));
+        assert!(result_text(&response).contains("25003 bytes"));
+
+        assert_eq!(
+            queued_for_worker_1(&mut ctx),
+            [japanese_body(MESSAGE_BODY_LIMIT)],
+            "the refused ones were not stored, cut or whole"
+        );
+    }
+
+    #[test]
+    fn interrupt_worker_has_the_same_limit_and_stores_nothing_over_it() {
+        let mut ctx = named_ctx();
+        let response = interrupt_now(
+            &mut ctx,
+            json!({"member": "worker-1", "text": japanese_body(MESSAGE_BODY_LIMIT + 1)}),
+        );
+        assert!(is_error(&response));
+        assert_eq!(
+            result_text(&response),
+            "Nothing was sent: `text` is 25001 bytes of UTF-8 and interrupt_worker takes at \
+             most 25000 (a Japanese character is three). Split it into several messages, or \
+             write the long part to a file and send its path."
+        );
+        assert!(ctx.store.pending_interrupts(1).unwrap().is_empty());
+        assert!(queued_for_worker_1(&mut ctx).is_empty());
+
+        let response = interrupt_now(
+            &mut ctx,
+            json!({"member": "worker-1", "text": japanese_body(MESSAGE_BODY_LIMIT)}),
+        );
+        assert!(!is_error(&response), "{}", result_text(&response));
+    }
+
+    #[test]
+    fn a_page_short_of_an_interrupt_leaves_the_gate_on_and_the_page_that_reaches_it_clears_it() {
+        // The cursor is the only page state, so mail older than the interrupt goes
+        // first. While the Worker keeps reading, the gate refuses its other calls
+        // and never `check_messages`, and it clears on the page that carries the
+        // interrupt. What a Worker that stops reading meets is the next test.
+        let mut worker = worker_with_interrupt_behind_a_full_page();
+
+        assert_eq!(gate(&mut worker, CHECK_MESSAGES_HOOK_NAME, ""), None);
+        let first = pull(&mut worker);
+        assert!(
+            first.contains("<<2>>") && !first.contains("stop"),
+            "{first:?}"
+        );
+        assert_eq!(
+            gate(&mut worker, "Bash", ""),
+            Some(GATE_REASON_MAIN.to_string()),
+            "the interrupt is still unread"
+        );
+        assert_eq!(gate(&mut worker, CHECK_MESSAGES_HOOK_NAME, ""), None);
+
+        let second = pull(&mut worker);
+        assert!(
+            second.contains("<<3>>") && second.contains("stop"),
+            "{second:?}"
+        );
+        assert_eq!(gate(&mut worker, "Bash", ""), None);
+    }
+
+    #[test]
+    fn an_interrupt_behind_a_full_page_can_be_overtaken_by_a_worker_that_stops_reading() {
+        // The gate's cap is not reset by reading an earlier page: a Worker that
+        // reads one page and then goes on with its tools is refused three times
+        // and let through on the fourth, with the interrupt still unread. Accepted:
+        // one cursor cannot put the interrupt ahead of older mail. The refusal
+        // note is what asks the Worker to keep reading.
+        let mut worker = worker_with_interrupt_behind_a_full_page();
+        pull(&mut worker);
+        for _ in 0..GATE_REFUSALS {
+            assert_eq!(
+                gate(&mut worker, "Bash", ""),
+                Some(GATE_REASON_MAIN.to_string())
+            );
+        }
+        assert_eq!(gate(&mut worker, "Bash", ""), None);
+        assert!(
+            !worker
+                .store
+                .unread_interrupt_ids(1, "worker-1")
+                .unwrap()
+                .is_empty(),
+            "the interrupt was still unread when the call ran"
+        );
+        assert!(GATE_REASON_MAIN.contains("keep calling it until it no longer does"));
+    }
+
+    /// `worker-1`'s context with four 9,000-byte messages queued before an
+    /// interrupt, so the first page holds three of them and not the interrupt.
+    fn worker_with_interrupt_behind_a_full_page() -> ServerContext {
+        let mut director = named_ctx();
+        for n in 0..4 {
+            director
+                .store
+                .enqueue_brigade_message(
+                    1,
+                    "director",
+                    BrigadeRole::Worker,
+                    Some("worker-1"),
+                    &format!("<<{n}>>{}", "a".repeat(9_000)),
+                )
+                .unwrap();
+        }
+        interrupt_now(&mut director, json!({"member": "worker-1", "text": "stop"}));
+        worker_ctx_of(director, "worker-1")
     }
 
     #[test]

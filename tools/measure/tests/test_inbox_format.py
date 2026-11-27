@@ -57,6 +57,29 @@ class InboxFormat(unittest.TestCase):
             text = banto_preface + header.format(sender, "synthetic", origin=sender_origin, addressing="to you", interrupted="")
             self.assertEqual(tr.split_delivery(text)[0][0], sender)
 
+        # The line a page that left mail unread ends with: rendered from the Rust string, it is
+        # what synth reproduces, and it is not the last message's body.
+        waiting = fmt_after(inbox, "fn more_waiting_line").replace("{remaining}", "3")
+        page = banto_preface + header.format("worker-1", "last body", origin="", addressing="to you", interrupted="") + waiting
+        self.assertEqual(tr.split_delivery(page), [("worker-1", None, "to you", "last body")])
+        self.assertEqual(tr.instruction_label(page), "last body")
+        synthetic = synth.delivery(("worker-1 — to you", "last body"), waiting=3)
+        self.assertTrue(synthetic.endswith(waiting), (synthetic, waiting))
+        self.assertEqual(tr.split_delivery(synthetic), [("worker-1", None, "to you", "last body")])
+        # Only the end of the answer is the line: the same words inside a body stay in it.
+        inside = synth.delivery(("worker-1 — to you", "quoted:" + waiting + "after"))
+        self.assertIn("quoted:", tr.split_delivery(inside)[0][3])
+        self.assertIn("after", tr.split_delivery(inside)[0][3])
+        self.assertIn("more message(s) waiting", tr.split_delivery(inside)[0][3])
+        # Known limitation (tools/measure/README.md): a last body that itself ends with the
+        # line is shortened though banto appended none. Pinned so nobody reads the parser as
+        # exact; if it ever learns to tell them apart, this is the assertion to flip.
+        lookalike = synth.delivery(("worker-1 — to you", "see:" + waiting), waiting=0)
+        self.assertEqual(tr.split_delivery(lookalike)[0][3], "see:")
+        # A later page's last message, and a page with several messages.
+        two = synth.delivery(("worker-1 — to you", "a"), ("worker-2 — broadcast", "b"), waiting=12)
+        self.assertEqual([p[3] for p in tr.split_delivery(two)], ["a", "b"])
+
     def test_update_progress_alone_identifies_director(self):
         import tempfile
         with tempfile.TemporaryDirectory() as root:

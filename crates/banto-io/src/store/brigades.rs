@@ -28,8 +28,8 @@ use rusqlite::{OptionalExtension, params};
 use banto_core::display_text::display_safe;
 use banto_core::member_name;
 use banto_core::model::{
-    AgentKind, Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, InterruptOutcome,
-    MemberToken, MessageGlance, SessionId, StoredLayout, StoredMemberLayout,
+    AgentKind, Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, InboxPage,
+    InterruptOutcome, MemberToken, MessageGlance, SessionId, StoredLayout, StoredMemberLayout,
 };
 
 use super::archive::archive_on;
@@ -1016,12 +1016,38 @@ impl Store {
     /// so it doesn't carry over if the token's underlying session
     /// later changes, and per-member cursors mean each recipient of a
     /// broadcast sees it independently.
+    ///
+    /// Takes every unread message. The tool a model calls goes through
+    /// [`Self::fetch_brigade_messages_page`], which bounds what one call hands over.
     pub fn fetch_brigade_messages(
         &mut self,
         brigade_id: BrigadeId,
         member_token: &str,
         recipient_role: BrigadeRole,
     ) -> Result<Vec<BrigadeMessage>, StoreError> {
+        Ok(self
+            .fetch_brigade_messages_page(brigade_id, member_token, recipient_role, <[_]>::len)?
+            .messages)
+    }
+
+    /// [`Self::fetch_brigade_messages`] for the first `page_len(unread)` of the
+    /// unread messages, oldest first: the cursor moves past those and no
+    /// further, and `remaining` counts what stays behind it.
+    ///
+    /// `page_len` is told every unread message and answers how many of them go
+    /// out. The choice is the caller's because the size of a page is the size of
+    /// the text built from it, which the store does not build. The answer is held
+    /// to at least one while anything is unread, so a call never comes back empty
+    /// with mail waiting, and to at most all of it. It is asked inside the
+    /// transaction that moves the cursor, so a second reader of the same member
+    /// cannot be handed the same page.
+    pub fn fetch_brigade_messages_page(
+        &mut self,
+        brigade_id: BrigadeId,
+        member_token: &str,
+        recipient_role: BrigadeRole,
+        page_len: impl FnOnce(&[BrigadeMessage]) -> usize,
+    ) -> Result<InboxPage, StoreError> {
         let tx = self.conn.transaction()?;
         let cursor: i64 = tx
             .query_row(
@@ -1055,6 +1081,14 @@ impl Store {
             )?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        let mut messages = messages;
+        let taken = if messages.is_empty() {
+            0
+        } else {
+            page_len(&messages).clamp(1, messages.len())
+        };
+        let remaining = messages.len() - taken;
+        messages.truncate(taken);
         if let Some(max_id) = messages.last().map(|message| message.id) {
             tx.execute(
                 "INSERT INTO brigade_cursors (brigade_id, member_token, last_seen_id)
@@ -1064,7 +1098,10 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(messages)
+        Ok(InboxPage {
+            messages,
+            remaining,
+        })
     }
 
     /// Janitor: deletes every brigade with zero `brigade_members` rows —
@@ -1948,6 +1985,71 @@ mod tests {
         assert_eq!(pulled[0].from_token, "director");
         assert_eq!(pulled[0].to_member.as_deref(), Some(worker.as_str()));
         assert_eq!(pulled[0].interrupted, None, "no outcome had been decided");
+    }
+
+    #[test]
+    fn a_page_moves_the_cursor_only_past_what_it_returns() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (br, worker) = with_a_worker(&mut store);
+        let ids: Vec<i64> = (0..5)
+            .map(|n| {
+                store
+                    .enqueue_brigade_message(
+                        br,
+                        "director",
+                        BrigadeRole::Worker,
+                        None,
+                        &format!("m{n}"),
+                    )
+                    .unwrap()
+            })
+            .collect();
+
+        let page = store
+            .fetch_brigade_messages_page(br, &worker, BrigadeRole::Worker, |_| 2)
+            .unwrap();
+        assert_eq!(
+            page.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            ids[..2]
+        );
+        assert_eq!(page.remaining, 3);
+        assert!(
+            store
+                .has_unseen_brigade_messages(br, &worker, BrigadeRole::Worker)
+                .unwrap(),
+            "the rest is still unread"
+        );
+
+        // The answer is held to one at least, so mail waiting never reads as none.
+        let page = store
+            .fetch_brigade_messages_page(br, &worker, BrigadeRole::Worker, |_| 0)
+            .unwrap();
+        assert_eq!(
+            page.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            ids[2..3]
+        );
+        assert_eq!(page.remaining, 2);
+
+        // And to all of it at most.
+        let page = store
+            .fetch_brigade_messages_page(br, &worker, BrigadeRole::Worker, |_| 99)
+            .unwrap();
+        assert_eq!(page.messages.len(), 2);
+        assert_eq!(page.remaining, 0);
+        assert!(
+            !store
+                .has_unseen_brigade_messages(br, &worker, BrigadeRole::Worker)
+                .unwrap()
+        );
+
+        // Nothing unread: the chooser is not asked.
+        let page = store
+            .fetch_brigade_messages_page(br, &worker, BrigadeRole::Worker, |_| {
+                panic!("asked with nothing to choose from")
+            })
+            .unwrap();
+        assert!(page.messages.is_empty());
+        assert_eq!(page.remaining, 0);
     }
 
     #[test]

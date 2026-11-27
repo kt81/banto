@@ -511,6 +511,13 @@ Never commit these files.
 - **The summarising call of a compaction.** It is not in any transcript; `ac_measure`
   estimates it, with the model inferred as described above, and says so.
 - **Real billing or limits.** Nothing here reads a plan's usage, quota or invoice.
+- **A body that ends with banto's "more waiting" line.** A `check_messages` page that left
+  mail unread ends with `[banto] N more message(s) waiting. Call check_messages again to
+  read them.`, and `transcripts.split_delivery` drops that line from the last message's
+  body. It cannot tell banto's line from a message whose own body ends with the same text,
+  so such a body is shortened by one line even when banto added nothing. It never matches
+  anywhere but the end of the answer. No real message was found that does this; the
+  limitation is pinned by a test, not fixed.
 - **Meaning.** Errand kinds, review verdicts, retractions and the two candidate
   lists are keyword heuristics tuned on one team's phrasing, under the named
   constants at the top of `quality_report.py` and `transcripts.py`. Every count they

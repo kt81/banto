@@ -626,6 +626,15 @@ pub struct BrigadeMessage {
     pub interrupted: Option<InterruptOutcome>,
 }
 
+/// What one `check_messages` call took out of a member's unread mail: the
+/// messages it delivers, oldest first, and how many more are still unread behind
+/// them. The member's cursor is past the first and short of the second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxPage {
+    pub messages: Vec<BrigadeMessage>,
+    pub remaining: usize,
+}
+
 /// A brigade message reduced to what a collapsed tile shows: when it was
 /// queued and the first line of its body (see
 /// `banto_io::store::glance_line` for the reduction). Message text in a plain

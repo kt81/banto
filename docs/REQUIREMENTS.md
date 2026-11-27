@@ -4633,10 +4633,41 @@ same `tools/list`:
   2026-11-22; all 47 Claude failures came from members without the schema in their
   prompt, which was not checked for the Codex ones). A `text` that is absent or
   null counts as not sent; any other `text` wins when both are sent, and an empty
-  one is still refused. The schema does not list `message`.
+  one is still refused. The schema does not list `message`. A `text` over 25,000 bytes
+  of UTF-8 is refused, not cut: the error gives the limit and the size and says to split
+  the message or write the long part to a file and send its path. `interrupt_worker`'s
+  `text` has the same limit, and it holds for every sender and every recipient, because a
+  sender cannot know the recipient's product.
 - `check_messages()` — pulls the messages addressed to this session's role
   that it hasn't seen yet, wrapped in framing that names them as relayed from
-  another AI rather than a direct operator instruction.
+  another AI rather than a direct operator instruction. A call returns the oldest
+  unread messages that fit in 32,000 bytes of UTF-8, counted over the whole result
+  (preface and headers included), and moves the cursor only past those. When mail is
+  left, the result ends with the line `[banto] N more message(s) waiting. Call
+  check_messages again to read them.`, which `tools/measure` keeps out of the last
+  message's body. The cursor is the only page state, so the tool takes no argument.
+  Why: Codex 0.172.0 cuts any tool output above about 40,000 bytes of UTF-8, keeping the
+  head and the tail and dropping the middle without an error (measured on 2026-11-27;
+  ASCII is cut near 40,000 characters, Japanese near 13,000 to 15,000, and no setting
+  raises it), and a cursor moved past the cut middle meant the recipient never saw it.
+  Over 2026-08-07 to 2026-11-27 the largest message was 24,780 B and the largest delivery
+  32,246 B (two messages; the only one past 30 KB, and over the budget, so it would now go
+  in two pages). The send limit sits below the budget by more than the framing (766 B at
+  most), which makes a page of one message always possible. The page is the most messages
+  that fit: all of the unread ones when they fit without the line about the rest, else the
+  longest prefix that fits with it. A message too big for a page, which can only have been stored before
+  the send limit, is delivered alone, and a page is never empty while mail waits.
+  A partly read inbox changes nothing else, because everything that asks whether mail is
+  unread compares against the cursor: the relay's unread check, a Claude wake waiter's
+  `poll_wake` and `brigade_status` all keep seeing the rest as unread. The wake hook fires
+  only for a wake the relay issued, so the remainder wakes no one by itself and nothing
+  loops; the relay's idle streak, 60 s cooldown and three attempts per unread run are the
+  backstop for a member that does not page on its own (a Codex member is woken through
+  `codex queue` under the same rules). The attempts are counted until the mail is all
+  read, not until a page is: a partly read inbox does not reset them, because the relay
+  observes only whether mail is unread and not where the cursor stands, so a backlog of
+  several pages that its member does not page through itself can use them up. An interrupt behind more than a page of older
+  unread mail is not delivered ahead of it, and can be overtaken (see the gate below).
 - `brigade_status()` — this member's own identity plus a roster of its addressable
   peers, each with what it's doing right now and whether it's holding unread mail from
   this member. Replaces an earlier bare ping-style health check, added once dogfooding
@@ -4962,7 +4993,17 @@ by a test), in this order:
 A failure to read the store lets every call through, a subagent's `check_messages` too.
 The counts live in the memory of the Worker's `_mcp` and nowhere else. A restarted `_mcp`
 forgets them, at worst three more refusals, and never a wrong one. Reading the message is
-what ends the refusals at once, whatever the counts say.
+what ends the refusals at once, whatever the counts say. A `check_messages` page that stops
+short of it (older mail fills the page) is not reading it, and reading an earlier page neither
+clears nor resets the counts. A Worker that keeps calling `check_messages` is never refused for
+it and is let through on the page that carries the interrupt; the refusal note tells it to keep
+calling until the result stops saying more is waiting. A Worker that reads one page and goes on
+with other tools is refused three times and let through on the fourth, with the interrupt still
+unread: an interrupt behind more than a page of older unread mail can be overtaken. That was
+accepted. The cursor is one number, so putting the interrupt first would mean skipping the older
+mail or keeping a read state per message (a migration), and Director-to-Worker mail measured at
+about 10 KB at most per delivery, so a full page of older unread mail ahead of an interrupt is
+rare.
 
 *Storage.* The message and the interrupt request are written in one transaction: the
 request is a property of the message row, which needed schema migration v21 on
