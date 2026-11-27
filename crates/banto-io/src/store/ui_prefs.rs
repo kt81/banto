@@ -1,6 +1,6 @@
 //! Window-wide interface preferences: a small key/value table for what
 //! belongs to the whole emporium rather than to one brigade. Today that is
-//! the sidebar width, the brigade-quiet bell switch and the agent the Worker
+//! the sidebar width, the quiet bell switch and the agent the Worker
 //! picker was last confirmed with; brigade arrangement
 //! lives on the brigade's own rows (`brigades.rs`, migration v15).
 
@@ -42,8 +42,8 @@ impl Store {
         Ok(())
     }
 
-    /// The stored "ring the brigade-quiet bell even when the Director is
-    /// focused" switch, if there is a usable value: only `1` and `0` are
+    /// The stored "ring the quiet bell even when the pane that went quiet
+    /// is focused" switch, if there is a usable value: only `1` and `0` are
     /// (anything else reads as "no preference", which the caller takes as off —
     /// the file outlives versions, and a stranger value must not turn a bell on).
     pub fn bell_when_focused(&self) -> Result<Option<bool>, StoreError> {

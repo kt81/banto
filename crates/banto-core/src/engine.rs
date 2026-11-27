@@ -1413,9 +1413,10 @@ pub struct EmporiumState {
     stated_names: HashMap<(BrigadeId, MemberToken), String>,
     /// The same for the sidebar width.
     persisted_sidebar_width: u16,
-    /// Whether the brigade-quiet bell also rings while the Director's pane is
-    /// effectively focused (a runtime switch, F4; the operator's to turn on).
-    /// Off by default and when the store holds nothing usable.
+    /// Whether a quiet bell also rings while the pane that went quiet is
+    /// effectively focused: a Director's, or a lone session's (a runtime switch,
+    /// F4; the operator's to turn on). Off by default and when the store holds
+    /// nothing usable.
     bell_when_focused: bool,
     /// The same for the switch.
     persisted_bell_when_focused: bool,
@@ -1760,9 +1761,10 @@ pub struct EmporiumState {
     /// to say it is over, and what is known about such a member (nothing, often)
     /// must not keep a second BEL from being a new event.
     latch_announced_waits: HashSet<SessionKey>,
-    /// The Directors' panes whose rows carry a brigade mark now: a mark is rung
-    /// for when it is made, so putting the same mark on a tile by staging the
-    /// brigade is not an event ([`refresh_waiting_display`]). Recomputed by every
+    /// The panes whose rows carry a quiet mark now, a Director's for its brigade
+    /// or a single session's for itself: a mark is rung for when it is made, so
+    /// putting the same mark on a tile by staging the pane is not an event
+    /// ([`refresh_waiting_display`]). Recomputed by every
     /// [`sync_brigade_marks`] from the current keys, so nothing here needs to
     /// follow a rename.
     marked_directors: HashSet<SessionKey>,
@@ -1775,6 +1777,14 @@ pub struct EmporiumState {
     /// Per brigade with hosted members: what [`update_brigade_quiet`] needs to
     /// tell "has gone quiet" from "has always been quiet".
     brigade_quiet: HashMap<BrigadeId, QuietWatch>,
+    /// The same watch for a pane that is not a live member of a brigade
+    /// ([`Self::is_live_member`]), by its process ([`Self::spawn_order`] number):
+    /// a relaunch under the same key is a new pane and a re-key moves nothing here.
+    solo_quiet: HashMap<u64, QuietWatch>,
+    /// The panes (by process) whose quiet has been recorded and not looked at:
+    /// the single-pane counterpart of [`Self::attention`], marked through the same
+    /// set ([`sync_brigade_marks`]) and ended by the same focus. Memory only.
+    solo_attention: HashSet<u64>,
     /// The processes ([`Self::spawn_order`] numbers) that have been sampled
     /// idle at least once since they were hosted. A reading of "not idle" from
     /// one that has never been idle may be nothing but the process starting up,
@@ -1992,6 +2002,8 @@ impl EmporiumState {
             marked_directors: HashSet::new(),
             quiescence: HashMap::new(),
             brigade_quiet: HashMap::new(),
+            solo_quiet: HashMap::new(),
+            solo_attention: HashSet::new(),
             seen_idle: HashSet::new(),
             process_started: HashMap::new(),
             ring_list_waiting: HashSet::new(),
@@ -2210,6 +2222,18 @@ impl EmporiumState {
         match cause {
             BellCause::QuietFocused { brigade, .. } | BellCause::QuietRecorded { brigade, .. } => {
                 format!("{} went quiet", self.brigade_name(app, *brigade))
+            }
+            // `session_call`, not `pane_call`: a Director that outlived its
+            // brigade keeps the membership maps and would be named as a member.
+            BellCause::PaneQuietFocused { pane } => {
+                format!("{} went quiet", self.session_call(app, pane))
+            }
+            BellCause::PaneQuietRecorded { pane, others } => {
+                format!(
+                    "{} went quiet{}",
+                    self.session_call(app, pane),
+                    more(others)
+                )
             }
             BellCause::Request { brigade, .. } => {
                 format!("{} asks for a decision", self.brigade_name(app, *brigade))
@@ -2567,6 +2591,19 @@ impl EmporiumState {
         (self.member_tokens.get(key).map(String::as_str) == Some(DIRECTOR_TOKEN)
             && !self.disbanding.contains(&brigade_id))
         .then_some(brigade_id)
+    }
+
+    /// Whether `key`'s pane is a member of a brigade that still stands: the
+    /// membership maps place it in one, and that brigade is not being disbanded
+    /// or already disbanded. [`Self::directed_brigade`] makes the same test for a
+    /// Director. A bare `member_brigades` entry is not it: a disband leaves the
+    /// surviving Director's pane open with the maps it was staged with, and that
+    /// pane belongs to no brigade's quiet watch and so to the single-pane one
+    /// ([`update_brigade_quiet`]).
+    fn is_live_member(&self, key: &SessionKey) -> bool {
+        self.member_brigades
+            .get(key)
+            .is_some_and(|brigade_id| !self.disbanding.contains(brigade_id))
     }
 
     /// How many of `brigade_id`'s panes are asked for and not reported spawned
@@ -3110,7 +3147,7 @@ impl EmporiumState {
     }
 
     /// Whether the session in `key`'s pane is known to be idle: the ONE place
-    /// that is decided, for the quit question and the brigade bell alike. A
+    /// that is decided, for the quit question and the quiet bell alike. A
     /// Codex pane that has reported its state is believed — it is the only signal
     /// that sees work left running after a turn and a prompt waiting for the
     /// operator, which the rollout the shell samples sees neither of — and
@@ -3401,8 +3438,9 @@ impl EmporiumState {
                 .is_some_and(|at| now.saturating_duration_since(*at) < QUIT_RECENT_INPUT_WINDOW)
     }
 
-    /// Whether the brigade-quiet bell rings with the Director's pane focused
-    /// too. The shell draws a standing indicator while this is on.
+    /// Whether a quiet bell (a brigade's or a lone session's) rings with the pane
+    /// that went quiet focused too. The shell draws a standing indicator while
+    /// this is on.
     pub fn bell_when_focused(&self) -> bool {
         self.bell_when_focused
     }
@@ -4403,6 +4441,13 @@ pub enum BellCause {
         brigade: BrigadeId,
         director: SessionKey,
     },
+    /// A session that is no live member of a brigade went quiet and the record of
+    /// it was made (the operator was not in its pane). Where several did in one
+    /// tick the cause names the lowest id and `others` counts the rest.
+    PaneQuietRecorded { pane: SessionKey, others: usize },
+    /// A session that is no live member of a brigade went quiet while it was the
+    /// focused pane and the "bell always" switch is on: leaves no mark.
+    PaneQuietFocused { pane: SessionKey },
     /// A pane on stage rang BEL while it was not the focused one (the tile's edge).
     StagedPaneBell { pane: SessionKey, others: usize },
     /// A pane on stage began waiting on the operator (the tile's edge).
@@ -4450,6 +4495,16 @@ impl std::fmt::Display for BellCause {
                     "quiet_recorded brigade={brigade} director={}",
                     director.log_id()
                 )
+            }
+            Self::PaneQuietRecorded { pane, others } => {
+                write!(
+                    f,
+                    "pane_quiet_recorded pane={} others={others}",
+                    pane.log_id()
+                )
+            }
+            Self::PaneQuietFocused { pane } => {
+                write!(f, "pane_quiet_focused pane={}", pane.log_id())
             }
             Self::Request { brigade, director } => {
                 write!(
@@ -5705,6 +5760,10 @@ struct QuietWatch {
 /// waiting reads as not idle here (it has its own mark). A brigade whose
 /// Director is not hosted is not watched; there is no pane to mark.
 ///
+/// The panes outside every live brigade are watched here too, one by one, through
+/// the same [`judge_quiet`] ([`update_solo_quiet`]); this function feeds them
+/// their readings and `seen_idle` along with the members'.
+///
 /// An off-stage brigade is watched and marked like any other. Firing records the
 /// brigade ([`EmporiumState::attention`]), which rings at once, and
 /// [`sync_brigade_marks`] marks its Director's row — which exists whether or not
@@ -5720,50 +5779,73 @@ fn update_brigade_quiet(
     #[derive(Default)]
     struct Hosted {
         director: Option<SessionKey>,
-        members: Vec<Quiescence>,
-        processes: HashSet<u64>,
-        last_prompted: Option<Instant>,
-        /// A member read not idle that is past its start-up: it has been idle
-        /// before, or was given work.
-        real_work: bool,
+        readings: QuietReadings,
     }
     let mut hosted: HashMap<BrigadeId, Hosted> = HashMap::new();
+    let mut solo: HashMap<u64, (SessionKey, QuietReadings)> = HashMap::new();
     let mut idle_now: Vec<u64> = Vec::new();
     for key in state.screens.keys() {
-        let Some(&brigade_id) = state.member_brigades.get(key) else {
-            continue;
-        };
-        let brigade = hosted.entry(brigade_id).or_default();
-        let sampled = state.quiescence_of(app, key);
-        // A member that reads idle while its first turn is still expected, or
-        // while mail is waiting that the relay will deliver, is not idle in the
-        // sense that matters: it is about to be started.
-        brigade.members.push(
-            if sampled == Quiescence::Idle
-                && (state.first_turn_owed(key) || state.mail_pending(key, relay_auto, observed))
-            {
-                Quiescence::Unknown
-            } else {
-                sampled
-            },
-        );
         let process = state.spawn_order.get(key).copied();
-        brigade.processes.extend(process);
-        if sampled == Quiescence::Idle {
-            idle_now.extend(process);
+        if let Some(&brigade_id) = state.member_brigades.get(key) {
+            let brigade = hosted.entry(brigade_id).or_default();
+            let sampled = state.quiescence_of(app, key);
+            // A member that reads idle while its first turn is still expected, or
+            // while mail is waiting that the relay will deliver, is not idle in the
+            // sense that matters: it is about to be started.
+            brigade.readings.members.push(
+                if sampled == Quiescence::Idle
+                    && (state.first_turn_owed(key) || state.mail_pending(key, relay_auto, observed))
+                {
+                    Quiescence::Unknown
+                } else {
+                    sampled
+                },
+            );
+            brigade.readings.processes.extend(process);
+            if sampled == Quiescence::Idle {
+                idle_now.extend(process);
+            }
+            // The grace is judged here and not on `seen_idle`, which stays a plain
+            // fact (this process was read idle): a process read idle at its first
+            // sample and not idle again after the grace is the ordinary case, and
+            // only the decision to call a reading work waits.
+            if sampled.is_working() && state.working_is_real_work(key, process, now) {
+                brigade.readings.real_work = true;
+            }
+            brigade.readings.last_prompted = brigade
+                .readings
+                .last_prompted
+                .max(state.last_prompted.get(key).copied());
+            if state.member_tokens.get(key).map(String::as_str) == Some(DIRECTOR_TOKEN) {
+                brigade.director = Some(key.clone());
+            }
         }
-        // The grace is judged here and not on `seen_idle`, which stays a plain
-        // fact (this process was read idle): a process read idle at its first
-        // sample and not idle again after the grace is the ordinary case, and
-        // only the decision to call a reading work waits.
-        if sampled.is_working() && state.working_is_real_work(key, process, now) {
-            brigade.real_work = true;
-        }
-        brigade.last_prompted = brigade
-            .last_prompted
-            .max(state.last_prompted.get(key).copied());
-        if state.member_tokens.get(key).map(String::as_str) == Some(DIRECTOR_TOKEN) {
-            brigade.director = Some(key.clone());
+        // A pane no live brigade holds is its own group of one, whatever its
+        // membership maps still say (a disbanded brigade's surviving Director
+        // keeps them). A pane with no process number was not spawned by this
+        // core and is not watched.
+        if !state.is_live_member(key)
+            && let Some(process) = process
+        {
+            let reading = solo_reading(state.quiescence_of(app, key));
+            if reading == Quiescence::Idle {
+                idle_now.push(process);
+            }
+            // No mail and no first prompt: nothing but the sample says it is
+            // about to start, so the sample is the observation.
+            solo.insert(
+                process,
+                (
+                    key.clone(),
+                    QuietReadings {
+                        members: vec![reading],
+                        processes: HashSet::from([process]),
+                        last_prompted: state.last_prompted.get(key).copied(),
+                        real_work: reading.is_working()
+                            && state.working_is_real_work(key, Some(process), now),
+                    },
+                ),
+            );
         }
     }
 
@@ -5812,34 +5894,10 @@ fn update_brigade_quiet(
         }
         let spent = state.request_spent.contains(&brigade_id);
         let watch = state.brigade_quiet.entry(brigade_id).or_default();
-        if watch.members != brigade.processes {
-            // Not `active`: whether anyone was busy since the last ring says
-            // nothing about who is hosted now.
-            watch.members = brigade.processes;
-            watch.idle_since = None;
-        }
-        if brigade.members.iter().any(|member| member.is_working()) {
-            watch.active |= brigade.real_work;
-            watch.idle_since = None;
-        } else if brigade.members.contains(&Quiescence::Unknown) {
-            watch.idle_since = None;
-        } else {
-            let idle_since = *watch.idle_since.get_or_insert(now);
-            // A wake can start a turn before the next sample reports it busy.
-            let since = brigade
-                .last_prompted
-                .map_or(idle_since, |at| at.max(idle_since));
-            if now.saturating_duration_since(since) >= BRIGADE_QUIET_SETTLE {
-                if spent {
-                    // The quiet point a request spent: it passes in silence,
-                    // whether or not a fire was due, and is not spent again.
-                    watch.active = false;
-                    swallowed.push(brigade_id);
-                } else if watch.active {
-                    watch.active = false;
-                    fired.push((brigade_id, director));
-                }
-            }
+        match judge_quiet(watch, now, brigade.readings, spent) {
+            QuietVerdict::Fired => fired.push((brigade_id, director)),
+            QuietVerdict::Swallowed => swallowed.push(brigade_id),
+            QuietVerdict::Nothing => {}
         }
     }
     for brigade_id in swallowed {
@@ -5871,6 +5929,157 @@ fn update_brigade_quiet(
             };
             cmds.extend(ring_host_bell(state, app, now, cause));
         }
+    }
+    cmds.extend(update_solo_quiet(state, app, now, solo));
+    cmds
+}
+
+/// What one group's samples say, for [`judge_quiet`]: a brigade's hosted members,
+/// or the one pane of a single session.
+#[derive(Default)]
+struct QuietReadings {
+    /// One reading per pane, already adjusted for what makes an idle sample not
+    /// idle for this group (a brigade's mail on the way and first prompts; a
+    /// single pane has neither).
+    members: Vec<Quiescence>,
+    /// The spawn number of every pane read ([`QuietWatch::members`]).
+    processes: HashSet<u64>,
+    /// The latest moment banto prompted or woke one of them.
+    last_prompted: Option<Instant>,
+    /// A pane read not idle that is past its start-up: it has been idle before,
+    /// or was given work ([`EmporiumState::working_is_real_work`]).
+    real_work: bool,
+}
+
+/// What [`judge_quiet`] decided for one group in this tick.
+enum QuietVerdict {
+    /// Nothing to say: working, unknown, not settled yet, or never armed.
+    Nothing,
+    /// Idle for the settle after real work, and armed: it went quiet. The
+    /// group's armed state is spent.
+    Fired,
+    /// The same moment, with a request's spent quiet point standing
+    /// ([`EmporiumState::request_spent`]): it passes in silence.
+    Swallowed,
+}
+
+/// The stretch, the arming and the settle over one group's readings: the part of
+/// the quiet watch that is the same for a brigade and for a single pane, and
+/// that decides nothing about who is told or how. What a brigade adds (the roster
+/// observed, its gates) and what a pane does not have is the caller's.
+fn judge_quiet(
+    watch: &mut QuietWatch,
+    now: Instant,
+    readings: QuietReadings,
+    spent: bool,
+) -> QuietVerdict {
+    if watch.members != readings.processes {
+        // Not `active`: whether anyone was busy since the last ring says
+        // nothing about who is hosted now.
+        watch.members = readings.processes;
+        watch.idle_since = None;
+    }
+    if readings.members.iter().any(|member| member.is_working()) {
+        watch.active |= readings.real_work;
+        watch.idle_since = None;
+    } else if readings.members.contains(&Quiescence::Unknown) {
+        watch.idle_since = None;
+    } else {
+        let idle_since = *watch.idle_since.get_or_insert(now);
+        // A wake can start a turn before the next sample reports it busy.
+        let since = readings
+            .last_prompted
+            .map_or(idle_since, |at| at.max(idle_since));
+        if now.saturating_duration_since(since) >= BRIGADE_QUIET_SETTLE {
+            if spent {
+                // The quiet point a request spent: it passes in silence,
+                // whether or not a fire was due, and is not spent again.
+                watch.active = false;
+                return QuietVerdict::Swallowed;
+            } else if watch.active {
+                watch.active = false;
+                return QuietVerdict::Fired;
+            }
+        }
+    }
+    QuietVerdict::Nothing
+}
+
+/// A single pane's reading for the quiet watch.
+///
+/// The one place a single pane differs from a brigade member in what it counts:
+/// a Claude session whose turn has ended and whose background command still runs
+/// ([`Quiescence::Background`]) is quiet here, because nobody is waiting on it
+/// and a session left in a pane that stopped is what the bell is for, while in a
+/// brigade it stays work, since the members' output is still to come. Codex cannot
+/// be told apart this way: its own `working` report includes background
+/// terminals, so a Codex pane with one running is working.
+fn solo_reading(sampled: Quiescence) -> Quiescence {
+    match sampled {
+        Quiescence::Background => Quiescence::Idle,
+        other => other,
+    }
+}
+
+/// The quiet watch over the panes that belong to no live brigade
+/// ([`EmporiumState::is_live_member`]), each judged by [`judge_quiet`] on its
+/// own sample with no gate of a brigade's, and told as a brigade is: a record
+/// ([`EmporiumState::solo_attention`]) that marks the pane through the same set
+/// ([`sync_brigade_marks`]) and rings once when it is made, or, with the pane
+/// focused, a ring without a mark when `bell_when_focused` is on.
+///
+/// Per process, so a relaunch under the same key starts over. A pane that stops
+/// being solo (it became a member, or is gone) loses its watch and its record. A
+/// fire under a record that still stands is silent, and a focused fire is spent:
+/// one ring per pane per look. Panes that fire in one tick ring once, naming the
+/// lowest id.
+fn update_solo_quiet(
+    state: &mut EmporiumState,
+    app: &App,
+    now: Instant,
+    solo: HashMap<u64, (SessionKey, QuietReadings)>,
+) -> Vec<Cmd> {
+    state
+        .solo_quiet
+        .retain(|process, _| solo.contains_key(process));
+    state
+        .solo_attention
+        .retain(|process| solo.contains_key(process));
+    let mut fired: Vec<(u64, SessionKey)> = Vec::new();
+    for (process, (pane, readings)) in solo {
+        let watch = state.solo_quiet.entry(process).or_default();
+        if let QuietVerdict::Fired = judge_quiet(watch, now, readings, false) {
+            fired.push((process, pane));
+        }
+    }
+    fired.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
+    let focused = effective_focused_pane(state);
+    let mut recorded: Vec<SessionKey> = Vec::new();
+    let mut spent_focused: Option<SessionKey> = None;
+    for (process, pane) in fired {
+        if focused.as_ref() != Some(&pane) {
+            if state.solo_attention.insert(process) {
+                recorded.push(pane);
+            }
+        } else if state.bell_when_focused && spent_focused.is_none() {
+            spent_focused = Some(pane);
+        }
+    }
+    let mut cmds = Vec::new();
+    if let Some((first, rest)) = recorded.split_first() {
+        let cause = BellCause::PaneQuietRecorded {
+            pane: first.clone(),
+            others: rest.len(),
+        };
+        cmds.extend(ring_host_bell(state, app, now, cause));
+    }
+    if let Some(pane) = spent_focused {
+        cmds.extend(ring_host_bell(
+            state,
+            app,
+            now,
+            BellCause::PaneQuietFocused { pane },
+        ));
     }
     cmds
 }
@@ -6232,7 +6441,10 @@ fn go_to_director(
 }
 
 /// Mark the Directors' rows of the brigades that want the operator, and ring for
-/// each member's wait the first time it is announced. A brigade wants him when it
+/// each member's wait the first time it is announced. A session in no brigade
+/// that went quiet ([`EmporiumState::solo_attention`]) is marked in the same set
+/// by its own row, and its mark ends on effective focus, with its pane, or when
+/// the pane becomes a member; [`update_solo_quiet`] rings for it. A brigade wants him when it
 /// went quiet ([`EmporiumState::attention`]; [`update_brigade_quiet`] rings when
 /// it makes the record), or, for a member that is NOT on stage, when that member
 /// is waiting on him (its session file says `waiting`, or the Codex pane reports
@@ -6260,11 +6472,16 @@ fn go_to_director(
 /// explicit and independent of what the list shows: a search that hides the
 /// Director's row does not silence it.
 fn sync_brigade_marks(state: &mut EmporiumState, app: &mut App, now: Instant) -> Vec<Cmd> {
-    if let Some(key) = effective_focused_pane(state)
-        && state.member_tokens.get(&key).map(String::as_str) == Some(DIRECTOR_TOKEN)
-        && let Some(brigade_id) = state.member_brigades.get(&key)
-    {
-        state.attention.remove(brigade_id);
+    if let Some(key) = effective_focused_pane(state) {
+        if state.member_tokens.get(&key).map(String::as_str) == Some(DIRECTOR_TOKEN)
+            && let Some(brigade_id) = state.member_brigades.get(&key)
+        {
+            state.attention.remove(brigade_id);
+        }
+        // A single session's record ends the same way, by being looked at.
+        if let Some(process) = state.spawn_order.get(&key) {
+            state.solo_attention.remove(process);
+        }
     }
     let mut directors: HashMap<BrigadeId, &SessionKey> = HashMap::new();
     for key in state.screens.keys() {
@@ -6279,6 +6496,18 @@ fn sync_brigade_marks(state: &mut EmporiumState, app: &mut App, now: Instant) ->
     state
         .attention
         .retain(|brigade_id, _| directors.contains_key(brigade_id));
+    // The panes a single-session quiet record can mark: hosted, and in no live
+    // brigade. A record whose pane is gone, or became a member, has nothing to
+    // mark and is forgotten.
+    let solo_panes: HashMap<u64, &SessionKey> = state
+        .screens
+        .keys()
+        .filter(|key| !state.is_live_member(key))
+        .filter_map(|key| Some((*state.spawn_order.get(key)?, key)))
+        .collect();
+    state
+        .solo_attention
+        .retain(|process| solo_panes.contains_key(process));
     let on_stage: HashSet<&SessionKey> = match &state.stage {
         Stage::Empty => HashSet::new(),
         Stage::Solo(key) => std::iter::once(key).collect(),
@@ -6289,6 +6518,12 @@ fn sync_brigade_marks(state: &mut EmporiumState, app: &mut App, now: Instant) ->
         .keys()
         .filter_map(|brigade_id| directors.get(brigade_id).copied())
         .collect();
+    marked.extend(
+        state
+            .solo_attention
+            .iter()
+            .filter_map(|process| solo_panes.get(process).copied()),
+    );
     let mut announced_now: HashSet<SessionKey> = HashSet::new();
     let mut on_tile_now: HashSet<SessionKey> = HashSet::new();
     let mut by_latch_now: HashSet<SessionKey> = HashSet::new();
@@ -6815,9 +7050,9 @@ fn update_key(
         state.bell_when_focused = !state.bell_when_focused;
         state.set_status(
             if state.bell_when_focused {
-                "brigade bell: on, it rings even while the Director's pane is focused"
+                "quiet bell: on, it rings even while a Director's or a lone session's pane is focused"
             } else {
-                "brigade bell: off, it stays silent while the Director's pane is focused"
+                "quiet bell: off, it stays silent while a Director's or a lone session's pane is focused"
             },
             now,
         );
@@ -31641,6 +31876,36 @@ mod tests {
             }),
             "a session is waiting",
             "a row without a title is never named by its id"
+        );
+        // A session in no brigade that went quiet is named by its title, the
+        // way a row is, and says how many more went quiet beside it.
+        assert_eq!(
+            body(BellCause::PaneQuietFocused {
+                pane: SessionKey::from_id("plain")
+            }),
+            "\"Plain one\" went quiet"
+        );
+        assert_eq!(
+            body(BellCause::PaneQuietRecorded {
+                pane: SessionKey::from_id("plain"),
+                others: 0
+            }),
+            "\"Plain one\" went quiet"
+        );
+        assert_eq!(
+            body(BellCause::PaneQuietRecorded {
+                pane: SessionKey::from_id("plain"),
+                others: 2
+            }),
+            "\"Plain one\" went quiet (+2 more)"
+        );
+        assert_eq!(
+            body(BellCause::PaneQuietRecorded {
+                pane: SessionKey::from_id("untitled"),
+                others: 0
+            }),
+            "a session went quiet",
+            "never the id"
         );
         assert_eq!(
             body(BellCause::OffStageMemberWait {

@@ -3772,12 +3772,12 @@ fn f4_flips_the_switch_from_the_list_or_a_pane_and_says_so_in_words() {
         toggle_bell(&mut state, &mut app, at);
         assert!(state.bell_when_focused(), "{focus:?}");
         let on = state.displayed_status().unwrap_or_default().to_string();
-        assert!(on.starts_with("brigade bell: on"), "{on:?}");
+        assert!(on.starts_with("quiet bell: on"), "{on:?}");
 
         toggle_bell(&mut state, &mut app, at + SECOND);
         assert!(!state.bell_when_focused(), "{focus:?}");
         let off = state.displayed_status().unwrap_or_default().to_string();
-        assert!(off.starts_with("brigade bell: off"), "{off:?}");
+        assert!(off.starts_with("quiet bell: off"), "{off:?}");
     }
 }
 
@@ -8092,8 +8092,8 @@ fn where_the_row_and_the_relay_disagree_about_the_product_the_report_is_not_beli
 
 #[test]
 fn a_blocked_codex_panes_mark_and_ring_do_not_depend_on_the_bell_switch_or_on_focus() {
-    // F4 ("BELL ALWAYS") is only about the brigade-quiet bell of a focused
-    // Director. A pane's own blocked mark is not that, and neither is it
+    // F4 ("BELL ALWAYS") is only about the quiet bell of a focused
+    // Director or lone session. A pane's own blocked mark is not that, and neither is it
     // cleared by the pane being the focused one: the same as a Claude session
     // whose live file says waiting.
     let mut outcomes = Vec::new();
@@ -11378,4 +11378,636 @@ fn a_key_typed_into_the_planners_pane_leaves_a_requests_spending_standing() {
     state.request_spent.insert(1);
     press(&mut state, &mut app, KeyCode::Char('x'), at);
     assert!(state.request_spent.contains(&1));
+}
+
+// --- a session in no brigade that goes quiet ------------------------------------------------------
+
+/// A hosted session that belongs to no brigade, with a process number and the
+/// history [`host`] gives a member: started long ago and read idle before.
+fn host_lone(state: &mut EmporiumState, id: &str) -> SessionKey {
+    let pane = host_lone_fresh(state, id);
+    let process = state.spawn_order[&pane];
+    state.seen_idle.insert(process);
+    if let Some(long_ago) = t0().checked_sub(2 * PROCESS_START_GRACE) {
+        state.process_started.insert(pane.clone(), long_ago);
+    }
+    pane
+}
+
+/// The same for a process that has only just started.
+fn host_lone_fresh(state: &mut EmporiumState, id: &str) -> SessionKey {
+    let pane = key(id);
+    state.screens.insert(pane.clone(), Screen::new(24, 80));
+    state.spawn_order.insert(pane.clone(), state.next_spawn);
+    state.next_spawn += 1;
+    state.process_started.insert(pane.clone(), t0());
+    pane
+}
+
+/// Titled rows for `ids` and the first tick, which seeds the attention display.
+fn lone_world(ids: &[&str]) -> (EmporiumState, App, Vec<SessionKey>, Instant) {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let rows = ids.iter().map(|id| titled(id, "Fix relay")).collect();
+    let mut app = App::new(rows);
+    app.set_viewport_height(20);
+    let panes = ids.iter().map(|id| host_lone(&mut state, id)).collect();
+    state.focus = Focus::Sidebar;
+    let at = t0();
+    tick(&mut state, &mut app, at);
+    (state, app, panes, at)
+}
+
+/// Every pane busy at `at`, idle from `at + 1 s`: the stretch starts there.
+fn lone_busy_then_idle(
+    state: &mut EmporiumState,
+    app: &mut App,
+    panes: &[&SessionKey],
+    at: Instant,
+) -> Instant {
+    let busy: Vec<_> = panes.iter().map(|pane| (*pane, NotIdle)).collect();
+    sample(state, app, &busy, at);
+    let idle: Vec<_> = panes.iter().map(|pane| (*pane, Idle)).collect();
+    sample(state, app, &idle, at + SECOND);
+    at + SECOND
+}
+
+fn idle_samples(
+    state: &mut EmporiumState,
+    app: &mut App,
+    panes: &[&SessionKey],
+    at: Instant,
+) -> Vec<Cmd> {
+    let idle: Vec<_> = panes.iter().map(|pane| (*pane, Idle)).collect();
+    sample(state, app, &idle, at)
+}
+
+#[test]
+fn a_lone_session_that_worked_and_then_sat_idle_for_the_settle_rings_and_is_marked() {
+    // Unstaged, and staged alone with the list focused: both are marked and rung for.
+    for staged in [false, true] {
+        let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+        let pane = &panes[0];
+        if staged {
+            state.stage = Stage::Solo(pane.clone());
+            tick(&mut state, &mut app, at);
+        }
+        let idle_from = lone_busy_then_idle(&mut state, &mut app, &[pane], at);
+
+        let early = idle_samples(
+            &mut state,
+            &mut app,
+            &[pane],
+            idle_from + BRIGADE_QUIET_SETTLE - SECOND,
+        );
+        assert!(
+            !rang(&early),
+            "staged {staged}: not before the settle: {early:?}"
+        );
+
+        let cmds = idle_samples(
+            &mut state,
+            &mut app,
+            &[pane],
+            idle_from + BRIGADE_QUIET_SETTLE,
+        );
+        assert_eq!(
+            bell_causes(&cmds),
+            vec![BellCause::PaneQuietRecorded {
+                pane: pane.clone(),
+                others: 0
+            }],
+            "staged {staged}: {cmds:?}"
+        );
+        assert!(
+            app.has_brigade_mark("solo"),
+            "staged {staged}: the row is marked"
+        );
+        assert!(app.is_waiting_id("solo"), "staged {staged}: and counted");
+        assert!(state.marked_directors.contains(pane), "staged {staged}");
+        assert_eq!(
+            state.attention_panes().contains(pane),
+            staged,
+            "staged {staged}: the tile carries it when there is one"
+        );
+        // The mark is display only: the sample still says idle.
+        assert_eq!(state.quiescence_of(&app, pane), Idle);
+    }
+}
+
+#[test]
+fn a_lone_session_opened_only_to_read_stays_silent_however_long() {
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    for secs in 1..60 {
+        let cmds = idle_samples(&mut state, &mut app, &[&panes[0]], at + secs * SECOND);
+        assert!(!rang(&cmds), "{secs}s: {cmds:?}");
+    }
+    assert!(!app.has_brigade_mark("solo"));
+    assert!(state.solo_attention.is_empty());
+}
+
+#[test]
+fn a_lone_sessions_start_up_work_does_not_arm_it_but_work_after_the_grace_does() {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(vec![titled("solo", "Fix relay")]);
+    let pane = host_lone_fresh(&mut state, "solo");
+    state.focus = Focus::Sidebar;
+    let at = t0();
+    tick(&mut state, &mut app, at);
+
+    // A resumed session reads busy for a moment as it starts, then idle.
+    sample(&mut state, &mut app, &[(&pane, NotIdle)], at);
+    sample(&mut state, &mut app, &[(&pane, Idle)], at + 2 * SECOND);
+    for secs in 3..9 {
+        let cmds = idle_samples(&mut state, &mut app, &[&pane], at + secs * SECOND);
+        assert!(!rang(&cmds), "{secs}s: within the grace, silent: {cmds:?}");
+    }
+
+    // Past the grace a not-idle reading is work, for a process read idle before.
+    let worked = at + PROCESS_START_GRACE + SECOND;
+    sample(&mut state, &mut app, &[(&pane, NotIdle)], worked);
+    sample(&mut state, &mut app, &[(&pane, Idle)], worked + SECOND);
+    let cmds = idle_samples(
+        &mut state,
+        &mut app,
+        &[&pane],
+        worked + SECOND + BRIGADE_QUIET_SETTLE,
+    );
+    assert!(rang(&cmds), "{cmds:?}");
+}
+
+#[test]
+fn a_lone_sessions_pane_being_focused_rings_nothing_and_marks_nothing_and_the_ring_is_spent() {
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    state.stage = Stage::Solo(pane.clone());
+    state.focus = Focus::Pane;
+    tick(&mut state, &mut app, at);
+    let idle_from = lone_busy_then_idle(&mut state, &mut app, &[pane], at);
+
+    let cmds = idle_samples(
+        &mut state,
+        &mut app,
+        &[pane],
+        idle_from + BRIGADE_QUIET_SETTLE,
+    );
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(!app.has_brigade_mark("solo"));
+    assert!(state.attention_panes().is_empty());
+
+    // Spent, not saved for when the operator leaves the pane.
+    state.focus = Focus::Sidebar;
+    let cmds = idle_samples(
+        &mut state,
+        &mut app,
+        &[pane],
+        idle_from + BRIGADE_QUIET_SETTLE + 5 * SECOND,
+    );
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(!app.has_brigade_mark("solo"));
+}
+
+#[test]
+fn with_bell_always_on_a_focused_lone_session_rings_without_a_mark() {
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    state.stage = Stage::Solo(pane.clone());
+    state.focus = Focus::Pane;
+    state.bell_when_focused = true;
+    tick(&mut state, &mut app, at);
+    let idle_from = lone_busy_then_idle(&mut state, &mut app, &[pane], at);
+
+    let cmds = idle_samples(
+        &mut state,
+        &mut app,
+        &[pane],
+        idle_from + BRIGADE_QUIET_SETTLE,
+    );
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::PaneQuietFocused { pane: pane.clone() }],
+        "{cmds:?}"
+    );
+    assert!(
+        !app.has_brigade_mark("solo"),
+        "a focused pane carries no mark"
+    );
+    assert!(state.attention_panes().is_empty());
+    assert!(state.solo_attention.is_empty());
+}
+
+#[test]
+fn a_lone_session_in_a_pane_that_is_focused_but_whose_window_is_not_marks_and_rings() {
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    state.stage = Stage::Solo(pane.clone());
+    state.focus = Focus::Pane;
+    state.window_focused = false;
+    tick(&mut state, &mut app, at);
+    let idle_from = lone_busy_then_idle(&mut state, &mut app, &[pane], at);
+
+    let cmds = idle_samples(
+        &mut state,
+        &mut app,
+        &[pane],
+        idle_from + BRIGADE_QUIET_SETTLE,
+    );
+    assert!(rang(&cmds), "{cmds:?}");
+    assert!(app.has_brigade_mark("solo"));
+}
+
+#[test]
+fn the_mark_of_a_lone_session_clears_when_the_operator_reaches_its_pane_without_a_second_ring() {
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    state.stage = Stage::Solo(pane.clone());
+    tick(&mut state, &mut app, at);
+    let idle_from = lone_busy_then_idle(&mut state, &mut app, &[pane], at);
+    let fired = idle_from + BRIGADE_QUIET_SETTLE;
+    let cmds = idle_samples(&mut state, &mut app, &[pane], fired);
+    assert!(rang(&cmds));
+    assert!(state.attention_panes().contains(pane));
+
+    state.focus = Focus::Pane;
+    let cmds = tick(&mut state, &mut app, fired + SECOND);
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(!app.has_brigade_mark("solo"));
+    assert!(state.attention_panes().is_empty());
+    assert!(state.solo_attention.is_empty());
+}
+
+#[test]
+fn a_second_fire_under_a_mark_still_standing_is_silent_and_a_looked_at_pane_rings_again() {
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    let idle_from = lone_busy_then_idle(&mut state, &mut app, &[pane], at);
+    let fired = idle_from + BRIGADE_QUIET_SETTLE;
+    assert!(rang(&idle_samples(&mut state, &mut app, &[pane], fired)));
+
+    // It works again and goes quiet again with the mark never looked at.
+    let again = fired + 20 * SECOND;
+    let idle_again = lone_busy_then_idle(&mut state, &mut app, &[pane], again);
+    let cmds = idle_samples(
+        &mut state,
+        &mut app,
+        &[pane],
+        idle_again + BRIGADE_QUIET_SETTLE,
+    );
+    assert!(!rang(&cmds), "the same unlooked-at attention: {cmds:?}");
+    assert!(app.has_brigade_mark("solo"), "and the mark stands");
+
+    // Looked at, then quiet once more: a new record, a new ring.
+    state.stage = Stage::Solo(pane.clone());
+    state.focus = Focus::Pane;
+    tick(
+        &mut state,
+        &mut app,
+        idle_again + BRIGADE_QUIET_SETTLE + SECOND,
+    );
+    assert!(!app.has_brigade_mark("solo"));
+    state.focus = Focus::Sidebar;
+    let third = idle_again + BRIGADE_QUIET_SETTLE + 20 * SECOND;
+    let idle_third = lone_busy_then_idle(&mut state, &mut app, &[pane], third);
+    let cmds = idle_samples(
+        &mut state,
+        &mut app,
+        &[pane],
+        idle_third + BRIGADE_QUIET_SETTLE,
+    );
+    assert!(rang(&cmds), "{cmds:?}");
+}
+
+#[test]
+fn lone_sessions_that_go_quiet_in_one_tick_ring_once_naming_the_lowest_id() {
+    let (mut state, mut app, panes, at) = lone_world(&["b-solo", "a-solo"]);
+    let all: Vec<&SessionKey> = panes.iter().collect();
+    let idle_from = lone_busy_then_idle(&mut state, &mut app, &all, at);
+
+    let cmds = idle_samples(&mut state, &mut app, &all, idle_from + BRIGADE_QUIET_SETTLE);
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::PaneQuietRecorded {
+            pane: key("a-solo"),
+            others: 1
+        }],
+        "{cmds:?}"
+    );
+    assert!(app.has_brigade_mark("a-solo") && app.has_brigade_mark("b-solo"));
+}
+
+#[test]
+fn a_live_member_is_never_watched_as_a_lone_session() {
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    let idle_from = busy_then_idle(&mut state, &mut app, &[&worker, &director], at);
+    let cmds = sample(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, Idle)],
+        idle_from + BRIGADE_QUIET_SETTLE,
+    );
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::QuietRecorded {
+            brigade: 1,
+            director: director.clone()
+        }],
+        "the brigade's own ring and nothing for its members: {cmds:?}"
+    );
+    assert!(state.solo_quiet.is_empty() && state.solo_attention.is_empty());
+
+    // A Worker that finished while its Director works is one member of a brigade
+    // that is not quiet, not a session that went quiet.
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    sample(
+        &mut state,
+        &mut app,
+        &[(&director, NotIdle), (&worker, NotIdle)],
+        at,
+    );
+    for secs in 1..30 {
+        let cmds = sample(
+            &mut state,
+            &mut app,
+            &[(&director, NotIdle), (&worker, Idle)],
+            at + secs * SECOND,
+        );
+        assert!(!rang(&cmds), "{secs}s: {cmds:?}");
+    }
+    assert!(state.solo_quiet.is_empty());
+}
+
+#[test]
+fn the_surviving_director_of_a_disbanded_brigade_is_watched_as_a_lone_session() {
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    app.replace_rows(vec![titled("dir", "Fix relay")]);
+    // The disband as the shell reports it: the Workers end, the Director stays
+    // open with the membership maps it was staged with.
+    send(
+        &mut state,
+        &mut app,
+        Event::Disbanded {
+            brigade_id: 1,
+            result: Ok((HashSet::new(), HashSet::new())),
+        },
+        at,
+    );
+    unhost(&mut state, &worker);
+    assert!(state.member_brigades.contains_key(&director), "maps kept");
+    assert!(!state.is_live_member(&director));
+
+    let idle_from = lone_busy_then_idle(&mut state, &mut app, &[&director], at + SECOND);
+    let cmds = idle_samples(
+        &mut state,
+        &mut app,
+        &[&director],
+        idle_from + BRIGADE_QUIET_SETTLE,
+    );
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::PaneQuietRecorded {
+            pane: director.clone(),
+            others: 0
+        }],
+        "{cmds:?}"
+    );
+    assert!(app.has_brigade_mark("dir"));
+}
+
+#[test]
+fn a_relaunch_under_the_same_key_is_a_new_pane_with_nothing_of_the_old_ones() {
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    let idle_from = lone_busy_then_idle(&mut state, &mut app, &[pane], at);
+    let before = state.spawn_order[pane];
+    // Armed and settling when the process under the key is replaced.
+    send(
+        &mut state,
+        &mut app,
+        Event::Spawned {
+            key: pane.clone(),
+            agent: None,
+        },
+        idle_from + 2 * SECOND,
+    );
+    assert_ne!(state.spawn_order[pane], before);
+    for secs in 3..20 {
+        let cmds = idle_samples(&mut state, &mut app, &[pane], idle_from + secs * SECOND);
+        assert!(
+            !rang(&cmds),
+            "{secs}s: the new process never worked: {cmds:?}"
+        );
+    }
+
+    // And a record of the old process goes with it.
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    let idle_from = lone_busy_then_idle(&mut state, &mut app, &[pane], at);
+    idle_samples(
+        &mut state,
+        &mut app,
+        &[pane],
+        idle_from + BRIGADE_QUIET_SETTLE,
+    );
+    assert!(app.has_brigade_mark("solo"));
+    send(
+        &mut state,
+        &mut app,
+        Event::Spawned {
+            key: pane.clone(),
+            agent: None,
+        },
+        idle_from + BRIGADE_QUIET_SETTLE + SECOND,
+    );
+    tick(
+        &mut state,
+        &mut app,
+        idle_from + BRIGADE_QUIET_SETTLE + 2 * SECOND,
+    );
+    assert!(!app.has_brigade_mark("solo"));
+    assert!(state.solo_attention.is_empty());
+}
+
+#[test]
+fn the_mark_of_a_lone_session_goes_with_its_pane_and_when_the_pane_becomes_a_member() {
+    for ends in [true, false] {
+        let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+        let pane = &panes[0];
+        let idle_from = lone_busy_then_idle(&mut state, &mut app, &[pane], at);
+        idle_samples(
+            &mut state,
+            &mut app,
+            &[pane],
+            idle_from + BRIGADE_QUIET_SETTLE,
+        );
+        assert!(app.has_brigade_mark("solo"), "ends {ends}");
+
+        if ends {
+            unhost(&mut state, pane);
+        } else {
+            state.member_brigades.insert(pane.clone(), 1);
+            state
+                .member_tokens
+                .insert(pane.clone(), "worker-1".to_string());
+        }
+        tick(
+            &mut state,
+            &mut app,
+            idle_from + BRIGADE_QUIET_SETTLE + SECOND,
+        );
+        assert!(!app.has_brigade_mark("solo"), "ends {ends}");
+        assert!(state.solo_attention.is_empty() && state.marked_directors.is_empty());
+    }
+}
+
+#[test]
+fn a_background_command_is_quiet_for_a_lone_session_and_still_work_for_a_brigade() {
+    // Alone: the turn worked, ended, and a command keeps running. Nobody is
+    // waiting on it, and the session stopped.
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    sample(&mut state, &mut app, &[(pane, NotIdle)], at);
+    sample(&mut state, &mut app, &[(pane, Background)], at + SECOND);
+    let cmds = sample(
+        &mut state,
+        &mut app,
+        &[(pane, Background)],
+        at + SECOND + BRIGADE_QUIET_SETTLE,
+    );
+    assert!(rang(&cmds), "alone: {cmds:?}");
+
+    // In a brigade the same reading holds the stretch and arms it as work does.
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    sample(
+        &mut state,
+        &mut app,
+        &[(&director, NotIdle), (&worker, Idle)],
+        at,
+    );
+    for secs in 1..20 {
+        let cmds = sample(
+            &mut state,
+            &mut app,
+            &[(&director, Background), (&worker, Idle)],
+            at + secs * SECOND,
+        );
+        assert!(!rang(&cmds), "brigade, {secs}s: {cmds:?}");
+    }
+}
+
+/// A Codex pane in no brigade, whose row says Codex, as the Codex fixtures host it.
+fn lone_codex() -> (EmporiumState, App, SessionKey, Instant) {
+    let (mut state, mut app, pane, at) = solo_fixture(codex_row("cx"));
+    state.spawn_order.insert(pane.clone(), state.next_spawn);
+    state.next_spawn += 1;
+    state.seen_idle.insert(state.spawn_order[&pane]);
+    if let Some(long_ago) = t0().checked_sub(2 * PROCESS_START_GRACE) {
+        state.process_started.insert(pane.clone(), long_ago);
+    }
+    tick(&mut state, &mut app, at);
+    (state, app, pane, at)
+}
+
+#[test]
+fn a_lone_codex_panes_own_reports_decide_when_it_went_quiet() {
+    let (mut state, mut app, pane, at) = lone_codex();
+    said(&mut state, &mut app, &pane, REPORT_WORKING, at + SECOND);
+    // The sample says idle throughout; the report says working, and is believed.
+    for secs in 2..12 {
+        let cmds = sample(&mut state, &mut app, &[(&pane, Idle)], at + secs * SECOND);
+        assert!(!rang(&cmds), "{secs}s working: {cmds:?}");
+    }
+    // A prompt waiting on the operator is not idle either.
+    said(
+        &mut state,
+        &mut app,
+        &pane,
+        REPORT_BLOCKED,
+        at + 12 * SECOND,
+    );
+    for secs in 13..20 {
+        let cmds = sample(&mut state, &mut app, &[(&pane, Idle)], at + secs * SECOND);
+        assert!(!rang(&cmds), "{secs}s blocked: {cmds:?}");
+    }
+    // The turn ends: the report is idle from there, and the settle runs from it.
+    let done = at + 20 * SECOND;
+    said(&mut state, &mut app, &pane, REPORT_DONE, done);
+    sample(&mut state, &mut app, &[(&pane, Idle)], done);
+    let cmds = sample(
+        &mut state,
+        &mut app,
+        &[(&pane, Idle)],
+        done + BRIGADE_QUIET_SETTLE,
+    );
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::PaneQuietRecorded {
+            pane: pane.clone(),
+            others: 0
+        }],
+        "{cmds:?}"
+    );
+}
+
+#[test]
+fn with_bell_always_on_every_stretch_of_work_in_a_focused_lone_pane_rings_and_none_leaves_a_mark() {
+    let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+    let pane = &panes[0];
+    state.stage = Stage::Solo(pane.clone());
+    state.focus = Focus::Pane;
+    state.bell_when_focused = true;
+    tick(&mut state, &mut app, at);
+
+    // No mark stands to hold the next ring back, so only the cooldown bounds them.
+    let mut from = at;
+    for round in 0..3 {
+        let idle_from = lone_busy_then_idle(&mut state, &mut app, &[pane], from);
+        let cmds = idle_samples(
+            &mut state,
+            &mut app,
+            &[pane],
+            idle_from + BRIGADE_QUIET_SETTLE,
+        );
+        assert_eq!(
+            bell_causes(&cmds),
+            vec![BellCause::PaneQuietFocused { pane: pane.clone() }],
+            "round {round}: {cmds:?}"
+        );
+        assert!(!app.has_brigade_mark("solo") && state.solo_attention.is_empty());
+        from = idle_from + BRIGADE_QUIET_SETTLE + 20 * SECOND;
+    }
+}
+
+#[test]
+fn with_bell_always_on_a_pane_that_is_not_effectively_focused_still_records_marks_and_rings() {
+    // The switch only adds the focused case; the others are what they are with it off.
+    for (stage_it, focus, window) in [
+        (false, Focus::Sidebar, true),
+        (true, Focus::Sidebar, true),
+        (true, Focus::Pane, false),
+    ] {
+        let (mut state, mut app, panes, at) = lone_world(&["solo"]);
+        let pane = &panes[0];
+        if stage_it {
+            state.stage = Stage::Solo(pane.clone());
+        }
+        state.focus = focus;
+        state.window_focused = window;
+        state.bell_when_focused = true;
+        tick(&mut state, &mut app, at);
+        let idle_from = lone_busy_then_idle(&mut state, &mut app, &[pane], at);
+        let cmds = idle_samples(
+            &mut state,
+            &mut app,
+            &[pane],
+            idle_from + BRIGADE_QUIET_SETTLE,
+        );
+        assert_eq!(
+            bell_causes(&cmds),
+            vec![BellCause::PaneQuietRecorded {
+                pane: pane.clone(),
+                others: 0
+            }],
+            "staged {stage_it}, window {window}: {cmds:?}"
+        );
+        assert!(app.has_brigade_mark("solo"));
+    }
 }

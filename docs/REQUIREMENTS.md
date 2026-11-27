@@ -219,6 +219,10 @@ entry records what was decided and why.
    key:* whether he wants the sound depends on what he is doing, and he wants to
    change it while running. *Why F4 and not a prefix chord:* he wants to flip it
    casually, in one keystroke, while working.
+   *Extended (2026-11-27):* a hosted session in no brigade is watched the same way and
+   marks and rings for itself; with `F4` on it rings while its own pane is focused too
+   ("Decision (2026-11-27): a session outside any brigade that goes quiet rings and
+   marks too").
 
 Alongside, banto now asks Codex to BEL for `async-question` and `plan-mode-prompt`
 as well as `approval-requested` ("Attention"), so that a question the model asks
@@ -253,7 +257,7 @@ and the plan-implementation prompt ring too, not only an approval.
    proposed by Mitchell Hashimoto,
    <https://mitchellh.com/writing/program-status-osc7501>; another member read the
    spec and Codex's source, banto's code reads only the sequences). For a pane known
-   to be Codex that has reported, it decides the quit question and the brigade bell
+   to be Codex that has reported, it decides the quit question and the quiet bell
    instead of the rollout marker; `blocked` is shown and rung for like a Claude
    session in `waiting`; `working` shows busy in the list. The relay still reads the
    rollout marker. *Why:* the rollout cannot see work a Codex session left running
@@ -1278,6 +1282,77 @@ has gone stale, and replacing the Director's own system prompt. A link from a ta
 the Plan is still the intent of the ids in the Plan's task headings, and nothing reads
 them yet.
 
+## Decision (2026-11-27): a session outside any brigade that goes quiet rings and marks too
+
+The operator's words, on a session that was open and went to the background and
+stopped without a sound: "開いた状態でバックグラウンドに回ったセッションが静かに停止するのは
+セッションマルチプレクサとして失格です。ここはBrigade同様にBELL ALWAYS設定を尊重しつつ
+「静かになった」ベルとバナーは対応すべき". And, on the focused case: "BELL
+ALWAYSを尊重して…ペイン上にフォーカスがあってもベルがなります" (*Bell always honoured:
+it rings with the focus on the pane.*)
+
+*What was missing.* Until now the only turn's end that rang was a brigade's, through
+its Director. A hosted session that was in no brigade, Claude or Codex, finished its
+turn and said nothing unless it was waiting on a prompt or had rung BEL.
+
+*Decision.* Every hosted pane that is not a live member of a brigade is watched the
+way a brigade is, as a watch of one pane: the same 5-second settle
+(`BRIGADE_QUIET_SETTLE`), the same arming by real work, unknown blocking, a dialog
+the operator opened reading unknown, judged at the end of the tick. Its fire makes
+the same kind of record, marks the session's row in the list (and its tile, when it
+is on stage) and rings the host bell with a banner, `"<title>" went quiet`, under
+the 3-second cooldown. Details are under "The quiet brigade's bell", *A session in
+no brigade*. *Live member* means banto's own membership maps name a brigade for the
+pane and that brigade is not being disbanded, the test the Director's pane is found
+by; a bare presence in those maps would not do, because a disband leaves the
+surviving Director's pane open with them. Members stay under their brigade's watch
+and nowhere else, so a turn's end rings once for a brigade, never per member.
+
+*The principle, restated.* A turn's end rings only for a pane nobody is in, once
+until it is looked at, and never per brigade member. *Why the two uses that stay
+dropped keep their conclusion* ("A child's own notifications are dropped",
+"Codex's session files carry no Waiting state"): the child's own idle notice cannot
+know where the operator is, and is false in a brigade, where members are idle while
+the Director works; Codex's `agent-turn-complete` would ring for every member's
+turn, with the operator in the pane. banto's own record knows both, so it is the one
+that rings.
+
+*Suppression, exactly.* With `F4` off and the pane effectively focused (the focus on
+the panes, the pane selected, banto's window focused: `effective_focused_pane`): no
+ring, no mark, and the fire is spent. With `F4` on and the pane effectively focused:
+`pane_quiet_focused`, the bell only, no mark, under the cooldown. In every other case
+(off stage, staged alone with the focus on the list, banto's window unfocused) the
+fire is recorded, marked and rung (`pane_quiet_recorded`), with `F4` on or off.
+"In the background" is only a name for that last case. *Intended consequence:* with
+`F4` on and the operator working in a solo pane, every stretch of work rings 5-6
+seconds after it ends. Those rings leave no mark, so "one ring per pane per look"
+does not bound them; only the 3-second cooldown does. That is what `F4` is for, and
+what he asked for. *A refinement that may be built later and is not built:* treat the
+pane as seen if it was focused at any tick of the stretch. It may only ever withhold
+the mark and the `F4`-off ring; with `F4` on a seen stretch still rings.
+
+*A background command, decided by the operator.* For a session alone, a Claude
+session whose live file says `shell` counts as quiet, not as work; inside a brigade
+it stays work, as written below. *Why:* the failure he named is the silent stop, and
+a turn that ends with a dev server left running would otherwise never ring; a brigade
+takes `shell` as work because its Director can call `request_decision`, and a lone
+session cannot; the tile already shows `idle · bg`. *Cost:* a background build
+ending may ring again, but only if he looked at the pane in between, since the
+standing mark holds it otherwise. It is one branch (`solo_reading`) and flips in one
+line. Codex cannot make the distinction, since its own `working` report includes
+background terminals, so a lone Codex pane with one left running is not quiet.
+
+*Other costs.* A permission wait within 3 seconds of a quiet ring is
+marked but silent, with no banner, being under the cooldown. Focus is judged at the
+fire, so leaving a pane within 5 seconds of a turn the operator watched end rings for
+it. Workers whose Director is not hosted are watched by nobody, and neither is a
+brigade lost from the store by another path, which leaves its panes in neither
+watch. A solo Codex pane keeps the key of the thread it was opened on ("Codex data
+sources", *Not covered*), so the mark and the banner may name the old thread.
+
+*Not changed.* A BEL a lone session's child rang while it was off stage is latched
+and announced by nothing, as before.
+
 ## Goinkyo's product: `goinkyo_agent` (2026-11-23)
 
 A Goinkyo runs as Claude Code or as Codex. The key is `[brigade] goinkyo_agent`:
@@ -1889,7 +1964,9 @@ quiet fire with the Director's pane focused and the "bell always" switch on, the
 ring that leaves no mark), `quiet_recorded` (brigade, Director), `request` (brigade, Director: a Director's
 decision request rang, in the same two forms as a quiet fire; it is the cause that
 leaves no mark when the operator is in the Director's pane with F4 on),
-`staged_pane_bell`
+`pane_quiet_recorded` (pane, others: a session in no brigade went quiet) and
+`pane_quiet_focused` (pane: the same with its pane focused and the switch on, no
+mark), `staged_pane_bell`
 (pane, others: a staged pane's BEL), `staged_pane_wait` (pane, others),
 `list_row_waiting` (session, others: a list row that began Waiting and is on no
 tile), `off_stage_member_bell` and `off_stage_member_wait` (member, brigade,
@@ -2163,9 +2240,9 @@ defaults`); with no brigade staged, or a single session, it is refused (`prefix:
 brigade layout to reset`). The case that prompted it: a Worker added later takes the
 mean of the others' heights, so weights set when a brigade had two Workers leave one
 tile much smaller than the rest once it has four. **What is kept across a restart.**
-Everything arranged above, and the brigade bell's switch, is stored in banto's own
+Everything arranged above, and the quiet bell's switch, is stored in banto's own
 sqlite store and comes back the next time banto runs: the sidebar width (table
-`ui_prefs`, key `sidebar_width`) and, in the same table, the brigade bell's switch
+`ui_prefs`, key `sidebar_width`) and, in the same table, the quiet bell's switch
 (key `bell_when_focused`, `1` or `0`; any other stored value reads as no preference,
 which is off — see "The quiet brigade's bell") and the agent the Worker picker was
 last confirmed with (key `last_worker_agent`, `claude` or `codex`; any other stored
@@ -2205,7 +2282,7 @@ A Worker added later gets the mean of the others' height.
 | `x` | End what the selected row hosts (with the list focused and no dialog or search box taking the key). On a Director's row: close its brigade (confirm; "Closing a brigade"), whether it is on stage or not and whether its own pane still exists; a status line says so when nothing of it is running. On a single session's row with an open pane: end its process (confirm). On a row with nothing hosted: a status line, nothing else. It never dismisses: a Worker's or Goinkyo's row (members are not listed, at any reveal level, so one shows at most for the moment between its session appearing and the next reload) answers with a status line pointing to prefix-`x` on its tile |
 | `F2` | Move focus between the list and the panes |
 | `F3` | Make the next pane of the staged brigade the current one (collapsed tiles are skipped); pressed from the list, the keyboard stays on the list |
-| `F4` | Switch the brigade bell between silent-while-the-Director's-pane-is-focused (the default) and ringing there too (bell only, no mark); says which in the status line, and a standing `BELL ALWAYS` badge shows left of the counts while it is on. One keystroke from the list or from a pane, taken by banto like `F2`/`F3` and never forwarded to the agent; with a modal or the search box open the key goes to that, and with the prefix armed it is an unbound prefix key (no toggle), as for `F2`/`F3` |
+| `F4` | Switch the quiet bell between silent-while-the-pane-that-went-quiet-is-focused, a Director's or a lone session's (the default), and ringing there too (bell only, no mark); says which in the status line, and a standing `BELL ALWAYS` badge shows left of the counts while it is on. One keystroke from the list or from a pane, taken by banto like `F2`/`F3` and never forwarded to the agent; with a modal or the search box open the key goes to that, and with the prefix armed it is an unbound prefix key (no toggle), as for `F2`/`F3` |
 | `F5` | Open the reading screen ("The reading screen" in "Decision (2026-11-26)"): a read-only modal with a brigade's open decision and its Progress. From a pane it reads the staged brigade; from the list, the selected row's brigade (a Director's, or a hosted member's), otherwise the staged one; with none, a status line says so and nothing opens. It stages and resumes nobody. Taken by banto like `F2`/`F3`/`F4` and never forwarded to the agent (it used to reach a pane as no bytes); with a modal or the search box open the key goes to that |
 | `q`/`Esc` (list focused) | Quit — at once when every hosted session is known to be idle (or none is hosted); otherwise the first press only shows the sessions it counts, each with its reason, for example `Esc again to quit — 2 not idle: a (unknown), b (busy)`, background commands as `(bg)` or `2 in background: x, y` (the forms and the naming are in "Is it idle? (the quit question)") and a second `q`/`Esc` within 3 seconds quits, since quitting ends every hosted process. N counts hosted sessions (staged or off-stage, collapsed tiles included) that are not known idle; "Is it idle? (the quit question)" below says what that is. Any other key, a mouse press, the focus leaving the list, every session becoming known idle or the window running out drops the prompt silently. Esc stays one of the two keys because an IME swallows `q`. Once quitting is decided the status line reads `Closing — ending N session(s)…` until the process exits. |
 | prefix chord (`Ctrl+B` default, `[keys] prefix` in config.toml; matched as below), from sidebar or pane, then: | |
@@ -2245,7 +2322,7 @@ operator would name it (`Ctrl+B`, or a bare character), `F2 list`, `F3 next
 pane` when the staged brigade has more than one tile that is not collapsed, `F4 bell`
 always and `F5 read` when a brigade is staged; while
 searching, the search keys. A transient status replaces the hints. The text is
-built by one pure function (`banto_tui::hints`). While the brigade bell's switch
+built by one pure function (`banto_tui::hints`). While the quiet bell's switch
 is on, the badge `BELL ALWAYS` stands in the right-hand segment of the bar, left
 of the match counts, whichever focus and whichever left-hand text (hints, a
 status, the quit prompt, the closing line) the bar has; a switch that is off
@@ -2351,7 +2428,7 @@ hosted pane (staged or off-stage, collapsed or not) as a fact of three answers a
 one refinement, `banto_core::model::Quiescence`: **idle**, **not idle**,
 **unknown**, and **background**, a kind of not idle that says why (below). Unknown
 is its own answer, never folded into idle: both readers of it fail safe on it (a
-quit asks; the brigade bell stays silent). Background is not a fourth answer to the
+quit asks; the quiet bell stays silent). Background is not a fourth answer to the
 question "could ending a session lose work in flight": every reader that asks it
 takes background as not idle (`Quiescence::is_working`: the quit count and the
 brigade's quiet watch), and only the tile and the quit prompt tell it apart. The
@@ -2374,7 +2451,7 @@ Nothing older than the tick survives into the next one. One thing is decided in 
 core from the pane rather than gathered by the shell: for a pane known to be Codex
 that has reported its own state, the report overrides the shell's sample (below);
 this is the one place `quiescence_of` is decided, for the quit question and the
-brigade bell alike.
+quiet bell alike.
 
 - *Claude Code:* the session's live file (`sessions/<pid>.json`, PID alive) says
   `status: idle` → idle. `busy`, `waiting` and any other or missing status → not
@@ -2396,7 +2473,7 @@ brigade bell alike.
   reported (OSC 7501; "Codex data sources", "The pane's own report"): `idle`, `done`
   and `error` → idle (nothing is running, and a pane may sit in `done` or `error`
   until the operator touches it); `working` and `blocked` → not idle. It overrides
-  the rollout for the quit question and the brigade bell, because it is the only
+  the rollout for the quit question and the quiet bell, because it is the only
   signal that sees work left running after a turn and a prompt waiting for the
   operator. With no report, or after `clear`, the rollout's last turn marker ("What
   the markers mean"): ended → idle; started → not idle; no marker, no such thread,
@@ -2478,8 +2555,8 @@ window focused (the same rule DECSET 1004 focus reports use; before the terminal
 said anything the window counts as focused). A mark from a BEL clears when the pane
 becomes effectively focused. The mark *set*, the count and the bell do not depend on
 focus (a Waiting pane is in the set while it is focused too, and its bell is the
-same edge); only a BEL latch, and the brigade-quiet fire below, are suppressed for a
-pane the operator is already in. What the border *draws* does depend on it: the tile
+same edge); only a BEL latch, and the quiet fires below (a brigade's and a lone session's), are
+suppressed for a pane the operator is already in. What the border *draws* does depend on it: the tile
 that has the pane focus (banto's own focus on that pane, whether or not its window
 is focused) is drawn in the focus colour (cyan) and its title reversed, which
 outranks the waiting colour, so a focused Waiting tile looks like any focused tile
@@ -2494,8 +2571,8 @@ set minus a Claude session that is Waiting only because a dialog is open
 like any Waiting one, but does not ring: it is the operator's own doing and he is
 looking at it. If its reason later becomes anything else while it is still waiting,
 it enters the ring set and rings once at that moment; a pane latched by a BEL rings
-whatever else it is (a quiet brigade's fire has its own record and rings through
-it); and the reason changes the bell and nothing else on screen. The *host bell* (a
+whatever else it is (a quiet fire, a brigade's or a lone session's, has its own
+record and rings through it); and the reason changes the bell and nothing else on screen. The *host bell* (a
 BEL written to banto's own terminal) rings when the ring set (the visible Waiting
 rows and marked panes, less dialog-open ones) gains a member, at most once per 3
 seconds (`ATTENTION_BELL_COOLDOWN`, shared by every cause below). **On stage and
@@ -2515,7 +2592,11 @@ the quit question, the quiet watch and the relay never read it. It is memory onl
 so a restart starts with none, and it ends when the operator is effectively focused
 on that Director's pane, the focus a BEL latch is cleared by: staging the brigade
 puts him there, so staging clears a quiet fire's or a request's mark in the update
-that stages it (the request's tag stays, "Decision (2026-11-15)").
+that stages it (the request's tag stays, "Decision (2026-11-15)"). A session in no
+brigade that went quiet is marked in the same set, by its own row (and its own
+tile, which reads the Waiting row), and the mark ends when the operator is
+effectively focused on that pane, is dropped with the pane, and is dropped if the
+pane becomes a member of a brigade.
 
 **A child's own notifications are dropped.** The escapes an agent writes to ask its
 terminal for a desktop notification (OSC 9 text, OSC 777 `notify`, OSC 99, OSC
@@ -2529,7 +2610,9 @@ input" once a finished turn has been idle for 60 seconds). It stays dropped for 
 reasons: the marks and the bells above already cover waiting and a permission
 dialog, and the idle notice would be false in a brigade, where members are idle
 while the Director works. Relaying or converting it would ring once per idle member
-per turn, and the bell is meant to be rarer than every turn.
+per turn, and the bell is meant to be rarer than every turn. banto's own "went quiet" ring ("The quiet brigade's bell")
+does not contradict that: it knows where the operator is and which sessions are
+members, which the child's notice cannot.
 
 **banto's own notification (`[attention] notify`, on by default).** When it is
 on, banto writes a desktop notification of its own to the host terminal each time it
@@ -2540,7 +2623,7 @@ cooldown, causes and focus rules and nothing of its own: a ring the cooldown swa
 has neither, and a ring the focus rules withhold has neither. The body is a fixed
 English phrase per cause with a name in it, made by banto from ids and the names its
 status lines use (a brigade by its Director's title in quotes as above, a member as
-`worker-2 of "title"`, a plain session by its own title, `a session` when it has
+`worker-2 of "title"`, a plain session, and a lone session that went quiet, by its own title, `a session` when it has
 none, ` (+N more)` when several gained a place in one update) and never from text a
 child printed, which stays dropped above; the builder also turns `;` (the field
 separator) into `,`, drops every control character and cuts the body to 255 bytes on
@@ -2602,7 +2685,9 @@ which the mark and bell above pick up. *Read in the Codex source at tag
 `rust-v0.168.0`:* those three are TUI notification types (exec/edit/elicitation
 approvals; a question the model asks; the plan-implementation prompt), and the
 fourth, `agent-turn-complete`, is left out on purpose — the bell is meant to be
-rarer than every turn. *Measured 2026-08-06 on `codex-cli` 0.146.1 (see
+rarer than every turn, and it would ring for every member's turn with the operator
+in the pane; a lone Codex pane that went quiet rings through banto's own record
+instead. *Measured 2026-08-06 on `codex-cli` 0.146.1 (see
 `crate::launch`), with the list as it was then, `approval-requested` alone:* a plain
 turn rang nothing; a turn forced to request approval rang exactly one bare BEL with
 the condition `always` and none with Codex's default `unfocused` (Codex counts a
@@ -2616,7 +2701,8 @@ same host bell under the same cooldown as the mechanism above, and marks through
 record of its own (see *Effect* below) rather than through a pane's latch.
 
 - *Watched:* every brigade whose Director is hosted; its members are every hosted
-  member (the Director, the Workers, a Goinkyo).
+  member (the Director, the Workers, a Goinkyo). A hosted pane in no brigade is
+  watched on its own (*A session in no brigade*, below).
 - *Fires* when every member's sample is idle and has been for 5 seconds
   (`BRIGADE_QUIET_SETTLE`), counted from the later of two moments: (a) the start of
   the unbroken all-idle stretch — the last member becoming idle, or the set of
@@ -2751,17 +2837,51 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   and the count starts over when observations return; a Director hosted before its
   session is discovered is not observed, so its brigade is not judged until
   discovery completes.
+- *A session in no brigade* (2026-11-27, "Decision (2026-11-27): a session outside any
+  brigade that goes quiet rings and marks too"):
+  - *Watched:* every hosted pane, Claude or Codex, that is not a live member: banto's
+    membership maps name no brigade for it, or name one that is being disbanded (a
+    disband leaves the surviving Director's pane open with those maps, so their
+    presence alone says nothing). Workers whose Director is not hosted stay
+    unwatched, as does a pane of a brigade lost from the store by another path.
+  - *Fires* by the same rules as a brigade, as a watch of one pane: 5-second settle
+    from the pane's own all-idle stretch, armed by real work (seen idle and past
+    `PROCESS_START_GRACE`, or given work), unknown blocks, a dialog the operator
+    opened reads unknown, judged at the end of the tick. A session opened only to
+    read stays silent. One function judges both (`judge_quiet`); the brigade's gates
+    (mail on the way, a first turn expected, observation of the Director, a request's
+    spent point) are the brigade's and a lone pane has none. Per process, keyed by
+    its spawn number, so a relaunch under the same key is a new pane and a key rename
+    keeps the watch.
+  - *A background command* reads quiet here, not work (`solo_reading`), and stays
+    work in a brigade. Codex cannot make the distinction, as its own `working` report
+    includes background terminals, so a lone Codex pane with one running is not quiet.
+  - *Effect:* the record is made when the pane fires, marks the session's row (and
+    its tile, if staged) through the same set the Director's mark uses, and rings the
+    host bell with a banner `"<title>" went quiet` (` (+N more)` when several fire in
+    one tick; the lowest id is named) under the 3-second cooldown. A second fire
+    under a mark still standing is silent. Not while the pane is effectively focused
+    (the selected pane, banto's window focused); a fire there is spent, not saved for
+    when he leaves. With `F4` on it rings with the pane focused, bell only, no mark
+    (cause `pane_quiet_focused`). A pane staged alone with the focus on the list marks
+    and rings. The mark ends when the operator is effectively focused on the pane,
+    and is dropped with the pane or if the pane becomes a member.
+  - *Known costs:* a permission wait within 3 seconds of a quiet ring is marked but
+    silent, with no banner; focus is judged at the fire, so leaving a pane within 5
+    seconds of a turn he watched end rings for it; a solo Codex pane keeps the key of
+    its first thread ("Codex data sources", *Not covered*), so the mark and the
+    banner may name the old thread.
 - *The principle:* the bell decides only from what the tick observed. Why: a
   remembered "unread" or "exists" could hold or ring forever once the thing it
   described could no longer be checked (found in review).
 - *The switch:* the function key `F4` — one keystroke from the list or from a pane,
   taken by banto like `F2`/`F3` and not forwarded to the agent — toggles "ring even
-  while the Director's pane is focused" — the bell only, under the usual cooldown,
-  no mark (a focused pane never carries one); every other case is unchanged. The
-  status line says which way it went (`brigade bell: on, it rings even while the
-  Director's pane is focused` / `brigade bell: off, it stays silent while the
-  Director's pane is focused`), and while it is on the badge `BELL ALWAYS` stands on
-  the status bar. It is persisted (`ui_prefs`, key `bell_when_focused`; see "What is
+  while the Director's pane is focused", or a lone session's pane (above) — the bell
+  only, under the usual cooldown, no mark (a focused pane never carries one); every
+  other case is unchanged. The status line says which way it went (`quiet bell:
+  on, it rings even while a Director's or a lone session's pane is focused` /
+  `quiet bell: off, it stays silent while a Director's or a lone session's pane is
+  focused`), and while it is on the badge `BELL ALWAYS` stands on the status bar. It is persisted (`ui_prefs`, key `bell_when_focused`; see "What is
   kept across a restart") and is off by default and when the stored value is
   unusable. It is deliberately a runtime switch and not a `config.toml` key: whether
   the operator wants the sound depends on what he is doing, and he wants to change
@@ -4985,7 +5105,7 @@ of the logs database runs only on a list reload, which a pane at its prompt neve
 causes. A busy or waiting activity stands, a reload does not lose it, and ending the
 pane gives the row its own word back; the rows of sessions not hosted here, and
 `banto list`, are unchanged. The stricter question "is this session known to be doing
-nothing?" — asked by the quit confirmation and the brigade bell (see "The emporium:
+nothing?" — asked by the quit confirmation and the quiet bell (see "The emporium:
 hosted panes") — reads the same file the other way round: only `idle` is idle,
 `shell` is not (it is told apart as *background*, not idle for that one reason
 only), and an unrecognised status is not either, so the list's drawing and the

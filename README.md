@@ -139,6 +139,14 @@ has gone quiet: your input is wanted. banto marks the Director (a waiting dot on
 its list row, a magenta pane border) and rings the terminal bell, except while you
 are looking at the Director's pane. `F4` rings even then (bell only, no mark).
 
+A session that belongs to no brigade and sits open in a pane is told the same way:
+once it has been idle for 5 seconds after real work, its list row gets the waiting
+dot and the bell rings, except while you are in its pane (`F4` rings even then). A
+session opened only to read never rings. A Claude session whose turn has ended but
+whose background command still runs counts as quiet; Codex cannot make that
+distinction, so a Codex pane with a background terminal counts as working. Members
+of a brigade whose Director is not hosted are not watched.
+
 Forming your first Codex brigade needs one thing from you: Codex reviews banto's
 hook for trust once, at its own startup, so banto opens a one-time approval pane
 before that first brigade forms. Approve it once and later brigades find it trusted.
@@ -355,7 +363,7 @@ given up to 5 seconds to finish.
 | `Tab` / `a` | Toggle grouped view (Pinned / groups / Ungrouped) / cycle what the list reveals: ordinary sessions → also hidden ones (agent-run) → also archived ones |
 | `B` / `b` | Appoint Director + auto-spawn Workers (on a Director: disband) / spawn one more Worker into the staged brigade |
 | `x` | End what the selected row runs (confirm). On a Director: **close its brigade**: every process of the brigade ends, nothing is deleted, and Enter on the Director's row brings it all back. On a single session with an open pane: end its process. It never dismisses a Worker; use `Ctrl+B x` on that Worker's tile |
-| `F2` / `F3` / `F4` | Move focus between the list and the panes / make the next pane of the staged brigade the current one / ring the brigade bell even while the Director's pane is focused (toggle) |
+| `F2` / `F3` / `F4` | Move focus between the list and the panes / make the next pane of the staged brigade the current one / ring the bell even while the pane that went quiet is focused, a Director's or a lone session's (toggle) |
 | `F5` | Read a brigade's open decision, Progress and Plan on a read-only screen (`A` approves the Plan's draft on screen), from the list (the selected row's brigade, else the staged one) or from a pane (the staged one). Arrows, `j`/`k`, `PgUp`/`PgDn`, `Home`/`End` scroll; `Esc` closes it; with a decision open, `Enter` closes it and goes to the Director's pane. Opening the screen starts and resumes nothing |
 | `Ctrl+B` … | tmux-style prefix (configurable), from the list or a pane: |
 | … `o`/`Tab`, arrows | cycle focus through sidebar and panes / directional pane navigation |

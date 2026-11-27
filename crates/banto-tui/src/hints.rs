@@ -9,8 +9,8 @@
 use banto_core::app::Mode;
 use banto_core::engine::Focus;
 
-/// The standing badge on the status bar's right while the brigade-quiet bell is
-/// set to ring even with the Director's pane focused. Shown only while on: a
+/// The standing badge on the status bar's right while the quiet bell is
+/// set to ring even with the pane that went quiet focused. Shown only while on: a
 /// mode that is off says nothing. The word BELL names the thing and ALWAYS what
 /// differs from the default (focus no longer silences it).
 pub const BELL_BADGE: &str = "BELL ALWAYS";
