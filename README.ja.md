@@ -84,7 +84,7 @@ codex = "C:/tools/codex.exe"
 
 **対応プラットフォーム**。Windows x64、Linux x64（glibc 2.35 以降）、Apple silicon の macOS です。リリースは Ubuntu 22.04 でビルドされ、バイナリがそれより新しい glibc を必要とするとビルドが失敗します。Alpine のような musl のシステムはソースからビルドします。Intel Mac と Windows on ARM 向けのビルド済みバイナリはありません。
 
-**macOS は軽く確認した段階です**。Apple silicon の Mac 1 台で、v0.1.0 と v0.3.0 は `install.sh` でインストールでき、Gatekeeper のプロンプトも出ませんでした。セッションをペインで開いて閉じられ、ペインで選択したテキストもコピーできました。再開、セッションファイルの変更への一覧の追従、入力の細部、ブラウザでダウンロードしたバイナリは、まだ確認していません。
+**macOS は日常的に使っています**。2026-11-26 から、メンテナーは Apple silicon の Mac の Ghostty 1.4.0 で、main からビルドした banto を普段使いにしています。セッションの再開（banto の再起動をまたぐものも含む）、Claude と Codex の Worker と Goinkyo を含む Brigade、セッションファイルへの一覧の追従、ペインのキー（改行、単語の削除と移動、プレフィックス）、ペインからのテキストのコピー、ベルとデスクトップ通知が動いています。Ghostty でベルの音を鳴らすには `bell-features = system` が必要です。v0.1.0 と v0.3.0 は `install.sh` でインストールでき、Gatekeeper のプロンプトは出ませんでした。まだ確認していないのは、ブラウザでダウンロードしたバイナリ（Gatekeeper）、実行中の banto をインストーラーが置き換えずに拒否する動作、Ghostty 以外のターミナル、ペインの hang-up と強制終了のタイミングです。
 
 ### ワンライナーでインストール
 

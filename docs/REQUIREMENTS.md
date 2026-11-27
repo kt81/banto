@@ -3637,10 +3637,9 @@ Unverified: that an agent's `SessionEnd` hooks run for a session ended this way,
 was not measured; and how an agent mid-turn answers a hang-up. The Linux half has run
 green under WSL, and the Unix hang-up timings were measured there. macOS is checked
 less: CI builds it and runs the test suite on `macos-latest`, and one Apple silicon Mac
-has installed v0.1.0 and opened and closed sessions in panes (README, "macOS is lightly
-checked"), but the hang-up and force-kill timings were not measured on macOS, and
-resume, the list following session-file changes and input in detail are unchecked
-there.
+has run banto in daily use in Ghostty 1.4.0 (README, "macOS is in daily use"), but the
+hang-up and force-kill timings were not measured on macOS, and terminals other than
+Ghostty are unchecked there.
 
 *Why the Director's prefix-`x` changed (operator's decision, 2026-11-20).* It used
 to end only the Director's process. The operator's reason: a brigade with only its
