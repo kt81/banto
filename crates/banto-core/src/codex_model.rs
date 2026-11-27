@@ -165,8 +165,6 @@ fn role_label(role: BrigadeRole) -> &'static str {
         BrigadeRole::Director => "director",
         BrigadeRole::Worker => "worker",
         BrigadeRole::Goinkyo => "goinkyo",
-        // Never reached today (a Planner is Claude only); named so that the day
-        // it is not, the status line says whose model it was.
         BrigadeRole::Planner => "planner",
     }
 }

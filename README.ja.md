@@ -33,7 +33,7 @@ banto は MCP 上でメンバー間のメッセージを中継します。各メ
 
 Goinkyo は、Director が `consult_goinkyo` で相談する助言役のセッションです。既定では Director と同じプロダクトで動くため、Codex の Director の Goinkyo は Codex になります（`goinkyo_agent`）。`goinkyo_agent = "claude"` にすると Claude のままです。Codex の Goinkyo は読み取り専用で、承認の確認なしに動くので、ビルドやテストはできません。Codex がまだ信頼していないディレクトリでの最初の相談は、Codex 自身の信頼の質問で止まり、Goinkyo のペインで答えるまで待ちます。
 
-Planner は複数の用事にまたがり、かつ範囲や完了条件があなたの言葉で決まっていない作業を頼まれたときに、Director が `open_planner` で開く Claude のセッションです。Planner は専用のペインであなたと Plan を詰め、コードは `Read`、`Grep`、`Glob` だけで読み、下書きを `write_plan` で書きます。読み取り画面（`F5`）で下書きを読み、`A`（Shift）を押して画面に出ている版を承認するまで、何も確定しません。画面を開いた後に Planner がもっと新しい版を書いていたときは、banto は承認を断り、先にその版を読むよう伝えます。承認すると banto から Director にメッセージが届きます。メッセージには `goinkyo_consult` に従って Plan を Goinkyo のレビューに回すかどうかも書かれています。Director は承認された Plan を用事に分けます。下書きの段階で Worker を始めないのは、`read_plan` ツールの説明にある指示で、banto が確かめるわけではありません。Director は `close_planner` で Plan を終え、banto は Planner のセッションをアーカイブして、Plan の Markdown の書き出しを残します。Planner は Director のプロダクトに関係なく、常に Claude で動きます。
+Planner は複数の用事にまたがり、かつ範囲や完了条件があなたの言葉で決まっていない作業を頼まれたときに、Director が `open_planner` で開くセッションです。Planner は専用のペインであなたと Plan を詰め、下書きを `write_plan` で書きます。Claude の Planner がコードを読むのは `Read`、`Grep`、`Glob` だけです。Planner は Director と同じプロダクトで動き（`planner_agent`）、プロダクトは Planner を開いたときに決まります。`planner_agent = "claude"` にすると Claude のままです。Codex の Planner は Codex の Goinkyo と同じく読み取り専用で、承認の確認なしに動き、Codex のシェル、Web 検索、アプリはそのまま使えるので、読み取り型のアプリのツール、ほかの Codex のスレッド、取得した Web ページの中身は読めます。読み取り画面（`F5`）で下書きを読み、`A`（Shift）を押して画面に出ている版を承認するまで、何も確定しません。画面を開いた後に Planner がもっと新しい版を書いていたときは、banto は承認を断り、先にその版を読むよう伝えます。承認すると banto から Director にメッセージが届きます。メッセージには `goinkyo_consult` に従って Plan を Goinkyo のレビューに回すかどうかも書かれています。Director は承認された Plan を用事に分けます。下書きの段階で Worker を始めないのは、`read_plan` ツールの説明にある指示で、banto が確かめるわけではありません。Director は `close_planner` で Plan を終え、banto は Planner のセッションをアーカイブして、Plan の Markdown の書き出しを残します。
 
 各メンバーには所属する Brigade、トークン、同僚を示す役割ブリーフィングも渡します。Claude Code ではシステムプロンプトへ追記し、Codex では banto 自身の `SessionStart` フックで届けます。中継されたメッセージには別の AI から来たものだと明示する枠を付けるので、操作者の入力と取り違えられることはありません。banto の自動リレーは、未読メッセージがあるアイドルのメンバーを起こします。Claude Code では起動用フックを使い、Codex では短い定型の Nudge（催促）を `codex queue` で積みます。そのため Director→Worker→Director の往復に人手の橋渡しは要りません。`relay = "auto"` のとき、この起こし方はメンバーの文脈全体に対するターンを始めるので、メッセージに依頼の中身がなくても、アイドルのメンバーは 1 ターン分の費用を使うことがあります。このリポジトリの大部分はこのループで作られました。
 
@@ -228,9 +228,13 @@ goinkyo_agent = "inherit"
 # 完了条件があなたの言葉で決まっていないとき）| "off"（頼まれたときだけ）。goinkyo_consult と同じく
 # director_prompt が空なら何も起きません。
 planner = "auto"
+# Planner が動くプロダクト: "inherit"（Director と同じ）| "claude" | "codex"。
+# Planner を開いたときに決まり、開いている Planner は編集しても動きません。
+# モデルと effort は [brigade.claude] または [brigade.codex] の planner_model と planner_effort です。
+planner_agent = "inherit"
 # Planner の役割の文面。banto が必ず足す段落と共に Claude 自身のシステムプロンプトに
-# 取って代わります。{brigade} は置き換えられ、"" ならその段落だけが残ります。
-# 既定は英語で、あなたの言語で答えるよう Planner に伝えます。
+# 取って代わります（Codex の Planner には banto のフック経由で届きます）。{brigade} は置き換えられ、
+# "" ならその段落だけが残ります。既定は英語で、あなたの言語で答えるよう Planner に伝えます。
 planner_prompt = "..."
 # Director の request_decision は、行に印を付けてベルも鳴らします。false なら印だけです。
 request_attention = true
@@ -259,6 +263,8 @@ worker_model = "terra"           # slug、または最新の slug に解決さ�
 worker_effort = "high"           # -c model_reasoning_effort
 goinkyo_model = ""               # Codex の Goinkyo のモデル。"" は Codex の既定
 goinkyo_effort = ""              # Codex の Goinkyo の -c model_reasoning_effort。"" は渡さない
+planner_model = ""               # Codex の Planner のモデル。"" は Codex の既定
+planner_effort = ""              # Codex の Planner の -c model_reasoning_effort。"" は渡さない
 
 [keys]
 prefix = "C-b"      # ペインのプレフィックスのキー。バックスラッシュは TOML では 'C-\' か "C-\\" と書く

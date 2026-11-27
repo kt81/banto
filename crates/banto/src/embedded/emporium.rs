@@ -1730,20 +1730,19 @@ fn execute_open_embedded(
             os_error: None,
         }];
     }
-    // A Planner is Claude's, and Claude may have been switched off since its row was
-    // made. The UI refuses here, in words, as the Goinkyo's launch is refused at the
-    // `_mcp` side (`goinkyo_launch_refusal`): a Planner that cannot start says so,
-    // and is not left an empty tile.
+    // The Planner runs the product its row names (`open_planner` fixed it), and that
+    // product may have been switched off since the row was made. The UI refuses
+    // here, in words, as the Goinkyo's launch is refused at the `_mcp` side
+    // (`goinkyo_launch_refusal`): a Planner that cannot start says so, and is not
+    // left an empty tile. The other product is never tried in its place.
     let planner = matches!(&brigade, Some((_, _, BrigadeRole::Planner)));
-    if planner
-        && (target.agent != AgentKind::ClaudeCode
-            || !deps.enabled_agents.contains(&AgentKind::ClaudeCode))
-    {
+    if planner && !deps.enabled_agents.contains(&target.agent) {
         return vec![Event::SpawnFailed {
             key,
-            error: "the Planner needs Claude, which is not enabled (see `agents` in \
-                    config.toml)"
-                .to_string(),
+            error: format!(
+                "the Planner runs on {}, which is not enabled (see `agents` in config.toml)",
+                target.agent.label()
+            ),
             refusal: SpawnRefusal::Refused,
             os_error: None,
         }];
@@ -3319,6 +3318,7 @@ fn gather_role_looks(
                 guard: planner_guard,
                 cwd: PathBuf::new(),
                 roster: Vec::new(),
+                agent: None,
             });
             continue;
         };
@@ -3389,15 +3389,24 @@ fn gather_role_looks(
             },
         };
         let planner_awaiting = matches!(planner_row, GoinkyoRow::NoSession) && director_hosted;
-        let (planner_cwd, planner_roster) = if planner_awaiting {
+        let (planner_cwd, planner_roster, planner_agent) = if planner_awaiting {
             // The Director's own cwd, as the Goinkyo's and `stage_brigade` read it.
             let cwd = director_session
                 .and_then(|session| app.row_for_id(&session.0))
                 .and_then(|row| row.cwd.clone())
                 .unwrap_or_else(|| PathBuf::from("."));
-            (cwd, members.iter().map(|m| m.token.clone()).collect())
+            (
+                cwd,
+                members.iter().map(|m| m.token.clone()).collect(),
+                // The product `open_planner` wrote on the row: the authority for
+                // what this launch runs, with nothing to fall back on but Claude.
+                members
+                    .iter()
+                    .find(|m| m.role == BrigadeRole::Planner)
+                    .and_then(|m| m.agent),
+            )
         } else {
-            (PathBuf::new(), Vec::new())
+            (PathBuf::new(), Vec::new(), None)
         };
         planner_looks.push(PlannerLook {
             brigade_id,
@@ -3407,6 +3416,7 @@ fn gather_role_looks(
             guard: planner_guard,
             cwd: planner_cwd,
             roster: planner_roster,
+            agent: planner_agent,
         });
     }
     RoleLooks {
@@ -15946,19 +15956,21 @@ mod tests {
     /// [`staged_goinkyo`]'s brigade with a Planner row instead, and the Plan that
     /// goes with it.
     fn staged_planner(session: Option<&str>) -> (RefCell<Store>, EmporiumState, App) {
+        staged_planner_as(session, AgentKind::ClaudeCode)
+    }
+
+    /// The same, the Planner's row naming `agent` as `open_planner` fixed it.
+    fn staged_planner_as(
+        session: Option<&str>,
+        agent: AgentKind,
+    ) -> (RefCell<Store>, EmporiumState, App) {
         let (store, state, app) = staged_goinkyo(None);
         {
             let mut store = store.borrow_mut();
             store.remove_brigade_member(1, "goinkyo").unwrap();
             assert_eq!(
                 store
-                    .open_planner(
-                        1,
-                        "director",
-                        "Layout",
-                        "make it better",
-                        AgentKind::ClaudeCode
-                    )
+                    .open_planner(1, "director", "Layout", "make it better", agent)
                     .unwrap(),
                 banto_io::store::OpenedPlanner::Opened { number: 1 }
             );
@@ -15981,6 +15993,17 @@ mod tests {
         assert_eq!(candidate.brigade_id, 1);
         assert_eq!(candidate.cwd, PathBuf::from("/work/alpha"));
         assert_eq!(candidate.roster, ["director", "planner"]);
+        assert_eq!(candidate.agent, Some(AgentKind::ClaudeCode));
+    }
+
+    #[test]
+    fn the_product_the_planners_row_names_is_the_one_the_spawn_candidate_carries() {
+        let (store, state, app) = staged_planner_as(None, AgentKind::Codex);
+        let observations = gather_planner_observations(&state, &store, &app);
+        let [engine::PlannerObservation::AwaitingSpawn(candidate)] = &observations[..] else {
+            panic!("{observations:?}");
+        };
+        assert_eq!(candidate.agent, Some(AgentKind::Codex));
     }
 
     #[test]
@@ -18661,13 +18684,18 @@ mod tests {
         );
     }
 
+    /// Tests the one refusal `execute_open_embedded` makes for a Planner: its
+    /// product is no longer enabled in `agents`. The other conditions
+    /// `open_planner` checks (no home, a hook Codex cannot launch or trust) are
+    /// not re-checked at a later launch, so nothing here covers them.
     #[test]
-    fn a_planner_is_refused_in_words_when_claude_is_not_enabled_and_nothing_is_started() {
+    fn a_planner_is_refused_in_words_when_its_product_is_not_enabled_and_nothing_is_started() {
         let rig = BriefingRig::new().with_planner();
         let only_codex = BTreeSet::from([AgentKind::Codex]);
-        for (agent, enabled) in [
-            (AgentKind::ClaudeCode, &only_codex),
-            (AgentKind::Codex, &all_agents()),
+        let only_claude = BTreeSet::from([AgentKind::ClaudeCode]);
+        for (agent, enabled, named) in [
+            (AgentKind::ClaudeCode, &only_codex, "Claude"),
+            (AgentKind::Codex, &only_claude, "Codex"),
         ] {
             let events = rig.open_planner(
                 agent,
@@ -18680,10 +18708,40 @@ mod tests {
                 panic!("{events:?}");
             };
             assert_eq!(*refusal, SpawnRefusal::Refused);
-            assert!(error.contains("needs Claude"), "{error}");
+            assert!(
+                error.contains(&format!(
+                    "the Planner runs on {named}, which is not enabled"
+                )),
+                "{error}"
+            );
         }
         assert!(rig.fixture.launches().is_empty());
         assert!(!rig.planner_prompt_file().exists(), "nothing was written");
+    }
+
+    #[test]
+    fn a_codex_planner_is_launched_without_the_claude_prompt_file_and_under_the_goinkyos_policy() {
+        let rig = BriefingRig::new().with_planner();
+        let events = rig.open_planner(
+            AgentKind::Codex,
+            "",
+            Some("Begin."),
+            &BrigadeConfig::default(),
+            &all_agents(),
+        );
+        assert!(matches!(&events[..], [Event::Spawned { .. }]), "{events:?}");
+        let argv = rig.fixture.launches().last().unwrap().argv.clone();
+        // Its instructions come from the SessionStart hook, composed when the hook
+        // runs; the Claude file is for Claude only.
+        assert!(!rig.planner_prompt_file().exists(), "{argv:?}");
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.contains("system-prompt-file") || a.contains("model_instructions_file")),
+            "{argv:?}"
+        );
+        assert_eq!(flag_value(&argv, "-s"), Some("read-only"), "{argv:?}");
+        assert_eq!(flag_value(&argv, "-a"), Some("never"), "{argv:?}");
     }
 
     #[test]

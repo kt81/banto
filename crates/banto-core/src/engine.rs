@@ -901,6 +901,14 @@ pub struct PlannerSpawnCandidate {
     /// bottom of the stack.
     #[serde(default)]
     pub roster: Vec<MemberToken>,
+    /// The product on the Planner's member row. `open_planner` writes it, after
+    /// resolving `planner_agent` against its Director and refusing a product that
+    /// cannot work, so the row is the one place that decides what the spawn runs
+    /// until the Plan closes. `None` for a row that never had one, and in a capture
+    /// recorded before this field existed: both are Claude, which is all a Planner
+    /// was then.
+    #[serde(default)]
+    pub agent: Option<AgentKind>,
 }
 
 /// What the shell observed about one brigade's Planner this tick, the Planner's
@@ -934,6 +942,8 @@ pub struct PlannerLook {
     /// Only meaningful when the row is awaiting a session and the Director is hosted.
     pub cwd: PathBuf,
     pub roster: Vec<MemberToken>,
+    /// The product on the Planner's row, as [`PlannerSpawnCandidate::agent`].
+    pub agent: Option<AgentKind>,
 }
 
 /// The observation this tick's [`PlannerLook`] calls for, or `None` when there is
@@ -955,6 +965,7 @@ pub fn decide_planner(look: &PlannerLook) -> Option<PlannerObservation> {
                 brigade_id: look.brigade_id,
                 cwd: look.cwd.clone(),
                 roster: look.roster.clone(),
+                agent: look.agent,
             })
         }),
         GoinkyoRow::Session(_) => None,
@@ -1032,14 +1043,20 @@ const FIRST_TURN_NOTICE_AFTER: Duration = Duration::from_secs(15);
 /// [`CODEX_WORKER_FIRST_PROMPT`].
 const GOINKYO_FIRST_PROMPT: &str = "[banto] This pane just started as your brigade's Goinkyo.";
 
-/// The fixed first prompt a freshly created Planner gets on its command line. It
-/// is the trigger and little more, as the Goinkyo's is: Claude does nothing with a
-/// system prompt alone until it has a turn. It names the request file because the
-/// Planner's banto tools are not connected on its first turn (the `_mcp` server
-/// starts with the session, after the first prompt is read), so the file is the
-/// one way the request reaches it. ASCII-only and quote-free like
-/// [`GOINKYO_FIRST_PROMPT`], so it survives a command line on any platform.
-const PLANNER_FIRST_PROMPT: &str = "[banto] This pane just started as your brigade's Planner. Read the request file named in your system prompt first.";
+/// The fixed first prompt a freshly created Planner gets on its command line,
+/// whichever product it runs. It is the trigger and little more, as the Goinkyo's
+/// is: Claude does nothing with a system prompt alone until it has a turn, and a
+/// Codex one never runs its hook, which carries its briefing, before its first. It
+/// names the request file because the Planner's banto tools are not connected on
+/// a Claude Planner's first turn (the `_mcp` server starts with the session, after
+/// the first prompt is read) and may not be on a Codex one's (measured on Codex
+/// 0.172.0: ready after about 1.8 s in one start, not visible after 10 s in
+/// another), so the file is the one way the request reaches it. It says
+/// "instructions" and not "system prompt": a Claude Planner's text is its system
+/// prompt, a Codex Planner's arrives as hook context, and the word has to be true
+/// of both. ASCII-only and quote-free like [`GOINKYO_FIRST_PROMPT`], so it
+/// survives a command line on any platform.
+const PLANNER_FIRST_PROMPT: &str = "[banto] This pane just started as your brigade's Planner. Read the request file named in your instructions first.";
 
 /// A member banto created with a first prompt on its command line
 /// ([`Cmd::OpenEmbedded::first_prompt`]), until that prompt is known to have
@@ -4583,7 +4600,8 @@ pub enum SpawnRefusal {
     /// The brigade's MCP channel config could not be written.
     ChannelWiring,
     /// The launch was refused before anything was written or started, for a reason
-    /// the operator can change: a Planner's product (Claude) is not enabled.
+    /// the operator can change: a Planner's product (Claude or Codex, whichever its
+    /// row names) is no longer enabled in `agents`.
     Refused,
 }
 
@@ -10150,7 +10168,8 @@ fn open_worker(
 /// Hold back a Codex creation whose model may be a family word until the
 /// catalog read answers, and ask for that read unless one is already out. Shared
 /// by every launch that creates a Codex member with a model: a Worker's
-/// ([`open_worker`]) and a Goinkyo's ([`update_goinkyo_awaiting_spawn`]).
+/// ([`open_worker`]), a Goinkyo's ([`update_goinkyo_awaiting_spawn`]) and a
+/// Planner's ([`update_planner_observed`]).
 fn hold_for_catalog(state: &mut EmporiumState, open: Cmd) -> Vec<Cmd> {
     // Joins the round already waiting, if there is one: its one read serves
     // every creation requested meanwhile, and a round that has creations
@@ -13151,8 +13170,9 @@ fn update_planner_closed(
 /// launch in flight or one that failed, so it is not retried; a real key beside a
 /// row with no session id is a pane of a Plan that ended and was replaced, which is
 /// torn down rather than adopted. Three things differ, all because a Planner
-/// outlives its panes. There is no Codex path, since the Planner is Claude's alone.
-/// The `NoPlanner` arm is how the UI learns of a Plan closed by another process (the
+/// outlives its panes. Its product is the row's (`open_planner` fixed it when the
+/// Plan opened), never re-resolved from the setting here: Claude when the row
+/// names none. The `NoPlanner` arm is how the UI learns of a Plan closed by another process (the
 /// Director's `close_planner` or `release_plan`), and it also reloads when the
 /// roster still listed the Planner, because closing the Plan archived its session
 /// and the hidden set is read once. And nothing here removes the row: a Planner
@@ -13219,18 +13239,25 @@ fn update_planner_observed(
     state
         .member_brigades
         .insert(key.clone(), candidate.brigade_id);
+    // The row's product, as the Goinkyo's spawn reads its own. A row with none is
+    // a Planner from before rows recorded one, and that was always Claude.
+    let agent = candidate.agent.unwrap_or(AgentKind::ClaudeCode);
     state.pending_opens.insert(
         key.clone(),
         PendingOpen::BrigadeMember {
             brigade_id: candidate.brigade_id,
-            first_turn: Some(AgentKind::ClaudeCode),
+            first_turn: Some(agent),
         },
     );
-    vec![Cmd::OpenEmbedded {
+    // `permission_mode` is a Claude flag: a Codex Planner is held read-only by its
+    // launch flags instead. The model and the effort are each product's own words.
+    let model = brigade.planner_model_for(agent).map(str::to_string);
+    let held = agent == AgentKind::Codex && model.is_some();
+    let open = Cmd::OpenEmbedded {
         key,
         target: SessionToOpen {
             id: String::new(),
-            agent: AgentKind::ClaudeCode,
+            agent,
             title: PLANNER_TOKEN.to_string(),
             cwd: candidate.cwd,
         },
@@ -13239,13 +13266,22 @@ fn update_planner_observed(
             PLANNER_TOKEN.to_string(),
             BrigadeRole::Planner,
         )),
-        model: brigade.planner_model().map(str::to_string),
-        effort: brigade.planner_effort().map(str::to_string),
-        permission_mode: brigade.planner_permission_mode().map(str::to_string),
+        model,
+        effort: brigade.planner_effort_for(agent).map(str::to_string),
+        permission_mode: brigade
+            .planner_permission_mode()
+            .filter(|_| agent == AgentKind::ClaudeCode)
+            .map(str::to_string),
         disallowed_tools: None,
         autocompact: None,
         first_prompt: Some(PLANNER_FIRST_PROMPT.to_string()),
-    }]
+    };
+    // A Codex model may be a family word, which has to meet the catalog before it
+    // can be passed, as a Goinkyo's does ([`update_goinkyo_awaiting_spawn`]).
+    if held {
+        return hold_for_catalog(state, open);
+    }
+    vec![open]
 }
 
 /// Answers `Event::GoinkyoAwaitingSpawn`: spawn the Goinkyo `observation`

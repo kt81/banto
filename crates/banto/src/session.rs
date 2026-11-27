@@ -954,6 +954,41 @@ mod tests {
         assert_eq!(metas[1].title.as_deref(), Some("Fix the parser"));
     }
 
+    /// A Codex session's `title_is_custom` is always false (the title is already a
+    /// pick among Codex's own sources), so an ended Plan titles a Codex Planner's
+    /// session over whatever Codex derived, as it does a Claude one that was not
+    /// renamed.
+    #[test]
+    fn an_ended_plans_codex_session_is_listed_under_the_planner_title() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                br,
+                "director",
+                banto_core::model::BrigadeRole::Director,
+                None,
+            )
+            .unwrap();
+        store
+            .open_planner(br, "director", "Layout", "make it better", AgentKind::Codex)
+            .unwrap();
+        store
+            .set_member_session(br, "planner", &SessionId("p1".to_string()))
+            .unwrap();
+        store
+            .close_plan(br, &banto_io::store::PlanClosing::Operator)
+            .unwrap();
+        let mut metas = vec![SessionMeta {
+            agent: AgentKind::Codex,
+            ..titled("p1", Some("banto runs this pane and adds"), false)
+        }];
+
+        apply_consultation_titles(&mut metas, &store);
+
+        assert_eq!(metas[0].title.as_deref(), Some("Planner: Layout"));
+    }
+
     #[test]
     fn a_title_is_given_to_a_session_that_has_none() {
         let store = store_with_ended_consultation("g1", "Layout drag");

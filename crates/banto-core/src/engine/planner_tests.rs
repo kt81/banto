@@ -24,6 +24,11 @@ const PLANNER_NEW: Member = ("planner", BrigadeRole::Planner, None);
 const PLANNER: Member = ("planner", BrigadeRole::Planner, Some("g1"));
 
 fn awaiting(scene: &mut Scene, brigade_id: BrigadeId) -> Vec<Cmd> {
+    awaiting_as(scene, brigade_id, None)
+}
+
+/// [`awaiting`] with the product the Planner's row names.
+fn awaiting_as(scene: &mut Scene, brigade_id: BrigadeId, agent: Option<AgentKind>) -> Vec<Cmd> {
     let roster = scene
         .roster(brigade_id)
         .into_iter()
@@ -34,6 +39,7 @@ fn awaiting(scene: &mut Scene, brigade_id: BrigadeId) -> Vec<Cmd> {
             brigade_id,
             cwd: PathBuf::from("/work/alpha"),
             roster,
+            agent,
         }),
     })
 }
@@ -98,6 +104,7 @@ fn look(row: GoinkyoRow, hosted: bool, guard: Option<SessionKey>) -> PlannerLook
         },
         cwd: PathBuf::from("/work/alpha"),
         roster: vec!["director".to_string(), "planner".to_string()],
+        agent: None,
     }
 }
 
@@ -109,11 +116,22 @@ fn the_tick_launches_a_planner_only_for_a_hosted_director_and_only_without_a_ses
         brigade_id: 1,
         cwd: PathBuf::from("/work/alpha"),
         roster: vec!["director".to_string(), "planner".to_string()],
+        agent: None,
     });
     assert_eq!(
         decide_planner(&look(GoinkyoRow::NoSession, true, None)),
         Some(candidate)
     );
+    // The row's product travels with the candidate, for the spawn to read.
+    let mut codex_row = look(GoinkyoRow::NoSession, true, None);
+    codex_row.agent = Some(AgentKind::Codex);
+    assert!(matches!(
+        decide_planner(&codex_row),
+        Some(PlannerObservation::AwaitingSpawn(PlannerSpawnCandidate {
+            agent: Some(AgentKind::Codex),
+            ..
+        }))
+    ));
     // A brigade nobody opened is not started behind the operator's back.
     assert_eq!(
         decide_planner(&look(GoinkyoRow::NoSession, false, None)),
@@ -229,6 +247,113 @@ fn the_launch_options_of_a_planner_are_the_operators_and_an_empty_one_passes_not
     assert_eq!(model.as_deref(), Some("haiku"));
     assert_eq!(effort, &None);
     assert_eq!(permission_mode.as_deref(), Some("plan"));
+}
+
+#[test]
+fn a_planner_row_naming_codex_is_created_on_codex_with_codexs_keys_and_no_claude_flag() {
+    let mut scene = Scene::two_brigades(true);
+    scene.stage_one();
+    scene.join(1, PLANNER_NEW);
+    // Both products' keys are set, to a different word each: the Codex Planner
+    // reads only its own, and `permission_mode` (a Claude flag) is not passed.
+    scene.brigade.claude.planner_model = Some("haiku".to_string());
+    scene.brigade.claude.planner_effort = Some("low".to_string());
+    scene.brigade.codex.planner_model = Some("gpt-5.9".to_string());
+    scene.brigade.codex.planner_effort = Some("medium".to_string());
+    // The setting names Claude: the row, not the setting, decides.
+    scene.brigade.planner_agent = crate::config::PlannerAgentSetting::Claude;
+
+    let cmds = awaiting_as(&mut scene, 1, Some(AgentKind::Codex));
+    // A model that holds a digit is not a family word, but it still waits for the
+    // catalog read like any Codex creation with a model: the round is asked for
+    // and the creation is held.
+    assert!(opens(&cmds).is_empty(), "{cmds:?}");
+    assert!(
+        cmds.iter()
+            .any(|cmd| matches!(cmd, Cmd::ReadCodexCatalog { .. })),
+        "{cmds:?}"
+    );
+    let held = &scene.state.codex_opens_awaiting_catalog;
+    assert_eq!(held.len(), 1);
+    let Cmd::OpenEmbedded {
+        target,
+        brigade,
+        model,
+        effort,
+        permission_mode,
+        disallowed_tools,
+        first_prompt,
+        ..
+    } = &held[0].open
+    else {
+        panic!("{:?}", held[0].open)
+    };
+    assert!(target.id.is_empty() && target.agent == AgentKind::Codex);
+    assert_eq!(
+        brigade,
+        &Some((1, PLANNER_TOKEN.to_string(), BrigadeRole::Planner))
+    );
+    assert_eq!(model.as_deref(), Some("gpt-5.9"));
+    assert_eq!(effort.as_deref(), Some("medium"));
+    assert_eq!((permission_mode, disallowed_tools), (&None, &None));
+    assert_eq!(first_prompt.as_deref(), Some(PLANNER_FIRST_PROMPT));
+    assert!(matches!(
+        scene
+            .state
+            .pending_opens
+            .get(&SessionKey::new_worker(1, PLANNER_TOKEN)),
+        Some(PendingOpen::BrigadeMember {
+            first_turn: Some(AgentKind::Codex),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_codex_planner_with_no_model_set_opens_at_once_on_the_operators_own_default() {
+    let mut scene = Scene::two_brigades(true);
+    scene.stage_one();
+    scene.join(1, PLANNER_NEW);
+    let cmds = awaiting_as(&mut scene, 1, Some(AgentKind::Codex));
+    let Some(Cmd::OpenEmbedded {
+        target,
+        model,
+        effort,
+        permission_mode,
+        ..
+    }) = opens(&cmds).first().copied()
+    else {
+        panic!("{cmds:?}")
+    };
+    assert_eq!(target.agent, AgentKind::Codex);
+    // Claude's built-ins (`opus`, `xhigh`, `auto`) are not Codex words.
+    assert_eq!((model, effort, permission_mode), (&None, &None, &None));
+}
+
+#[test]
+fn a_row_with_no_product_and_a_claude_row_are_both_created_on_claude() {
+    for row in [None, Some(AgentKind::ClaudeCode)] {
+        let mut scene = Scene::two_brigades(true);
+        scene.stage_one();
+        scene.join(1, PLANNER_NEW);
+        // Even a setting that names Codex does not move a Planner whose row says
+        // otherwise, or says nothing.
+        scene.brigade.planner_agent = crate::config::PlannerAgentSetting::Codex;
+        let cmds = awaiting_as(&mut scene, 1, row);
+        let Some(Cmd::OpenEmbedded { target, model, .. }) = opens(&cmds).first().copied() else {
+            panic!("{cmds:?}")
+        };
+        assert_eq!(target.agent, AgentKind::ClaudeCode, "{row:?}");
+        assert_eq!(model.as_deref(), Some("opus"), "{row:?}");
+    }
+}
+
+#[test]
+fn an_old_capture_of_a_planner_candidate_without_a_product_still_reads() {
+    // A recorded event stream from before the field existed.
+    let json = r#"{"brigade_id":1,"cwd":"/work/alpha","roster":["director","planner"]}"#;
+    let candidate: PlannerSpawnCandidate = serde_json::from_str(json).unwrap();
+    assert_eq!(candidate.agent, None);
 }
 
 #[test]

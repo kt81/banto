@@ -505,6 +505,11 @@ Never commit these files.
   `reasoning_output_tokens` (read on three rollouts on 2026-11-19; one of them had no `effort`
   in the first `turn_context`). No script reads them yet. Only `consult_report.py` reads
   Codex rollouts, and only for Goinkyo consultations.
+- **A Codex Planner.** `[brigade] planner_agent` can put the Planner on Codex, and the
+  Plan metrics (`plan_metrics.py` and the Planner rows of the reports) read Claude Code
+  transcripts only: a Codex Planner's turns, its tokens and its `write_plan` calls are not
+  counted, and the "Planner inputs" figure leaves it out. The Plan itself is still stored
+  and exported by banto, so what the Plan says is not missing; what the Planner cost is.
 - **A Goinkyo from before Claude Code 2.1.265.** It left no system-prompt snapshot, so it
   reads as a worker. `usage_whatif.py` and `ac_measure.py` treat a recognised Goinkyo as
   neither a Worker nor a Director.

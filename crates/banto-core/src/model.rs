@@ -476,7 +476,7 @@ pub enum BrigadeRole {
     /// never a broadcast recipient.
     Goinkyo,
     /// Works a Plan out with the operator, who talks to it directly. Opened by
-    /// the Director's `open_planner` (Claude only), addressable only by name and
+    /// the Director's `open_planner` (on Claude or Codex, by `planner_agent`), addressable only by name and
     /// only by the Director, never a broadcast recipient. Its member row
     /// disappears only in the transaction that closes its Plan.
     Planner,

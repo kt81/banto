@@ -27,7 +27,7 @@ const CODEX_MEMBER_TOOLS: [&str; 4] = [
 /// would only get it a tool error. The list was once a fixed sentence naming the
 /// three above, and the four Director tools added after it never reached it, so a
 /// Codex Director had no name to call them by; a test in `crate::mcp` now checks
-/// every advertised tool against these two lists.
+/// every advertised tool against these lists and [`CODEX_PLANNER_TOOLS`].
 const CODEX_DIRECTOR_TOOLS: [&str; 8] = [
     "mcp__banto__request_decision",
     "mcp__banto__name_member",
@@ -38,6 +38,11 @@ const CODEX_DIRECTOR_TOOLS: [&str; 8] = [
     "mcp__banto__open_planner",
     "mcp__banto__close_planner",
 ];
+
+/// The tools only the Planner may call, named to a Codex Planner as the Director's
+/// are to a Codex Director. A list of its own because no other role is told these:
+/// calling one would only get it a tool error.
+const CODEX_PLANNER_TOOLS: [&str; 2] = ["mcp__banto__write_plan", "mcp__banto__release_plan"];
 
 /// Facts a Codex member needs that a Claude one does not, appended to the
 /// operator's own template by [`with_codex_addendum`].
@@ -63,8 +68,10 @@ const CODEX_DIRECTOR_TOOLS: [&str; 8] = [
 /// facts they should not have to know or maintain.
 fn codex_addendum(role: BrigadeRole) -> String {
     let mut tools = CODEX_MEMBER_TOOLS.to_vec();
-    if role == BrigadeRole::Director {
-        tools.extend(CODEX_DIRECTOR_TOOLS);
+    match role {
+        BrigadeRole::Director => tools.extend(CODEX_DIRECTOR_TOOLS),
+        BrigadeRole::Planner => tools.extend(CODEX_PLANNER_TOOLS),
+        BrigadeRole::Worker | BrigadeRole::Goinkyo => {}
     }
     let named: Vec<String> = tools.iter().map(|tool| format!("`{tool}`")).collect();
     let (last, rest) = named.split_last().expect("every role may call a tool");
@@ -261,6 +268,16 @@ pub(crate) fn director_planner_paragraph(setting: PlannerSetting) -> &'static st
 /// give the role any text, and the paragraph does not outlive it: Claude then
 /// gets no flag at all, Codex only the addendum. Workers and the Goinkyo never
 /// get a paragraph.
+///
+/// A Planner is composed differently, and the same on both products: its template
+/// is rendered with no roster and no request (a Planner has no peer but the
+/// Director, and its request is a file, not a placeholder), and banto's own
+/// paragraph ([`planner_paragraph`]) follows it *always*, an empty template
+/// included, because the facts in it are ones the operator has no reason to know.
+/// `request` is then the request file's path, and without one the paragraph
+/// keeps its rules and drops only the sentences that point at the file. The Claude launch does not
+/// reach this through `--append-system-prompt`; [`planner_system_prompt`] hands it
+/// the whole text as a file.
 pub(crate) fn compose(
     brigade: &BrigadeConfig,
     agent: AgentKind,
@@ -270,6 +287,9 @@ pub(crate) fn compose(
     peers: &[String],
     request: Option<&str>,
 ) -> Option<String> {
+    if role == BrigadeRole::Planner {
+        return compose_planner(brigade, agent, brigade_id, token, request);
+    }
     let rendered = brigade
         .prompt_for(role)
         .map(|template| render(template, brigade_id, token, peers, request));
@@ -291,19 +311,56 @@ pub(crate) fn compose(
     }
 }
 
-/// What banto adds to the Planner's system prompt after the operator's own role
+/// What banto adds to the Planner's instructions after the operator's own role
 /// text (`[brigade] planner_prompt`), always, even when that text is empty: the
 /// facts the Planner cannot work without and the operator has no reason to know.
 /// `request_path` is the request file, written with forward slashes whatever the
 /// platform: the path travels through a model that reads a backslash as an escape.
-fn planner_paragraph(request_path: &str) -> String {
+///
+/// The two products differ in the first-turn paragraph only. A Claude Planner's
+/// banto tools are not connected on its first turn, so it must read the file
+/// first. A Codex Planner's may or may not be: its MCP server starts with the
+/// session in a race with the first turn (measured on Codex 0.172.0: ready after
+/// about 1.8 s in one start, still not visible after 10 s in another), so it is
+/// told they may be absent and to go on from the file. And Codex cuts what a tool
+/// returns at about 40,000 bytes without saying so, while the request file holds
+/// up to 20,000 characters each of the request and of what the Director knew, so
+/// the Codex paragraph says a file may not come back whole in one read.
+///
+/// The two sentences `tools/measure/transcripts.py` recognises a Planner by (the
+/// opening one, and the one that starts "Write the Plan with write_plan") are the
+/// same on both products, byte for byte.
+///
+/// Without a path (`None`) only what points at the file is left out: the rules for
+/// `write_plan`, approval and `send_to_peer` hold whether or not banto knows where
+/// the request is, so they stay.
+fn planner_paragraph(agent: AgentKind, request_path: Option<&str>) -> String {
+    let path = request_path.map(|path| path.replace('\\', "/"));
+    let opening = match (agent, path) {
+        (AgentKind::ClaudeCode, Some(path)) => format!(
+            "The operator's request is in the file {path}. Your banto tools are not connected \
+             during your first turn, so read that file with Read before anything else. "
+        ),
+        (AgentKind::ClaudeCode, None) => {
+            "Your banto tools are not connected during your first turn. ".to_string()
+        }
+        (AgentKind::Codex, Some(path)) => format!(
+            "The operator's request is in the file {path}. Read it before anything else. A file \
+             may not come back whole in one read: read it to the end, in ranges. Your banto \
+             tools may not be connected yet during your first turn. "
+        ),
+        (AgentKind::Codex, None) => {
+            "Your banto tools may not be connected yet during your first turn. ".to_string()
+        }
+    };
+    let first_turn = format!(
+        "{opening}From your second turn on, read_plan shows you the Plan as banto holds it, \
+         your own drafts included. If on a later turn banto's tools are still not visible to \
+         you, tell the operator so; do not write the Plan into your answer instead."
+    );
     format!(
         "banto runs this pane and adds the following to the text above.\n\n\
-         The operator's request is in the file {path}. Your banto tools are not connected \
-         during your first turn, so read that file with Read before anything else. From your \
-         second turn on, read_plan shows you the Plan as banto holds it, your own drafts \
-         included. If on a later turn banto's tools are still not visible to you, tell the \
-         operator so; do not write the Plan into your answer instead.\n\n\
+         {first_turn}\n\n\
          Write the Plan with write_plan, once per version, in the operator's language: each \
          call is a new version and nothing is in force until the operator approves one. They \
          approve the version they are reading with the key A on banto's reading screen (F5); \
@@ -313,29 +370,55 @@ fn planner_paragraph(request_path: &str) -> String {
          send_to_peer reaches the Director, with `to` set to \"director\", and nobody else. \
          Use it for what only the Director can answer or must know: a question about the \
          brigade's work, or a Plan that cannot be made as asked. Do not use it to report \
-         progress to the operator: they are in this pane.",
-        path = request_path.replace('\\', "/")
+         progress to the operator: they are in this pane."
     )
 }
 
-/// The Planner's whole system prompt, which replaces Claude's own
-/// (`--system-prompt-file`): the operator's role text rendered, then banto's
-/// paragraph. A Planner is given no `--append-system-prompt` briefing, so
-/// [`compose`] is not used for it.
+/// A Planner's instructions, as [`compose`] says: the operator's text rendered with
+/// no roster, then [`planner_paragraph`] (with its file sentences only when the
+/// request file's path is known), then on Codex, last, the addendum. Never `None`
+/// for a Planner: the paragraph is always there.
+fn compose_planner(
+    brigade: &BrigadeConfig,
+    agent: AgentKind,
+    brigade_id: BrigadeId,
+    token: &str,
+    request_path: Option<&str>,
+) -> Option<String> {
+    let mut text = brigade
+        .prompt_for(BrigadeRole::Planner)
+        .map(|template| render(template, brigade_id, token, &[], None))
+        .unwrap_or_default();
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str(&planner_paragraph(agent, request_path));
+    match agent {
+        AgentKind::Codex => Some(with_codex_addendum(&text, BrigadeRole::Planner)),
+        AgentKind::ClaudeCode => (!text.is_empty()).then_some(text),
+    }
+}
+
+/// A Claude Planner's whole system prompt, which replaces Claude's own
+/// (`--system-prompt-file`). A Planner is given no `--append-system-prompt`
+/// briefing, so what the emporium's `member_briefing` returns for it is `None` and
+/// nothing is said twice; a Codex Planner's text reaches it through the hook
+/// instead, composed by the same [`compose`].
 pub(crate) fn planner_system_prompt(
     brigade: &BrigadeConfig,
     brigade_id: BrigadeId,
     request_path: &str,
 ) -> String {
-    let mut text = brigade
-        .prompt_for(BrigadeRole::Planner)
-        .map(|template| render(template, brigade_id, PLANNER_TOKEN, &[], None))
-        .unwrap_or_default();
-    if !text.is_empty() {
-        text.push_str("\n\n");
-    }
-    text.push_str(&planner_paragraph(request_path));
-    text
+    compose(
+        brigade,
+        AgentKind::ClaudeCode,
+        BrigadeRole::Planner,
+        brigade_id,
+        PLANNER_TOKEN,
+        &[],
+        Some(request_path),
+    )
+    .expect("a path was given, so the paragraph is there")
 }
 
 /// [`compose`] for a Claude member, as a pattern to compare a recorded briefing
@@ -1296,7 +1379,11 @@ mod tests {
 
     #[test]
     fn the_last_sentence_is_the_one_the_dedupe_recognises() {
-        for role in [BrigadeRole::Director, BrigadeRole::Worker] {
+        for role in [
+            BrigadeRole::Director,
+            BrigadeRole::Worker,
+            BrigadeRole::Planner,
+        ] {
             assert!(with_codex_addendum("x", role).ends_with(BRIEFING_LAST_SENTENCE));
             assert!(with_codex_addendum("", role).ends_with(BRIEFING_LAST_SENTENCE));
         }
@@ -1336,12 +1423,183 @@ mod tests {
     }
 
     #[test]
-    fn the_planner_is_told_its_banto_tools_are_absent_on_the_first_turn() {
-        let text = planner_paragraph("/r.md");
+    fn a_claude_planner_is_told_its_banto_tools_are_absent_on_the_first_turn() {
+        let text = planner_paragraph(AgentKind::ClaudeCode, Some("/r.md"));
         assert!(
             text.contains("not connected during your first turn")
                 && text.contains("read that file with Read"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_codex_planner_is_told_they_may_be_absent_and_to_read_the_file_to_its_end() {
+        let text = planner_paragraph(AgentKind::Codex, Some("/r.md"));
+        assert!(text.contains("may not be connected yet"), "{text}");
+        assert!(
+            !text.contains("not connected during your first turn"),
+            "{text}"
+        );
+        assert!(!text.contains("with Read"), "{text}");
+        assert!(text.contains("to the end, in ranges"), "{text}");
+    }
+
+    /// `tools/measure/transcripts.py` tells a Planner session from any other by
+    /// these two sentences in the first prompt snapshot, so they are the same on
+    /// both products: a change to either is a change there too.
+    #[test]
+    fn the_sentences_the_measurement_scripts_recognise_a_planner_by_are_on_both_products() {
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+            let text = planner_paragraph(agent, Some("/r.md"));
+            assert!(
+                text.contains("banto runs this pane and adds the following to the text above."),
+                "{agent:?}"
+            );
+            assert!(
+                text.contains(
+                    "Write the Plan with write_plan, once per version, in the operator's language:"
+                ),
+                "{agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_codex_planners_briefing_is_the_operators_text_the_paragraph_then_the_addendum_last() {
+        let brigade = BrigadeConfig {
+            planner_prompt: "You plan work for brigade {brigade}. Peers: {peers}.".to_string(),
+            ..Default::default()
+        };
+        let briefing = |peers: &[String]| {
+            compose(
+                &brigade,
+                AgentKind::Codex,
+                BrigadeRole::Planner,
+                7,
+                "planner",
+                peers,
+                Some(r"C:\data\planner\7.txt"),
+            )
+            .unwrap()
+        };
+        let out = briefing(&["worker-9".to_string()]);
+        assert!(
+            out.starts_with("You plan work for brigade 7. Peers: "),
+            "{out}"
+        );
+        assert!(out.contains("C:/data/planner/7.txt"), "{out}");
+        // No roster: the Planner's only peer is the Director, so a template that
+        // asks for {peers} gets the same text whatever the roster is.
+        assert!(!out.contains("worker-9"), "{out}");
+        assert_eq!(
+            out,
+            briefing(&["worker-3".to_string(), "worker-4".to_string()])
+        );
+        let paragraph_at = out.find("banto runs this pane").unwrap();
+        let addendum_at = out.find("banto's tools are not listed").unwrap();
+        assert!(paragraph_at < addendum_at);
+        assert!(out.ends_with(BRIEFING_LAST_SENTENCE));
+    }
+
+    /// An unknown request path takes away the sentences that name the file and
+    /// nothing else: the write_plan, approval and send_to_peer rules stay, on both
+    /// products, so a Planner is never left without them.
+    #[test]
+    fn without_a_request_path_the_paragraph_keeps_its_rules_and_drops_only_the_file() {
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+            let text = planner_paragraph(agent, None);
+            assert!(!text.contains("request is in the file"), "{agent:?} {text}");
+            assert!(!text.contains("with Read"), "{agent:?} {text}");
+            assert!(!text.contains("in ranges"), "{agent:?} {text}");
+            for kept in [
+                "banto runs this pane and adds the following to the text above.",
+                "Write the Plan with write_plan, once per version",
+                "release_plan",
+                "send_to_peer reaches the Director",
+                "read_plan shows you the Plan",
+            ] {
+                assert!(text.contains(kept), "{agent:?} {kept}");
+            }
+            let brigade = BrigadeConfig::default();
+            let out = compose(
+                &brigade,
+                agent,
+                BrigadeRole::Planner,
+                1,
+                "planner",
+                &[],
+                None,
+            )
+            .expect("a Planner always has instructions");
+            assert!(out.contains("Write the Plan with write_plan"), "{agent:?}");
+            if agent == AgentKind::Codex {
+                assert!(out.ends_with(BRIEFING_LAST_SENTENCE));
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_planner_prompt_still_gets_banto_paragraph_on_codex() {
+        let brigade = BrigadeConfig {
+            planner_prompt: String::new(),
+            ..Default::default()
+        };
+        let out = compose(
+            &brigade,
+            AgentKind::Codex,
+            BrigadeRole::Planner,
+            1,
+            "planner",
+            &[],
+            Some("/data/planner/1.txt"),
+        )
+        .unwrap();
+        assert!(out.starts_with("banto runs this pane"), "{out}");
+        assert!(out.ends_with(BRIEFING_LAST_SENTENCE));
+    }
+
+    #[test]
+    fn a_codex_planner_is_named_its_own_tools_and_nobody_else_is() {
+        let planner = with_codex_addendum("", BrigadeRole::Planner);
+        for tool in CODEX_PLANNER_TOOLS {
+            assert!(planner.contains(tool), "{tool}");
+        }
+        for tool in CODEX_DIRECTOR_TOOLS {
+            assert!(!planner.contains(tool), "{tool}");
+        }
+        for role in [
+            BrigadeRole::Director,
+            BrigadeRole::Worker,
+            BrigadeRole::Goinkyo,
+        ] {
+            let text = with_codex_addendum("", role);
+            for tool in CODEX_PLANNER_TOOLS {
+                assert!(!text.contains(tool), "{role:?} {tool}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_codex_planner_briefing_stays_under_the_spill_budget() {
+        // The same limit as the Director's test above: Codex stores a hook's
+        // context over about 10,000 bytes as a truncated preview that can never be
+        // matched again. The shipped template, the longest path the data directory
+        // can make, and the addendum.
+        let long_path = format!(
+            "C:/Users/{}/AppData/Local/banto/mcp/planner/123456789.txt",
+            "x".repeat(40)
+        );
+        let out = compose(
+            &BrigadeConfig::default(),
+            AgentKind::Codex,
+            BrigadeRole::Planner,
+            123_456_789,
+            "planner",
+            &[],
+            Some(&long_path),
+        )
+        .unwrap();
+        eprintln!("codex planner briefing: {} bytes", out.len());
+        assert!(out.len() < 9_900, "{} bytes", out.len());
     }
 }

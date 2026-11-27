@@ -66,7 +66,8 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use banto_core::config::{
-    CodexHookFacts, GoinkyoAgentSetting, GoinkyoRefusal, goinkyo_refusal, resolve_goinkyo_agent,
+    CodexHookFacts, GoinkyoAgentSetting, GoinkyoRefusal, PlannerAgentSetting, goinkyo_refusal,
+    resolve_goinkyo_agent, resolve_planner_agent,
 };
 use banto_core::consultation::check_title;
 use banto_core::model::{
@@ -169,14 +170,17 @@ struct GateState {
     capped_written: bool,
 }
 
-/// The settings `consult_goinkyo` resolves the Goinkyo's product from, as the
-/// parent banto handed them to this process at start. A config edited after
-/// that is not seen here, which is why the product is written on the member row
-/// and the engine reads it from there rather than resolving it a second time.
+/// The settings `consult_goinkyo` and `open_planner` resolve the Goinkyo's and the
+/// Planner's product from, as the parent banto handed them to this process at
+/// start. A config edited after that is not seen here, which is why the product is
+/// written on the member row and the engine reads it from there rather than
+/// resolving it a second time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoinkyoPolicy {
     /// `[brigade] goinkyo_agent`.
     pub setting: GoinkyoAgentSetting,
+    /// `[brigade] planner_agent`.
+    pub planner_setting: PlannerAgentSetting,
     /// The products the `agents` setting enables.
     pub enabled: BTreeSet<AgentKind>,
     /// Whether banto's own path can sit in a Codex hook command. Read from this
@@ -190,6 +194,7 @@ impl Default for GoinkyoPolicy {
     fn default() -> Self {
         Self {
             setting: GoinkyoAgentSetting::default(),
+            planner_setting: PlannerAgentSetting::default(),
             enabled: AgentKind::ALL.into_iter().collect(),
             hook_launchable: true,
         }
@@ -631,14 +636,16 @@ fn tools_list_result() -> Value {
             },
             {
                 "name": "open_planner",
-                "description": "Director only. Open the brigade's Planner: a Claude session \
-                                that works out a Plan (what to build, how far, and when it is \
+                "description": "Director only. Open the brigade's Planner: a session that \
+                                works out a Plan (what to build, how far, and when it is \
                                 done) with the operator, in its own pane, and writes it down \
                                 for the operator's approval. Pass the operator's words in \
                                 `request` verbatim and what you already know in `known`; the \
                                 Planner reads them from a file on its first turn. Fails while \
-                                the brigade has a Planner or an open Plan, or when Claude is \
-                                not available. send_to_peer(to: \"planner\") reaches it. Do not \
+                                the brigade has a Planner or an open Plan, or when the product \
+                                it would run on is not available (the operator's `[brigade] \
+                                planner_agent` decides which). send_to_peer(to: \"planner\") \
+                                reaches it. Do not \
                                 instruct it while it plans: it asks the operator itself. Write \
                                 to it only to answer a check it asked for, to propose an \
                                 amendment, or to pass on a review finding, several together in \
@@ -2980,27 +2987,62 @@ fn parse_progress_args(msg: &Value) -> Result<Progress, String> {
 }
 
 /// Why a Planner cannot be opened, written for a Director that can change none of
-/// it and must pass it on. Only the two conditions a Claude session can fail are
-/// reachable; the Codex ones are named so that a new refusal is a compile error
-/// here and not a silent "unknown".
-fn planner_refusal_message(refusal: GoinkyoRefusal) -> String {
+/// it and must pass it on: which condition failed, why this product was the one,
+/// and what the operator can change. The wording follows
+/// [`goinkyo_refusal_message`], with `planner_agent` where that says
+/// `goinkyo_agent`.
+fn planner_refusal_message(
+    refusal: GoinkyoRefusal,
+    setting: PlannerAgentSetting,
+    product: AgentKind,
+) -> String {
+    let name = product.label();
+    let why = match setting {
+        PlannerAgentSetting::Inherit => format!(
+            "`[brigade] planner_agent` is \"inherit\", so it follows this Director's product, {name}"
+        ),
+        PlannerAgentSetting::Claude => "`[brigade] planner_agent` is \"claude\"".to_string(),
+        PlannerAgentSetting::Codex => "`[brigade] planner_agent` is \"codex\"".to_string(),
+    };
     let (failed, remedy) = match refusal {
         GoinkyoRefusal::NotEnabled(_) => (
-            "the `agents` setting does not enable Claude Code",
-            "The operator can add it to `agents` in banto's config.toml.",
+            format!("the `agents` setting does not enable {name}"),
+            "The operator can add it to `agents` in banto's config.toml, or set \
+             `[brigade] planner_agent` to a product `agents` does enable."
+                .to_string(),
         ),
-        GoinkyoRefusal::HomeUnresolved(_) => (
-            "banto found no Claude home directory",
-            "The operator can point banto at it (`--claude-home`, or `claude_home` in config.toml).",
+        GoinkyoRefusal::HomeUnresolved(_) => {
+            let flag = product.as_token();
+            (
+                format!("banto found no {name} home directory"),
+                format!(
+                    "The operator can point banto at it (`--{flag}-home`, or `{flag}_home` in \
+                     config.toml), or set `[brigade] planner_agent` to a product whose home \
+                     banto has."
+                ),
+            )
+        }
+        GoinkyoRefusal::CodexHookNotLaunchable => (
+            "banto's own path contains a space, which Codex cannot launch a hook from, so a \
+             Codex Planner would start without its instructions and without saying so"
+                .to_string(),
+            "The operator can move banto to a path without a space and restart it, or set \
+             `[brigade] planner_agent = \"claude\"`."
+                .to_string(),
         ),
-        GoinkyoRefusal::CodexHookNotLaunchable | GoinkyoRefusal::CodexHookNotPrimed => (
-            "a Codex condition failed, which a Planner never depends on",
-            "This is a banto defect: tell the operator.",
+        GoinkyoRefusal::CodexHookNotPrimed => (
+            "Codex has not been asked to trust banto's SessionStart hook, so a Codex Planner \
+             would start without its instructions and without saying so"
+                .to_string(),
+            "The operator can approve the hook once in banto's Codex trust pane, which opens \
+             when a brigade that has a Codex member is formed, or set `[brigade] \
+             planner_agent = \"claude\"`."
+                .to_string(),
         ),
     };
     format!(
-        "open_planner refused: a Planner runs as Claude Code, but {failed}. {remedy} Nothing \
-         was filed. Tell the operator, then call open_planner again."
+        "open_planner refused: this Planner would run as {name} ({why}), but {failed}. \
+         {remedy} Nothing was filed. Tell the operator, then call open_planner again."
     )
 }
 
@@ -3039,16 +3081,19 @@ fn tool_open_planner(ctx: &mut ServerContext, msg: &Value) -> Value {
     if role != BrigadeRole::Director {
         return tool_error("open_planner may only be called by a Director.");
     }
-    match ctx.store.brigade_members(brigade) {
+    let director_agent = match ctx.store.brigade_members(brigade) {
         Ok(members) if members.iter().any(|m| m.role == BrigadeRole::Planner) => {
             return tool_error(
                 "This brigade already has a Planner. Only one plans at a time: call \
                  close_planner to end the current Plan first.",
             );
         }
-        Ok(_) => {}
+        Ok(members) => members
+            .iter()
+            .find(|m| m.role == BrigadeRole::Director)
+            .and_then(|m| m.agent),
         Err(err) => return tool_error(&format!("failed to read the brigade roster: {err}")),
-    }
+    };
     match ctx.store.open_plan_view(brigade) {
         Ok(Some(view)) => {
             return tool_error(&format!(
@@ -3060,8 +3105,17 @@ fn tool_open_planner(ctx: &mut ServerContext, msg: &Value) -> Value {
         Ok(None) => {}
         Err(err) => return tool_error(&format!("failed to read the open Plan: {err}")),
     }
-    if let Some(refusal) = goinkyo_launch_refusal(ctx, AgentKind::ClaudeCode) {
-        return tool_error(&planner_refusal_message(refusal));
+    // The product is fixed here, on the Planner's row, and the row stays the
+    // authority until the Plan closes: a config edited later moves no open Planner.
+    // A Director row with no product is a Claude one (a row from before banto
+    // recorded it, and Claude was then the only product), unlike the Goinkyo's
+    // `goinkyo_product`, which declines to guess: a Planner is opened by a
+    // Director that is running and has been written on, and the engine has no
+    // Director session to resolve it from afterwards.
+    let setting = ctx.goinkyo_policy.planner_setting;
+    let product = resolve_planner_agent(setting, director_agent);
+    if let Some(refusal) = goinkyo_launch_refusal(ctx, product) {
+        return tool_error(&planner_refusal_message(refusal, setting, product));
     }
 
     let title = match require_string_arg(msg, "title") {
@@ -3096,7 +3150,7 @@ fn tool_open_planner(ctx: &mut ServerContext, msg: &Value) -> Value {
     }
     match ctx
         .store
-        .open_planner(brigade, &token, &title, &request, AgentKind::ClaudeCode)
+        .open_planner(brigade, &token, &title, &request, product)
     {
         Ok(OpenedPlanner::Opened { number }) => tool_text(
             format!(
@@ -3962,11 +4016,14 @@ mod tests {
             let director = crate::briefing::with_codex_addendum("", BrigadeRole::Director);
             let worker = crate::briefing::with_codex_addendum("", BrigadeRole::Worker);
             let called = format!("`mcp__banto__{name}`");
-            // The Planner is a Claude session, so no Codex briefing names its tools.
+            // A Planner may run on Codex, so its tools are named to a Codex Planner
+            // and to nobody else.
             if description.starts_with("Planner only.") {
+                let planner = crate::briefing::with_codex_addendum("", BrigadeRole::Planner);
+                assert!(planner.contains(&called), "a Planner must be told {name}");
                 assert!(
                     !director.contains(&called) && !worker.contains(&called),
-                    "{name} is for the Planner alone, and no Codex briefing names it"
+                    "{name} is for the Planner alone, and no other Codex briefing names it"
                 );
                 continue;
             }
@@ -8076,6 +8133,7 @@ mod tests {
         ctx.codex_home = codex_home.map(|dir| CodexHome::new(dir.to_path_buf()));
         ctx.goinkyo_policy = GoinkyoPolicy {
             setting,
+            planner_setting: PlannerAgentSetting::default(),
             enabled: enabled.iter().copied().collect(),
             hook_launchable: true,
         };
@@ -9101,7 +9159,8 @@ enabled = true
         let (failed, text) = run_tool(&mut ctx, "open_planner", open_args());
         assert!(failed, "{text}");
         assert!(
-            text.contains("`agents` setting does not enable Claude Code"),
+            text.contains("`agents` setting does not enable Claude")
+                && text.contains("`[brigade] planner_agent`"),
             "{text}"
         );
         assert!(!has_planner_row(&ctx));
@@ -9122,6 +9181,124 @@ enabled = true
             request,
             "a refused call does not overwrite a running Planner's request"
         );
+    }
+
+    fn planner_row_agent(ctx: &ServerContext) -> Option<Option<AgentKind>> {
+        ctx.store
+            .brigade_members(1)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.role == BrigadeRole::Planner)
+            .map(|m| m.agent)
+    }
+
+    /// `planner_world` with `planner_agent` set, the Director's own row recording
+    /// `director` (none when `None`), both products enabled, and a Codex home whose
+    /// hook is trusted.
+    fn planner_policy_world(
+        setting: PlannerAgentSetting,
+        director: Option<AgentKind>,
+        codex_home: &Path,
+    ) -> (ServerContext, tempfile::TempDir) {
+        let (mut ctx, tmp) = planner_world();
+        if let Some(agent) = director {
+            ctx.store.set_member_agent(1, "director", agent).unwrap();
+        }
+        ctx.codex_home = Some(CodexHome::new(codex_home.to_path_buf()));
+        ctx.goinkyo_policy.planner_setting = setting;
+        ctx.goinkyo_policy.enabled = BOTH.into_iter().collect();
+        (ctx, tmp)
+    }
+
+    #[test]
+    fn open_planner_records_the_resolved_product_on_the_planners_row() {
+        use PlannerAgentSetting::{Claude, Codex, Inherit};
+        let primed = codex_home_with(Some(PRIMED_CODEX_CONFIG));
+        for (setting, director, expected) in [
+            (Inherit, Some(AgentKind::ClaudeCode), AgentKind::ClaudeCode),
+            (Inherit, Some(AgentKind::Codex), AgentKind::Codex),
+            // A Director row that names no product is a Claude one.
+            (Inherit, None, AgentKind::ClaudeCode),
+            (Claude, Some(AgentKind::Codex), AgentKind::ClaudeCode),
+            (Codex, Some(AgentKind::ClaudeCode), AgentKind::Codex),
+        ] {
+            let (mut ctx, _tmp) = planner_policy_world(setting, director, primed.path());
+            let (failed, text) = run_tool(&mut ctx, "open_planner", open_args());
+            assert!(!failed, "{setting:?} under {director:?}: {text}");
+            assert_eq!(
+                planner_row_agent(&ctx),
+                Some(Some(expected)),
+                "{setting:?} under {director:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_planner_that_cannot_run_on_its_product_is_refused_by_name_and_files_nothing() {
+        use PlannerAgentSetting::{Codex, Inherit};
+        let primed = codex_home_with(Some(PRIMED_CODEX_CONFIG));
+        let untrusted = codex_home_with(None);
+
+        // `inherit` under a Codex Director, with Codex not enabled.
+        let (mut ctx, tmp) = planner_policy_world(Inherit, Some(AgentKind::Codex), primed.path());
+        ctx.goinkyo_policy.enabled = [AgentKind::ClaudeCode].into_iter().collect();
+        let (failed, text) = run_tool(&mut ctx, "open_planner", open_args());
+        assert!(failed, "{text}");
+        for expected in [
+            "open_planner refused",
+            "this Planner would run as Codex",
+            "`[brigade] planner_agent` is \"inherit\"",
+            "the `agents` setting does not enable Codex",
+            "Nothing was filed",
+        ] {
+            assert!(text.contains(expected), "{expected:?} missing from: {text}");
+        }
+        assert!(!has_planner_row(&ctx));
+        assert!(!tmp.path().join("mcp").exists());
+
+        // No Codex home resolved.
+        let (mut ctx, tmp) = planner_policy_world(Codex, None, primed.path());
+        ctx.codex_home = None;
+        let (failed, text) = run_tool(&mut ctx, "open_planner", open_args());
+        assert!(failed, "{text}");
+        assert!(
+            text.contains("banto found no Codex home directory"),
+            "{text}"
+        );
+        assert!(text.contains("planner_agent"), "{text}");
+        assert!(!has_planner_row(&ctx));
+        assert!(!tmp.path().join("mcp").exists());
+
+        // The hook is not trusted: a Codex Planner would start without its
+        // instructions and say nothing.
+        let (mut ctx, tmp) = planner_policy_world(Codex, None, untrusted.path());
+        let (failed, text) = run_tool(&mut ctx, "open_planner", open_args());
+        assert!(failed, "{text}");
+        assert!(
+            text.contains("Codex has not been asked to trust banto's SessionStart hook"),
+            "{text}"
+        );
+        assert!(text.contains("a Codex Planner"), "{text}");
+        assert!(!has_planner_row(&ctx));
+        assert!(!tmp.path().join("mcp").exists());
+
+        // Trusted, but banto's path cannot sit in a hook command.
+        let (mut ctx, _tmp) = planner_policy_world(Codex, None, primed.path());
+        ctx.goinkyo_policy.hook_launchable = false;
+        let (failed, text) = run_tool(&mut ctx, "open_planner", open_args());
+        assert!(failed, "{text}");
+        assert!(text.contains("banto's own path contains a space"), "{text}");
+        assert!(!has_planner_row(&ctx));
+
+        // A Claude Planner does not care about the Codex hook.
+        let (mut ctx, _tmp) = planner_policy_world(
+            PlannerAgentSetting::Claude,
+            Some(AgentKind::Codex),
+            untrusted.path(),
+        );
+        ctx.goinkyo_policy.hook_launchable = false;
+        let (failed, text) = run_tool(&mut ctx, "open_planner", open_args());
+        assert!(!failed, "{text}");
     }
 
     #[test]

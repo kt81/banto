@@ -333,6 +333,71 @@ impl<'de> Deserialize<'de> for GoinkyoAgentSetting {
     }
 }
 
+/// Which product a Planner runs as — `[brigade] planner_agent` in config.toml, the
+/// Goinkyo's `goinkyo_agent` with the same three words. The built-in is
+/// [`Self::Inherit`], the Director's own product, and a Director row with no
+/// product is Claude, which is what every Planner was before the key existed.
+///
+/// Read once, when `open_planner` files the Planner: the product is then written
+/// on the Planner's member row, and the row stays the authority until the Plan
+/// closes, so editing this setting never moves a Planner that is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlannerAgentSetting {
+    /// The Director's own product. The built-in.
+    #[default]
+    Inherit,
+    /// Claude Code, whatever the Director runs.
+    Claude,
+    /// Codex, whatever the Director runs.
+    Codex,
+}
+
+impl PlannerAgentSetting {
+    /// Parses `[brigade] planner_agent`'s raw string like
+    /// [`GoinkyoAgentSetting::parse`]: case-insensitive, whitespace-trimmed, and
+    /// `None` for anything else, an empty string included.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "inherit" => Some(Self::Inherit),
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PlannerAgentSetting {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).ok_or_else(|| {
+            not_accepted(
+                "planner_agent",
+                &raw,
+                "\"inherit\", \"claude\" or \"codex\"",
+            )
+        })
+    }
+}
+
+/// The product a Planner runs as, given the operator's setting and the product of
+/// the Director that opens it. `open_planner` is the one caller: it records the
+/// answer on the Planner's row, and the engine reads the row, so a config edited
+/// afterwards cannot send a launch somewhere the refusal never looked. A Director
+/// whose row names no product is Claude, as it was before rows recorded one.
+pub fn resolve_planner_agent(
+    setting: PlannerAgentSetting,
+    director: Option<AgentKind>,
+) -> AgentKind {
+    match setting {
+        PlannerAgentSetting::Inherit => director.unwrap_or(AgentKind::ClaudeCode),
+        PlannerAgentSetting::Claude => AgentKind::ClaudeCode,
+        PlannerAgentSetting::Codex => AgentKind::Codex,
+    }
+}
+
 /// `[brigade.claude]`: the settings that only mean something to Claude Code.
 /// Every one is optional: an absent key defers to the legacy flat `[brigade]`
 /// key of the same name (see [`BrigadeConfig`]) and then to the built-in. Values
@@ -436,27 +501,33 @@ pub struct ClaudeBrigadeConfig {
     /// built-in and for the same reason: a Plan is the part of a job where a
     /// wrong turn costs the most, and a Planner is one session per Plan. On
     /// creation only, like [`Self::goinkyo_model`]. Same empty-string escape
-    /// hatch. Claude only: banto has no Codex Planner.
+    /// hatch. A Claude Planner's alone: a Codex Planner reads
+    /// [`CodexBrigadeConfig::planner_model`].
     pub planner_model: Option<String>,
     /// `--effort <level>` a Planner is created with, built-in `"xhigh"`, on
-    /// creation only. See [`Self::goinkyo_effort`] for why not `max`.
+    /// creation only. See [`Self::goinkyo_effort`] for why not `max`. A Codex
+    /// Planner reads [`CodexBrigadeConfig::planner_effort`] instead.
     pub planner_effort: Option<String>,
     /// `--permission-mode <mode>` a Planner launches with on every launch, built-in
     /// `"auto"`. The operator is at a Planner's keyboard, but not at the moment a
     /// relay wake or a first turn starts it, and a `manual` prompt on a read would
-    /// stop the very first turn. Same empty-string escape hatch.
+    /// stop the very first turn. Same empty-string escape hatch. A Claude flag: a
+    /// Codex Planner is held by Codex's own sandbox flags instead
+    /// (`launch::GOINKYO_CODEX_POLICY`).
     pub planner_permission_mode: Option<String>,
     /// `--tools <list>` a Planner launches with on every launch, built-in
     /// `"Read,Grep,Glob"`: it reads code to ask better questions and edits nothing.
     /// Unlike the Goinkyo's `--disallowedTools` this is an allowlist of what exists
     /// at all, so Bash is not there to be reached for. Passed on as written; an
     /// empty string passes no flag, which gives the Planner every tool Claude has.
+    /// A Codex Planner has no such list and keeps Codex's shell (its only way to
+    /// read code), held read-only by the sandbox.
     pub planner_tools: Option<String>,
 }
 
 /// `[brigade.codex]`: the settings that only mean something to Codex. Resolved
-/// like [`ClaudeBrigadeConfig`]'s, except that its two Goinkyo keys have no
-/// legacy flat spelling, so their built-in is the empty string.
+/// like [`ClaudeBrigadeConfig`]'s, except that its Goinkyo and Planner keys have
+/// no legacy flat spelling, so their built-in is the empty string.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default)]
 pub struct CodexBrigadeConfig {
@@ -490,6 +561,14 @@ pub struct CodexBrigadeConfig {
     /// its session is first created. Built-in empty: nothing is passed. Creation
     /// only, for the reason [`Self::worker_effort`] gives. Not validated.
     pub goinkyo_effort: Option<String>,
+    /// The model a Codex Planner launches with when its session is first
+    /// created. Built-in empty, as the Goinkyo's is: no `-m`, so it starts on the
+    /// operator's own Codex default. A slug or a family word, held back for the
+    /// catalog like [`Self::goinkyo_model`]. Creation only. Not validated.
+    pub planner_model: Option<String>,
+    /// `-c model_reasoning_effort="<level>"` a Codex Planner launches with when
+    /// its session is first created. Built-in empty. Creation only. Not validated.
+    pub planner_effort: Option<String>,
 }
 
 /// Brigade formation settings.
@@ -599,6 +678,11 @@ pub struct BrigadeConfig {
     /// nothing else, never Claude's own default prompt: a Planner without a role
     /// text is still a Planner that knows how to be one, only a plainer one.
     pub planner_prompt: String,
+    /// See [`PlannerAgentSetting`]. A Codex Planner takes its model and effort from
+    /// `[brigade.codex]` ([`CodexBrigadeConfig::planner_model`],
+    /// [`CodexBrigadeConfig::planner_effort`]) and none of the Claude-only flags;
+    /// like a Codex Goinkyo it is held read-only by Codex's own sandbox flags.
+    pub planner_agent: PlannerAgentSetting,
     /// See [`GoinkyoAgentSetting`]. A Codex Goinkyo takes its model
     /// and effort from `[brigade.codex]` ([`CodexBrigadeConfig::goinkyo_model`],
     /// [`CodexBrigadeConfig::goinkyo_effort`]), never from the Claude ones, and
@@ -868,10 +952,11 @@ when you have a view.
 - Push back. If a request is bigger than it looks, contradicts something already \
 in the code, or has a cheaper shape, say so plainly and show where you saw it. \
 Agreeing quickly is not a service to the operator.
-- Read the code that the work touches, with Read, Grep and Glob, before you ask \
-what the code already answers. Search before you read: a Grep that finds the \
-three places that matter beats opening the whole directory.
-- You change nothing. You have no editing tools by design; the Workers do the \
+- Read the code that the work touches, with the tools you have for reading and \
+searching files, before you ask what the code already answers. Search before you \
+read: a search that finds the three places that matter beats opening the whole \
+directory.
+- You change nothing. You are set up read-only by design; the Workers do the \
 editing once the Plan is approved.
 - When something needs checking beyond reading, such as a build or an experiment, \
 ask the Director with send_to_peer. Each message wakes it over a long context, so \
@@ -901,6 +986,7 @@ impl Default for BrigadeConfig {
             goinkyo_prompt: DEFAULT_GOINKYO_PROMPT.to_string(),
             planner: PlannerSetting::default(),
             planner_prompt: DEFAULT_PLANNER_PROMPT.to_string(),
+            planner_agent: PlannerAgentSetting::default(),
             goinkyo_agent: GoinkyoAgentSetting::default(),
             goinkyo_model: "opus".to_string(),
             goinkyo_effort: "xhigh".to_string(),
@@ -1278,17 +1364,27 @@ impl BrigadeConfig {
         (!raw.is_empty()).then_some(raw)
     }
 
-    /// The model a Planner is created with: `[brigade.claude] planner_model`, else
-    /// `opus`; `None` for the empty-string escape hatch. A new key has no legacy
-    /// spelling to fall back on, so the built-in lives here.
-    pub fn planner_model(&self) -> Option<&str> {
-        flag_value(self.claude.planner_model.as_deref().unwrap_or("opus"))
+    /// The model a Planner running `agent` is created with. Claude's is
+    /// `[brigade.claude] planner_model`, else `opus`; Codex's is `[brigade.codex]
+    /// planner_model`, else nothing (no `-m`, the operator's own default), as a
+    /// Codex Goinkyo's is. `None` for the empty-string escape hatch. A new key has
+    /// no legacy spelling to fall back on, so the built-in lives here. Never the
+    /// other product's: a model word means nothing to the other binary.
+    pub fn planner_model_for(&self, agent: AgentKind) -> Option<&str> {
+        flag_value(match agent {
+            AgentKind::ClaudeCode => self.claude.planner_model.as_deref().unwrap_or("opus"),
+            AgentKind::Codex => self.codex.planner_model.as_deref().unwrap_or(""),
+        })
     }
 
-    /// The effort a Planner is created with: `[brigade.claude] planner_effort`,
-    /// else `xhigh`; `None` for the empty-string escape hatch.
-    pub fn planner_effort(&self) -> Option<&str> {
-        flag_value(self.claude.planner_effort.as_deref().unwrap_or("xhigh"))
+    /// The effort a Planner running `agent` is created with, read like
+    /// [`Self::planner_model_for`]: Claude's `[brigade.claude] planner_effort`, else
+    /// `xhigh`; Codex's `[brigade.codex] planner_effort`, else nothing.
+    pub fn planner_effort_for(&self, agent: AgentKind) -> Option<&str> {
+        flag_value(match agent {
+            AgentKind::ClaudeCode => self.claude.planner_effort.as_deref().unwrap_or("xhigh"),
+            AgentKind::Codex => self.codex.planner_effort.as_deref().unwrap_or(""),
+        })
     }
 
     /// The permission mode a Planner launches with: `[brigade.claude]
@@ -1443,7 +1539,7 @@ fn table_then_legacy<'a>(table: &'a Option<String>, legacy: &'a str) -> &'a str 
 /// `the_key_lists_name_every_field_their_struct_has` fails to compile when a
 /// field is added to [`BrigadeConfig`] and passes only when this list, the two
 /// below and [`LEGACY_BRIGADE_KEYS`] still cover it.
-const PLAIN_BRIGADE_KEYS: [&str; 13] = [
+const PLAIN_BRIGADE_KEYS: [&str; 14] = [
     "workers",
     "worker_agent",
     "worker_autocompact",
@@ -1456,6 +1552,7 @@ const PLAIN_BRIGADE_KEYS: [&str; 13] = [
     "goinkyo_agent",
     "planner",
     "planner_prompt",
+    "planner_agent",
     "message_log",
 ];
 
@@ -1475,11 +1572,13 @@ const CLAUDE_TABLE_KEYS: [&str; 11] = [
 ];
 
 /// The keys [`CodexBrigadeConfig`] has.
-const CODEX_TABLE_KEYS: [&str; 4] = [
+const CODEX_TABLE_KEYS: [&str; 6] = [
     "worker_model",
     "worker_effort",
     "goinkyo_model",
     "goinkyo_effort",
+    "planner_model",
+    "planner_effort",
 ];
 
 /// Why `key`, written under `[brigade.<table>]`, would be lost, or `None` when it
@@ -3209,9 +3308,10 @@ data_dir = \"C:/synthetic/banto-data\"
 
     #[test]
     fn the_planner_flags_have_built_ins_and_pass_the_operators_words_through_unchecked() {
+        use AgentKind::ClaudeCode as Claude;
         let b = BrigadeConfig::default();
-        assert_eq!(b.planner_model(), Some("opus"));
-        assert_eq!(b.planner_effort(), Some("xhigh"));
+        assert_eq!(b.planner_model_for(Claude), Some("opus"));
+        assert_eq!(b.planner_effort_for(Claude), Some("xhigh"));
         assert_eq!(b.planner_permission_mode(), Some("auto"));
         assert_eq!(b.planner_tools(), Some("Read,Grep,Glob"));
 
@@ -3220,8 +3320,8 @@ data_dir = \"C:/synthetic/banto-data\"
              planner_permission_mode = \"made-up\"\nplanner_tools = \"Read\"\n",
         )
         .brigade;
-        assert_eq!(c.planner_model(), Some("haiku"));
-        assert_eq!(c.planner_effort(), Some("extreme"));
+        assert_eq!(c.planner_model_for(Claude), Some("haiku"));
+        assert_eq!(c.planner_effort_for(Claude), Some("extreme"));
         assert_eq!(c.planner_permission_mode(), Some("made-up"));
         assert_eq!(c.planner_tools(), Some("Read"));
 
@@ -3232,8 +3332,8 @@ data_dir = \"C:/synthetic/banto-data\"
         .brigade;
         assert_eq!(
             (
-                none.planner_model(),
-                none.planner_effort(),
+                none.planner_model_for(Claude),
+                none.planner_effort_for(Claude),
                 none.planner_permission_mode(),
                 none.planner_tools()
             ),
@@ -3246,6 +3346,91 @@ data_dir = \"C:/synthetic/banto-data\"
     fn the_planner_settings_do_not_touch_the_goinkyos() {
         let c = parse("[brigade.claude]\nplanner_model = \"haiku\"\n").brigade;
         assert_eq!(c.goinkyo_model(), Some("opus"));
+        let c = parse("[brigade.codex]\nplanner_model = \"terra\"\n").brigade;
+        assert_eq!(c.goinkyo_model_for(AgentKind::Codex), None);
+    }
+
+    #[test]
+    fn a_codex_planner_reads_its_own_keys_and_has_no_built_in_model_or_effort() {
+        use AgentKind::{ClaudeCode as Claude, Codex};
+        let built_in = BrigadeConfig::default();
+        assert_eq!(built_in.planner_model_for(Codex), None);
+        assert_eq!(built_in.planner_effort_for(Codex), None);
+
+        let both = parse(
+            "[brigade.claude]\nplanner_model = \"haiku\"\nplanner_effort = \"low\"\n\
+             [brigade.codex]\nplanner_model = \"terra\"\nplanner_effort = \"medium\"\n",
+        )
+        .brigade;
+        assert_eq!(both.planner_model_for(Codex), Some("terra"));
+        assert_eq!(both.planner_effort_for(Codex), Some("medium"));
+        // Neither product reads the other's word.
+        assert_eq!(both.planner_model_for(Claude), Some("haiku"));
+        assert_eq!(both.planner_effort_for(Claude), Some("low"));
+
+        let empty = parse("[brigade.codex]\nplanner_model = \"\"\nplanner_effort = \"\"\n").brigade;
+        assert_eq!(empty.planner_model_for(Codex), None);
+        assert_eq!(empty.planner_effort_for(Codex), None);
+    }
+
+    #[test]
+    fn planner_agent_defaults_to_inherit_and_every_known_value_parses() {
+        assert_eq!(
+            BrigadeConfig::default().planner_agent,
+            PlannerAgentSetting::Inherit
+        );
+        assert_eq!(
+            parse("[brigade]\nworkers = 2\n").brigade.planner_agent,
+            PlannerAgentSetting::Inherit
+        );
+        for (text, expected) in [
+            ("inherit", PlannerAgentSetting::Inherit),
+            ("claude", PlannerAgentSetting::Claude),
+            ("codex", PlannerAgentSetting::Codex),
+            (" CODEX ", PlannerAgentSetting::Codex),
+            ("Claude", PlannerAgentSetting::Claude),
+        ] {
+            assert_eq!(
+                parse(&format!("[brigade]\nplanner_agent = \"{text}\"\n"))
+                    .brigade
+                    .planner_agent,
+                expected,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn planner_agent_refuses_a_value_that_is_not_one_of_its_three() {
+        for bad in ["\"\"", "\"  \"", "\"codx\"", "\"gemini\"", "\"auto\""] {
+            assert_refused_naming(
+                &format!("[brigade]\nplanner_agent = {bad}\n"),
+                "planner_agent",
+                bad.trim_matches('"'),
+                &["inherit", "claude", "codex"],
+            );
+        }
+        assert_wrong_type("[brigade]\nplanner_agent = 5\n", "a string");
+        assert_eq!(PlannerAgentSetting::parse(""), None, "empty is not a value");
+    }
+
+    #[test]
+    fn planner_agent_inherit_follows_the_director_and_a_row_with_no_product_is_claude() {
+        use AgentKind::{ClaudeCode as Claude, Codex};
+        for (setting, director, expected) in [
+            (PlannerAgentSetting::Inherit, Some(Claude), Claude),
+            (PlannerAgentSetting::Inherit, Some(Codex), Codex),
+            (PlannerAgentSetting::Inherit, None, Claude),
+            (PlannerAgentSetting::Claude, Some(Codex), Claude),
+            (PlannerAgentSetting::Codex, Some(Claude), Codex),
+            (PlannerAgentSetting::Codex, None, Codex),
+        ] {
+            assert_eq!(
+                resolve_planner_agent(setting, director),
+                expected,
+                "{setting:?} under {director:?}"
+            );
+        }
     }
 
     // -- product tables: [brigade.claude] and [brigade.codex] ----------------
@@ -3627,6 +3812,8 @@ data_dir = \"C:/synthetic/banto-data\"
             worker_effort,
             goinkyo_model,
             goinkyo_effort,
+            planner_model,
+            planner_effort,
         } = parse(&format!(
             "[brigade.codex]\n{}",
             CODEX_TABLE_KEYS
@@ -3635,7 +3822,14 @@ data_dir = \"C:/synthetic/banto-data\"
         ))
         .brigade
         .codex;
-        for field in [worker_model, worker_effort, goinkyo_model, goinkyo_effort] {
+        for field in [
+            worker_model,
+            worker_effort,
+            goinkyo_model,
+            goinkyo_effort,
+            planner_model,
+            planner_effort,
+        ] {
             assert_eq!(field.as_deref(), Some("x"));
         }
         // The plain keys: one by one, each one set to something other than its
@@ -3654,6 +3848,7 @@ data_dir = \"C:/synthetic/banto-data\"
             ("goinkyo_agent", "\"codex\""),
             ("planner", "\"off\""),
             ("planner_prompt", "\"p\""),
+            ("planner_agent", "\"codex\""),
             ("message_log", "true"),
         ] {
             assert!(PLAIN_BRIGADE_KEYS.contains(&key), "{key}");
@@ -3675,6 +3870,7 @@ data_dir = \"C:/synthetic/banto-data\"
             goinkyo_agent: _,
             planner: _,
             planner_prompt: _,
+            planner_agent: _,
             message_log: _,
             worker_model: _,
             worker_effort: _,
@@ -3687,11 +3883,11 @@ data_dir = \"C:/synthetic/banto-data\"
             worker_effort_codex: _,
             legacy_keys: _,
         } = built_in;
-        // 25 fields: the 13 plain keys, the two tables, the 9 legacy keys and
+        // 26 fields: the 14 plain keys, the two tables, the 9 legacy keys and
         // `legacy_keys`.
         assert_eq!(
             PLAIN_BRIGADE_KEYS.len() + 2 + LEGACY_BRIGADE_KEYS.len() + 1,
-            25
+            26
         );
     }
 

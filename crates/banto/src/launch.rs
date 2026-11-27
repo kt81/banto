@@ -496,19 +496,36 @@ const NOTIFICATION_OVERRIDES: [&str; 3] = [
     NOTIFICATION_CONDITION_OVERRIDE,
 ];
 
-/// The policy a Codex Goinkyo is launched under, as Codex's own first-class
-/// flags: `--sandbox read-only --ask-for-approval never`. A Goinkyo is an
-/// unattended advisor, so it must neither write nor stop at an approval nobody
-/// answers. Passed on a resume as on a creation, because banto does not count on
+/// The policy a Codex Goinkyo or Planner is launched under, as Codex's own
+/// first-class flags: `--sandbox read-only --ask-for-approval never`. The Goinkyo
+/// is an unattended advisor: nobody answers an approval at its pane. The Planner
+/// is talked to, but nobody is at its pane on the first turn or on a relay wake, so
+/// an approval there would stop it unanswered (the reason
+/// `BrigadeConfig::planner_permission_mode` gives for the Claude one), and it has
+/// nothing to change besides the Plan it writes through banto. So neither may write
+/// or stop at an approval. Passed on a resume as on a creation, because banto does not count on
 /// a resumed session remembering a launch flag (the rule [`AgentLaunch::Claude`]'s
 /// `permission_mode` and `disallowed_tools` follow).
 ///
-/// Measured on codex-cli 0.171.0 (Windows, four runs): reads, `git log` and
-/// `git status`, and banto's three MCP tools all worked under these with no
+/// Measured on codex-cli 0.171.0 (Windows, four runs, Goinkyo): reads, `git log`
+/// and `git status`, and banto's three MCP tools all worked under these with no
 /// prompt, which holds only because every Codex member's launch also carries
 /// `mcp_servers.banto.default_tools_approval_mode="approve"` ([`CodexBrigade`]).
-/// That a write is blocked is not measured. The cost is that a Codex Goinkyo
-/// cannot build or run tests, and its shell has no network.
+/// That a write is blocked was measured on Codex 0.172.0 on 2026-11-27, in an
+/// interactive launch with `-s read-only -a never`: a shell write was refused
+/// ("Access to the path ... is denied", no file made) and `apply_patch` was
+/// rejected ("writing is blocked by read-only sandbox"). The cost is that a Codex
+/// advisor cannot build or run tests, and its shell has no network.
+///
+/// The four words are one set; do not take `read-only` or `never` out alone. With
+/// `-a never` and a sandbox that is not read-only, Codex approves every MCP
+/// tool call, the operator's own servers' included (upstream `main`,
+/// `codex-rs/core/src/mcp_tool_call.rs`, read 2026-11-27, not the 0.172.0 tag).
+/// Under `read-only` and `never` the same source runs a non-banto MCP tool
+/// without approval only when it advertises `readOnlyHint`, or both
+/// `destructiveHint: false` and `openWorldHint: false`, and denies it otherwise.
+/// What was measured on 0.172.0 is three calls: `codex_tui` `create_thread` was
+/// refused, and `read_thread` and `codex_apps` `pets_list_pets` ran.
 const GOINKYO_CODEX_POLICY: [&str; 4] = ["-s", "read-only", "-a", "never"];
 
 impl AgentLaunch {
@@ -532,7 +549,7 @@ impl AgentLaunch {
     /// [`NOTIFICATION_OVERRIDES`]), then `-c model_reasoning_effort` (a new
     /// session with an effort), then `-c model_auto_compact_token_limit` (a
     /// Worker's, create or resume), then brigade `-c` overrides (if any — see
-    /// [`CodexBrigade::overrides`]), then a Goinkyo's `-s read-only -a never`
+    /// [`CodexBrigade::overrides`]), then a Goinkyo's or Planner's `-s read-only -a never`
     /// ([`GOINKYO_CODEX_POLICY`], create or resume), then `-C <cwd>` last, always
     /// present. After the session id and among the options on a resume as well:
     /// `codex resume --help` lists both flags, and the `-c`/`-C` options banto
@@ -685,7 +702,7 @@ impl AgentLaunch {
                         argv.push("-c".to_string());
                         argv.push(value);
                     }
-                    if brigade.role == BrigadeRole::Goinkyo {
+                    if matches!(brigade.role, BrigadeRole::Goinkyo | BrigadeRole::Planner) {
                         argv.extend(GOINKYO_CODEX_POLICY.map(str::to_string));
                     }
                 }
@@ -1644,6 +1661,23 @@ mod tests {
         assert_eq!(&argv[..3], ["codex", "resume", "codex-uuid-1"]);
         assert_eq!(read_only_and_never(&argv), (true, true), "{argv:?}");
         assert_eq!(&argv[argv.len() - 2..], ["-C", "/work/alpha"]);
+    }
+
+    #[test]
+    fn a_codex_planner_is_launched_like_a_codex_goinkyo_on_creation_and_on_resume() {
+        for start in [create(), SessionStart::Resume("codex-uuid-1".to_string())] {
+            let planner = codex_member_launch(start.clone(), BrigadeRole::Planner).argv("codex");
+            assert_eq!(read_only_and_never(&planner), (true, true), "{planner:?}");
+            assert_eq!(&planner[planner.len() - 2..], ["-C", "/work/alpha"]);
+            // One set of four words, in the Goinkyo's order: a second list built
+            // for the Planner could drift from it.
+            let goinkyo = codex_member_launch(start, BrigadeRole::Goinkyo).argv("codex");
+            let policy = |argv: &[String]| {
+                let at = argv.iter().position(|arg| arg == "-s").unwrap();
+                argv[at..at + 4].to_vec()
+            };
+            assert_eq!(policy(&planner), policy(&goinkyo));
+        }
     }
 
     #[test]

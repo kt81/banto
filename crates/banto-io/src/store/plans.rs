@@ -378,7 +378,8 @@ impl Store {
     /// Refused, with nothing written, when `caller_token` is not the brigade's
     /// Director, when the brigade has a Planner, or when it has an open Plan. The
     /// number is one past the largest the brigade has used, closed Plans included.
-    /// `agent` is the product the Planner will run as, always Claude Code today.
+    /// `agent` is the product the Planner runs as, written on its row; the row stays
+    /// the authority until the Plan closes.
     pub fn open_planner(
         &mut self,
         brigade_id: BrigadeId,
@@ -1187,6 +1188,27 @@ mod tests {
             "mail to a gone Planner is purged"
         );
         assert_eq!(store.open_plan_view(br).unwrap(), None);
+    }
+
+    /// Archiving and titling are by session id, whatever product's session it is: a
+    /// Codex Planner's thread id is archived in banto's own table (`~/.codex` is
+    /// never written) and titled the same way.
+    #[test]
+    fn closing_a_codex_planners_plan_archives_and_titles_its_session_too() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = briefed(&mut store);
+        store
+            .open_planner(br, "director", "Layout", "make it better", AgentKind::Codex)
+            .unwrap();
+        let sid = SessionId("019a0000-codex-thread".to_string());
+        store.set_member_session(br, PLANNER_TOKEN, &sid).unwrap();
+        store.close_plan(br, &PlanClosing::Operator).unwrap();
+        assert!(!has_planner(&store, br));
+        assert_eq!(store.archived_ids().unwrap(), std::slice::from_ref(&sid));
+        assert_eq!(
+            store.planner_titles().unwrap(),
+            [(sid, "Layout".to_string())]
+        );
     }
 
     #[test]

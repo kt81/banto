@@ -327,6 +327,7 @@ fn main() -> Result<()> {
                 dirs,
                 mcp::GoinkyoPolicy {
                     setting: config.brigade.goinkyo_agent,
+                    planner_setting: config.brigade.planner_agent,
                     enabled: resolved_agents.enabled.clone(),
                     hook_launchable: exe::BantoExe::resolve().hook_launchable(),
                 },

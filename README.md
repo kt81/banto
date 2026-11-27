@@ -69,10 +69,15 @@ read-only with no approval prompts, so it cannot build or run tests. The first
 consultation in a directory Codex has not trusted waits at Codex's own trust question
 until you answer it in the Goinkyo's pane.
 
-The Planner is a Claude session the Director opens with `open_planner` when you ask for
+The Planner is a session the Director opens with `open_planner` when you ask for
 work that spans several errands and whose scope or completion conditions are not settled
-in your words. It works the Plan out with you in its own pane, reads the code with
-`Read`, `Grep` and `Glob` only, and writes each draft with `write_plan`. Nothing is
+in your words. It works the Plan out with you in its own pane and writes each draft
+with `write_plan`. A Claude Planner reads the code with `Read`, `Grep` and `Glob` only.
+It runs as its Director's own product (`planner_agent`), fixed when the Planner is
+opened; `planner_agent = "claude"` keeps it on Claude. A Codex Planner runs read-only
+with no approval prompts, like a Codex Goinkyo, and keeps Codex's shell, web search
+and apps, so it can still read through read-type app tools, other Codex threads and
+fetched web pages. Nothing is
 settled until you read a draft on the reading screen (`F5`) and press `A` (Shift) to
 approve the version on screen; if the Planner has written a newer version since you
 opened the screen, banto refuses and tells you to read it first. Approval sends the
@@ -80,8 +85,7 @@ Director a message from banto, which also says whether the Plan goes to the Goin
 review, by `goinkyo_consult`; the Director splits the approved Plan into errands.
 Starting no Worker on a draft is an instruction in the `read_plan` tool's description,
 not a check banto makes. The Director ends the Plan with `close_planner`, and banto
-archives the Planner's session and keeps a Markdown export of the Plan. The Planner
-always runs on Claude, whatever the Director is.
+archives the Planner's session and keeps a Markdown export of the Plan.
 
 Each member also gets a role briefing naming its brigade, token and peers (appended
 to the system prompt for Claude Code, delivered by banto's own `SessionStart` hook
@@ -405,9 +409,15 @@ goinkyo_agent = "inherit"
 # or completion is not settled in your words) | "off" (only when you ask). Like
 # goinkyo_consult, it does nothing if director_prompt is empty.
 planner = "auto"
-# The Planner's role text, which replaces Claude's own system prompt along with a paragraph
-# banto always adds; {brigade} is substituted, and "" leaves that paragraph alone. The
-# default is in English and tells the Planner to answer in your language.
+# Which product a Planner runs as: "inherit" (its Director's own) | "claude" | "codex".
+# Fixed when the Planner is opened; an open Planner is not moved by an edit.
+# Its model and effort are planner_model and planner_effort under [brigade.claude]
+# or [brigade.codex].
+planner_agent = "inherit"
+# The Planner's role text, which replaces Claude's own system prompt (a Codex Planner gets
+# it through banto's hook instead) along with a paragraph banto always adds; {brigade} is
+# substituted, and "" leaves that paragraph alone. The default is in English and tells the
+# Planner to answer in your language.
 planner_prompt = "..."
 # A Director's request_decision also marks its row and rings. false: the tag only.
 request_attention = true
@@ -436,6 +446,8 @@ worker_model = "terra"           # a slug, or a family word resolved to its newe
 worker_effort = "high"           # -c model_reasoning_effort
 goinkyo_model = ""               # a Codex Goinkyo's model; "" = Codex's own default
 goinkyo_effort = ""              # a Codex Goinkyo's -c model_reasoning_effort; "" = none
+planner_model = ""               # a Codex Planner's model; "" = Codex's own default
+planner_effort = ""              # a Codex Planner's -c model_reasoning_effort; "" = none
 
 [keys]
 prefix = "C-b"      # pane prefix chord; a backslash is written 'C-\' or "C-\\" in TOML

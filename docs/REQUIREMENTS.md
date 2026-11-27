@@ -907,7 +907,7 @@ holds exactly the keys its product has, and a product with no table yet costs
 nothing.
 
 *The shape.* `[brigade]` keeps what is not about one product: `workers`,
-`worker_agent`, `goinkyo_agent`, `worker_autocompact`, `relay`, the prompts,
+`worker_agent`, `goinkyo_agent`, `planner_agent`, `worker_autocompact`, `relay`, the prompts,
 `goinkyo_consult`, `message_log`, `request_attention`. The rest move, with the key
 names inside a table losing their suffix:
 
@@ -957,7 +957,7 @@ the same way and shows no notice.
 there it would vanish without a word, `relay = "typo"` included, which is a value
 the file's own rule would have refused. So a `[brigade.claude]` or `[brigade.codex]`
 holding a key that is a plain `[brigade]` key (`workers`, `relay`, `worker_agent`,
-`goinkyo_agent`, `worker_autocompact`, `request_attention`, `message_log`,
+`goinkyo_agent`, `planner_agent`, `worker_autocompact`, `request_attention`, `message_log`,
 `goinkyo_consult`, the three prompts), or a legacy flat name its table does not have
 (`worker_model_codex` under `[brigade.claude]`, `goinkyo_permission_mode` under
 `[brigade.codex]`), is refused at the offending value, with `toml`'s own line,
@@ -1108,13 +1108,17 @@ does not; the work is built; the Director closes the Planner. "Come together" me
 thing: **the operator approved a saved draft with a key on the reading screen.** The
 reasons are the Director's and the implementer's unless marked as his.
 
-1. **A role, not a mode.** `BrigadeRole::Planner`, token `planner`, Claude only. A
+1. **A role, not a mode.** `BrigadeRole::Planner`, token `planner`, on Claude or Codex
+   (item 14). A
    brigade has at most one Planner and at most one open Plan, and the two lifetimes are
    one: the Planner opens with its Plan and closes with it. Opening is refused with a
    reason when the caller is not the Director, when a Planner or an open Plan exists,
-   and, as `consult_goinkyo` is, when Claude is disabled in `agents` or its home cannot
-   be resolved (the UI side refuses the same way, with a status line, for a Planner
-   whose launch cannot happen). **Invariant: the Planner's member row disappears only
+   and, as `consult_goinkyo` is, when the Planner's product is disabled in `agents`, its
+   home cannot be resolved, or (Codex) the hook cannot be launched or is not trusted.
+   Those are checks of `open_planner` only. A later launch of the open Planner (the UI
+   side) refuses, with a status line, only a product that is no longer enabled in
+   `agents`; otherwise it follows what any Codex member's relaunch does (for instance a
+   banto path with spaces leaves the hook out, and startup warns of it). **Invariant: the Planner's member row disappears only
    inside the transaction that closes its Plan** (`close_open_plan_on`).
    `dismiss_worker` refuses a Planner, and deleting a brigade (the disband) closes the Plan
    first, as `abandoned` by the operator. Closing a brigade does not: that ends the
@@ -1292,7 +1296,44 @@ reasons are the Director's and the implementer's unless marked as his.
 - A generated file as the reading place, because the operator found an external viewer
   awkward; the reading screen is.
 
-*Not built.* Plan metrics, a Codex Planner, a tile for the Plan, a mark on Progress that
+14. **A Planner on Codex (2026-11-27 decision, built 2026-11-28).** `[brigade]
+    planner_agent = "inherit" | "claude" | "codex"` (default `inherit`: the Director's
+    own product), a sibling of `goinkyo_agent`; a typo is a startup error.
+    - **Where the product lives.** `open_planner` resolves it once and writes it on the
+      Planner's member row, and the row is the authority until the Plan closes: editing
+      the setting moves no open Planner, and a resume uses the row's agent. It refuses,
+      as `consult_goinkyo` does (`goinkyo_launch_refusal`), when that product is not in
+      `agents`, has no home, or for Codex has no launchable, trusted hook; it never
+      falls back to the other product.
+    - **Launch.** The Codex arm of `build_open_launch` covers Goinkyo and Planner alike,
+      with `GOINKYO_CODEX_POLICY` (`-s read-only -a never`) and no Planner flags of its
+      own. `[brigade.codex] planner_model` / `planner_effort` default to empty (Codex's
+      own) and go to a new Planner only at creation; a model slug is checked against
+      the catalog as a Worker's is. There is no tool-list key for Codex: it keeps its
+      shell, web search and apps.
+    - **Texts.** A Codex Planner has no `--system-prompt-file`; its role text and the
+      banto-owned paragraph arrive in the `SessionStart` hook's context, composed by the
+      same `compose` as every Codex briefing (no roster; `BRIEFING_LAST_SENTENCE` stays
+      last), 4009 bytes on the shipped text against the 9900 test and Codex's
+      ~10,000-byte limit. The request stays in its file. Codex cuts a tool's output at
+      about 40,000 bytes, so the Codex paragraph says a file may not come back whole
+      and must be read to the end in ranges.
+    - **What read-only does not stop.** Source read on upstream `main` on 2026-11-27 (not
+      the 0.172.0 tag): under `-s read-only -a never`, a non-banto MCP tool runs without
+      approval only if it advertises `readOnlyHint`, or both `destructiveHint: false`
+      and `openWorldHint: false`, and is denied otherwise. Separately, measured on
+      0.172.0 and only three calls: `codex_tui` `create_thread` was refused, and
+      `read_thread` and `codex_apps` `pets_list_pets` ran. So a Codex Planner can still
+      read through read-type app tools, other Codex threads and fetched web pages.
+    - **Unchanged.** The bell rule of item 12, resume, and the Codex Director's tool
+      list. The ended session is archived and titled `Planner: <title>` by session id,
+      as for Claude (store and `apply_consultation_titles` tests with a Codex row);
+      *unverified live.*
+    - *Unverified:* a real Codex Planner end to end (the hook-delivered text reaching
+      the model, `write_plan` through the policy, the first prompt reading the request
+      file).
+
+*Not built.* Plan metrics (and any count of a Codex Planner's turns), a tile for the Plan, a mark on Progress that
 has gone stale, and replacing the Director's own system prompt. A link from a task id to
 the Plan is still the intent of the ids in the Plan's task headings, and nothing reads
 them yet.
@@ -3716,6 +3757,7 @@ pub struct BrigadeConfig {
     pub worker_prompt: String,      // role briefing template for each Worker
     pub goinkyo_prompt: String,     // role briefing template for a Goinkyo; also substitutes {request}
     pub goinkyo_agent: GoinkyoAgentSetting, // Inherit (default) | Claude | Codex — see "Goinkyo's product" below; a Codex Goinkyo gets none of the Claude settings in `claude`, and its own two in `codex`
+    pub planner_agent: PlannerAgentSetting, // Inherit (default) | Claude | Codex — see "Decision (2026-11-26): the Planner" item 14; fixed per Planner when it opens
     pub message_log: bool,          // append every brigade message to a plain-text file under banto's data dir (see "Message log" below); default false
     // The legacy flat spellings, still read; each holds its legacy value, or the built-in when the file writes none:
     pub worker_model: String,       // = [brigade.claude] worker_model
@@ -4357,7 +4399,7 @@ A string the key does not take is the same as a value of the wrong type (decisio
 and column `toml` reports, with `` `worker_agent` does not take "typo"; it takes
 "inherit", "claude", "codex" or "select" `` under it. Every setting that reads one
 of a fixed set of words is held to it when the file is read: `relay` (`auto` or
-`manual`), `worker_agent`, `goinkyo_agent`, `goinkyo_consult`, `worker_autocompact`,
+`manual`), `worker_agent`, `goinkyo_agent`, `planner_agent`, `goinkyo_consult`, `worker_autocompact`,
 `agents`, each trimmed and case-insensitive, and `[keys] prefix`, which must be exactly
 `C-<char>` or one character (`C-b` is read, `c-b` is refused), and with `""` valid only where
 it is documented as an escape (`goinkyo_consult`, `worker_autocompact`, `agents`).

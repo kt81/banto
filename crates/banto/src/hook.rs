@@ -50,7 +50,7 @@
 //! `BANTO_PARENT_DATA_DIR`) for the same reason identity does: the command line
 //! can carry nothing. Without them (an older banto launched this agent) the hook
 //! resolves them for itself, as it always did. The data directory is read for one
-//! thing: a Goinkyo's briefing names the consultation request file in it.
+//! thing: a Goinkyo's or a Planner's briefing names its request file in it.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -86,17 +86,21 @@ fn read_identity(get: impl Fn(&str) -> Option<String>) -> HookIdentity {
     }
 }
 
-/// The consultation request path a Goinkyo's briefing names as `{request}`, or
-/// `None` for another role or a data directory that is not known. Built from the
-/// same [`DataDir`] path `crate::mcp::tool_consult_goinkyo` wrote the file to, so
-/// the briefing and the file cannot disagree about where it is.
+/// The request file a Goinkyo's or a Planner's briefing names, or `None` for
+/// another role or a data directory that is not known. For a Goinkyo it is the
+/// `{request}` its template renders; for a Planner, the file banto's own
+/// paragraph points at. Built from the same [`DataDir`] path
+/// `crate::mcp::tool_consult_goinkyo` and `tool_open_planner` wrote the file to,
+/// so the briefing and the file cannot disagree about where it is.
 fn request_path(identity: &HookIdentity, data_dir: Option<&DataDir>) -> Option<String> {
-    if identity.role? != BrigadeRole::Goinkyo {
-        return None;
+    let data_dir = data_dir?;
+    let brigade_id = identity.brigade_id?;
+    match identity.role? {
+        BrigadeRole::Goinkyo => data_dir.goinkyo_request_path(brigade_id),
+        BrigadeRole::Planner => data_dir.planner_request_path(brigade_id),
+        BrigadeRole::Director | BrigadeRole::Worker => None,
     }
-    data_dir?
-        .goinkyo_request_path(identity.brigade_id?)
-        .map(|path| path.to_string_lossy().into_owned())
+    .map(|path| path.to_string_lossy().into_owned())
 }
 
 /// Pulls `session_id` out of the hook's stdin JSON. Leniently: a missing
@@ -623,6 +627,11 @@ mod tests {
             };
             assert_eq!(request_path(&identity, Some(&dir)), None, "{role:?}");
         }
+        let planner = HookIdentity {
+            role: Some(BrigadeRole::Planner),
+            ..goinkyo_identity(7)
+        };
+        assert_eq!(request_path(&planner, None), None);
         let no_brigade = HookIdentity {
             brigade_id: None,
             ..goinkyo_identity(7)
@@ -671,6 +680,30 @@ mod tests {
             briefing,
             crate::briefing::with_codex_addendum(&claude, BrigadeRole::Goinkyo)
         );
+    }
+
+    #[test]
+    fn a_codex_planners_briefing_names_the_planners_request_file() {
+        let store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        let identity = HookIdentity {
+            brigade_id: Some(brigade_id),
+            token: Some("planner".to_string()),
+            role: Some(BrigadeRole::Planner),
+        };
+        let dir = DataDir::new(std::env::temp_dir().join("banto data"));
+        let request = request_path(&identity, Some(&dir)).unwrap();
+        assert_eq!(
+            Some(request.clone()),
+            dir.planner_request_path(brigade_id)
+                .map(|path| path.to_string_lossy().into_owned())
+        );
+
+        let briefing =
+            build_briefing(&identity, &Config::default(), Some(&store), Some(&request)).unwrap();
+        assert!(briefing.contains(&request.replace('\\', "/")), "{briefing}");
+        assert!(briefing.contains("mcp__banto__write_plan"), "{briefing}");
+        assert!(briefing.ends_with(codex_briefing::BRIEFING_LAST_SENTENCE));
     }
 
     #[test]
